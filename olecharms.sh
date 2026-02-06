@@ -21,6 +21,9 @@ HOOK_MARKER="# olecharms managed hook - do not remove this line"
 LASTRUN_DIR="$SCRIPTS_DIR/.last-run"
 DOWNLOADS_INTERVAL=86400
 PARANOID_INTERVAL=43200
+CRON_MARKER_DOWNLOADS="# olecharms:downloads-cleanup"
+DOWNLOADS_CRON_HOUR=16
+DOWNLOADS_CRON_MIN=0
 
 # Source line we manage in ~/.vimrc
 SOURCE_MARKER="\" olecharms managed config - do not remove this line"
@@ -159,8 +162,8 @@ is_paranoid_mode_enabled() {
     [ -x "$PARANOID_SCRIPT" ]
 }
 
-any_feature_enabled() {
-    is_downloads_cleanup_enabled || is_paranoid_mode_enabled
+is_downloads_cron_enabled() {
+    check_command crontab && crontab -l 2>/dev/null | grep -qF "$CRON_MARKER_DOWNLOADS"
 }
 
 generate_hook_script() {
@@ -183,12 +186,20 @@ _olecharms_check_and_run() {
         "\$script" &
     fi
 }
-
-_olecharms_check_and_run "$CLEANUP_SCRIPT" "downloads-cleanup" $DOWNLOADS_INTERVAL
-_olecharms_check_and_run "$PARANOID_SCRIPT" "paranoid-cleanup" $PARANOID_INTERVAL
-
-unset -f _olecharms_check_and_run
 HOOK_EOF
+
+    # Only include features that are hook-scheduled (not cron)
+    if is_downloads_cleanup_enabled && ! is_downloads_cron_enabled; then
+        echo "_olecharms_check_and_run \"$CLEANUP_SCRIPT\" \"downloads-cleanup\" $DOWNLOADS_INTERVAL" >> "$HOOK_SCRIPT"
+    fi
+    if is_paranoid_mode_enabled; then
+        echo "_olecharms_check_and_run \"$PARANOID_SCRIPT\" \"paranoid-cleanup\" $PARANOID_INTERVAL" >> "$HOOK_SCRIPT"
+    fi
+
+    {
+        echo ""
+        echo "unset -f _olecharms_check_and_run"
+    } >> "$HOOK_SCRIPT"
     chmod +x "$HOOK_SCRIPT"
 }
 
@@ -232,6 +243,7 @@ remove_shell_hook() {
 
 enable_downloads_cleanup() {
     local downloads_dir="$1"
+    local mode="${2:-hook}"
 
     mkdir -p "$SCRIPTS_DIR"
 
@@ -246,8 +258,23 @@ find "\$DOWNLOADS_DIR" -mindepth 1 -type d -empty -delete 2>/dev/null
 CLEANUP_EOF
     chmod +x "$CLEANUP_SCRIPT"
 
-    generate_hook_script
-    install_shell_hook
+    if [ "$mode" = "cron" ]; then
+        local new_entry="$DOWNLOADS_CRON_MIN $DOWNLOADS_CRON_HOUR * * * $CLEANUP_SCRIPT $CRON_MARKER_DOWNLOADS"
+        local existing
+        existing=$(crontab -l 2>/dev/null | grep -v "$CRON_MARKER_DOWNLOADS") || true
+        if [ -n "$existing" ]; then
+            printf '%s\n%s\n' "$existing" "$new_entry" | crontab -
+        else
+            echo "$new_entry" | crontab -
+        fi
+        # Regenerate hook script to exclude downloads if paranoid uses it
+        if is_paranoid_mode_enabled; then
+            generate_hook_script
+        fi
+    else
+        generate_hook_script
+        install_shell_hook
+    fi
 }
 
 disable_downloads_cleanup() {
@@ -256,13 +283,24 @@ disable_downloads_cleanup() {
         return
     fi
 
+    # Remove cron entry if present
+    if is_downloads_cron_enabled; then
+        local existing
+        existing=$(crontab -l 2>/dev/null | grep -v "$CRON_MARKER_DOWNLOADS") || true
+        if [ -n "$existing" ]; then
+            echo "$existing" | crontab -
+        else
+            crontab -r 2>/dev/null || true
+        fi
+    fi
+
     rm -f "$CLEANUP_SCRIPT"
     rm -f "$LASTRUN_DIR/downloads-cleanup"
 
-    if ! any_feature_enabled; then
-        remove_shell_hook
-    else
+    if is_paranoid_mode_enabled; then
         generate_hook_script
+    else
+        remove_shell_hook
     fi
     info "Downloads auto-cleanup disabled"
 }
@@ -297,10 +335,11 @@ disable_paranoid_mode() {
     rm -f "$PARANOID_SCRIPT"
     rm -f "$LASTRUN_DIR/paranoid-cleanup"
 
-    if ! any_feature_enabled; then
-        remove_shell_hook
-    else
+    if is_downloads_cleanup_enabled && ! is_downloads_cron_enabled; then
+        # Downloads still needs the hook, regenerate without paranoid
         generate_hook_script
+    else
+        remove_shell_hook
     fi
     info "Paranoid mode disabled"
 }
@@ -657,7 +696,11 @@ cmd_status() {
 
 config_downloads_cleanup() {
     if is_downloads_cleanup_enabled; then
-        echo -e "  Status: ${GREEN}enabled${NC}"
+        local method_info="shell hook"
+        if is_downloads_cron_enabled; then
+            method_info="cron, daily at ${DOWNLOADS_CRON_HOUR}:$(printf '%02d' $DOWNLOADS_CRON_MIN)"
+        fi
+        echo -e "  Status: ${GREEN}enabled${NC} ($method_info)"
         echo ""
         read -rp "  Disable auto-cleanup? [y/N] " answer
         case "$answer" in
@@ -709,21 +752,49 @@ config_downloads_cleanup() {
 
         local selected="${dir_array[$((choice - 1))]}"
         echo ""
-        echo "  Once a day (on next shell open), files older than ${DOWNLOADS_MAX_AGE_DAYS} days will be"
-        echo "  deleted from:"
+        echo "  Files older than ${DOWNLOADS_MAX_AGE_DAYS} days will be deleted from:"
         echo "    $selected"
         echo ""
-        read -rp "  Enable auto-cleanup? [y/N] " confirm
-        case "$confirm" in
-            [yY])
-                enable_downloads_cleanup "$selected"
-                info "Downloads auto-cleanup enabled for $selected"
-                info "Changes take effect in your next shell session."
+        echo "  Select scheduling method:"
+        echo ""
+        echo "    1) Shell hook — checked on shell open (recommended)"
+        echo "    2) Cron job — daily at ${DOWNLOADS_CRON_HOUR}:$(printf '%02d' $DOWNLOADS_CRON_MIN)"
+        echo ""
+        echo "    0) Cancel"
+        echo ""
+
+        local method_choice
+        read -rp "  Select: " method_choice
+
+        local mode
+        case "$method_choice" in
+            1)
+                mode="hook"
+                ;;
+            2)
+                if ! check_command crontab; then
+                    error "crontab is not available. Install a cron daemon or use the shell hook."
+                    return 1
+                fi
+                mode="cron"
+                ;;
+            0|"")
+                info "Cancelled"
+                return
                 ;;
             *)
-                info "No changes made"
+                error "Invalid selection"
+                return 1
                 ;;
         esac
+
+        enable_downloads_cleanup "$selected" "$mode"
+        info "Downloads auto-cleanup enabled for $selected"
+        if [ "$mode" = "cron" ]; then
+            info "Cron job installed (daily at ${DOWNLOADS_CRON_HOUR}:$(printf '%02d' $DOWNLOADS_CRON_MIN))."
+        else
+            info "Changes take effect in your next shell session."
+        fi
     fi
 }
 

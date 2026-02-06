@@ -24,6 +24,8 @@ PARANOID_INTERVAL=43200
 CRON_MARKER_DOWNLOADS="# olecharms:downloads-cleanup"
 DOWNLOADS_CRON_HOUR=16
 DOWNLOADS_CRON_MIN=0
+CRON_MARKER_PARANOID="# olecharms:paranoid-cleanup"
+PARANOID_CRON_SCHEDULE="0 */12 * * *"
 
 # Source line we manage in ~/.vimrc
 SOURCE_MARKER="\" olecharms managed config - do not remove this line"
@@ -166,6 +168,10 @@ is_downloads_cron_enabled() {
     check_command crontab && crontab -l 2>/dev/null | grep -qF "$CRON_MARKER_DOWNLOADS"
 }
 
+is_paranoid_cron_enabled() {
+    check_command crontab && crontab -l 2>/dev/null | grep -qF "$CRON_MARKER_PARANOID"
+}
+
 generate_hook_script() {
     mkdir -p "$SCRIPTS_DIR"
 
@@ -192,7 +198,7 @@ HOOK_EOF
     if is_downloads_cleanup_enabled && ! is_downloads_cron_enabled; then
         echo "_olecharms_check_and_run \"$CLEANUP_SCRIPT\" \"downloads-cleanup\" $DOWNLOADS_INTERVAL" >> "$HOOK_SCRIPT"
     fi
-    if is_paranoid_mode_enabled; then
+    if is_paranoid_mode_enabled && ! is_paranoid_cron_enabled; then
         echo "_olecharms_check_and_run \"$PARANOID_SCRIPT\" \"paranoid-cleanup\" $PARANOID_INTERVAL" >> "$HOOK_SCRIPT"
     fi
 
@@ -268,7 +274,7 @@ CLEANUP_EOF
             echo "$new_entry" | crontab -
         fi
         # Regenerate hook script to exclude downloads if paranoid uses it
-        if is_paranoid_mode_enabled; then
+        if is_paranoid_mode_enabled && ! is_paranoid_cron_enabled; then
             generate_hook_script
         fi
     else
@@ -297,7 +303,7 @@ disable_downloads_cleanup() {
     rm -f "$CLEANUP_SCRIPT"
     rm -f "$LASTRUN_DIR/downloads-cleanup"
 
-    if is_paranoid_mode_enabled; then
+    if is_paranoid_mode_enabled && ! is_paranoid_cron_enabled; then
         generate_hook_script
     else
         remove_shell_hook
@@ -306,6 +312,8 @@ disable_downloads_cleanup() {
 }
 
 enable_paranoid_mode() {
+    local mode="${1:-hook}"
+
     mkdir -p "$SCRIPTS_DIR"
 
     cat > "$PARANOID_SCRIPT" <<PARANOID_EOF
@@ -322,14 +330,40 @@ find "$VIM_DIR/undodir" -type f -delete 2>/dev/null
 PARANOID_EOF
     chmod +x "$PARANOID_SCRIPT"
 
-    generate_hook_script
-    install_shell_hook
+    if [ "$mode" = "cron" ]; then
+        local new_entry="$PARANOID_CRON_SCHEDULE $PARANOID_SCRIPT $CRON_MARKER_PARANOID"
+        local existing
+        existing=$(crontab -l 2>/dev/null | grep -v "$CRON_MARKER_PARANOID") || true
+        if [ -n "$existing" ]; then
+            printf '%s\n%s\n' "$existing" "$new_entry" | crontab -
+        else
+            echo "$new_entry" | crontab -
+        fi
+        # Regenerate hook script to exclude paranoid if downloads uses it
+        if is_downloads_cleanup_enabled && ! is_downloads_cron_enabled; then
+            generate_hook_script
+        fi
+    else
+        generate_hook_script
+        install_shell_hook
+    fi
 }
 
 disable_paranoid_mode() {
     if ! is_paranoid_mode_enabled; then
         warn "Paranoid mode is already disabled"
         return
+    fi
+
+    # Remove cron entry if present
+    if is_paranoid_cron_enabled; then
+        local existing
+        existing=$(crontab -l 2>/dev/null | grep -v "$CRON_MARKER_PARANOID") || true
+        if [ -n "$existing" ]; then
+            echo "$existing" | crontab -
+        else
+            crontab -r 2>/dev/null || true
+        fi
     fi
 
     rm -f "$PARANOID_SCRIPT"
@@ -534,8 +568,8 @@ cmd_update() {
         before_script=$(_file_hash "$SCRIPT_DIR/olecharms.sh")
         before_conf=$(_file_hash "$CONF_FILE")
 
-        git -C "$SCRIPT_DIR" pull --ff-only 2>/dev/null || {
-            warn "Could not update olecharms repo (may have local changes)"
+        git -C "$SCRIPT_DIR" pull --rebase --autostash 2>/dev/null || {
+            warn "Could not update olecharms repo"
         }
 
         local after_script after_conf
@@ -800,7 +834,11 @@ config_downloads_cleanup() {
 
 config_paranoid_mode() {
     if is_paranoid_mode_enabled; then
-        echo -e "  Status: ${GREEN}enabled${NC}"
+        local method_info="shell hook"
+        if is_paranoid_cron_enabled; then
+            method_info="cron, every 12 hours"
+        fi
+        echo -e "  Status: ${GREEN}enabled${NC} ($method_info)"
         echo ""
         echo "  Paranoid mode clears every 12 hours:"
         echo "    - Bash history (~/.bash_history)"
@@ -820,7 +858,7 @@ config_paranoid_mode() {
     else
         echo -e "  Status: ${RED}disabled${NC}"
         echo ""
-        echo "  Every 12 hours (checked on shell open), paranoid mode will delete:"
+        echo "  Every 12 hours, paranoid mode will delete:"
         echo "    - Bash history (~/.bash_history)"
         echo "    - Zsh history (~/.zsh_history)"
         echo "    - Vim swap files ($VIM_DIR/swapfiles/)"
@@ -833,60 +871,89 @@ config_paranoid_mode() {
             echo ""
         fi
 
-        read -rp "  Enable paranoid mode? [y/N] " confirm
-        case "$confirm" in
-            [yY])
-                # Also enable downloads cleanup if not already on
-                if ! is_downloads_cleanup_enabled; then
-                    echo ""
-                    local dirs
-                    if ! dirs=$(find_downloads_dirs) || [ -z "$dirs" ]; then
-                        error "No downloads folder found in $HOME"
-                        echo "  Create one with: mkdir ~/Downloads"
-                        return 1
-                    fi
+        echo "  Select scheduling method:"
+        echo ""
+        echo "    1) Shell hook — checked on shell open (recommended)"
+        echo "    2) Cron job — every 12 hours"
+        echo ""
+        echo "    0) Cancel"
+        echo ""
 
-                    local dir_array=()
-                    while IFS= read -r d; do
-                        dir_array+=("$d")
-                    done <<< "$dirs"
+        local method_choice
+        read -rp "  Select: " method_choice
 
-                    echo "  Select downloads folder for auto-cleanup:"
-                    echo ""
-                    local i
-                    for i in "${!dir_array[@]}"; do
-                        echo "    $((i + 1))) ${dir_array[$i]}"
-                    done
-                    echo ""
-                    echo "    0) Cancel"
-                    echo ""
-
-                    local dl_choice
-                    read -rp "  Select folder: " dl_choice
-
-                    if [ "$dl_choice" = "0" ] || [ -z "$dl_choice" ]; then
-                        info "Cancelled"
-                        return
-                    fi
-
-                    if ! [[ "$dl_choice" =~ ^[0-9]+$ ]] || [ "$dl_choice" -lt 1 ] || [ "$dl_choice" -gt ${#dir_array[@]} ]; then
-                        error "Invalid selection"
-                        return 1
-                    fi
-
-                    local selected="${dir_array[$((dl_choice - 1))]}"
-                    enable_downloads_cleanup "$selected"
-                    info "Downloads auto-cleanup enabled for $selected"
+        local mode
+        case "$method_choice" in
+            1)
+                mode="hook"
+                ;;
+            2)
+                if ! check_command crontab; then
+                    error "crontab is not available. Install a cron daemon or use the shell hook."
+                    return 1
                 fi
-
-                enable_paranoid_mode
-                info "Paranoid mode enabled"
-                info "Changes take effect in your next shell session."
+                mode="cron"
+                ;;
+            0|"")
+                info "Cancelled"
+                return
                 ;;
             *)
-                info "No changes made"
+                error "Invalid selection"
+                return 1
                 ;;
         esac
+
+        # Also enable downloads cleanup if not already on
+        if ! is_downloads_cleanup_enabled; then
+            echo ""
+            local dirs
+            if ! dirs=$(find_downloads_dirs) || [ -z "$dirs" ]; then
+                error "No downloads folder found in $HOME"
+                echo "  Create one with: mkdir ~/Downloads"
+                return 1
+            fi
+
+            local dir_array=()
+            while IFS= read -r d; do
+                dir_array+=("$d")
+            done <<< "$dirs"
+
+            echo "  Select downloads folder for auto-cleanup:"
+            echo ""
+            local i
+            for i in "${!dir_array[@]}"; do
+                echo "    $((i + 1))) ${dir_array[$i]}"
+            done
+            echo ""
+            echo "    0) Cancel"
+            echo ""
+
+            local dl_choice
+            read -rp "  Select folder: " dl_choice
+
+            if [ "$dl_choice" = "0" ] || [ -z "$dl_choice" ]; then
+                info "Cancelled"
+                return
+            fi
+
+            if ! [[ "$dl_choice" =~ ^[0-9]+$ ]] || [ "$dl_choice" -lt 1 ] || [ "$dl_choice" -gt ${#dir_array[@]} ]; then
+                error "Invalid selection"
+                return 1
+            fi
+
+            local selected="${dir_array[$((dl_choice - 1))]}"
+            enable_downloads_cleanup "$selected" "$mode"
+            info "Downloads auto-cleanup enabled for $selected"
+        fi
+
+        enable_paranoid_mode "$mode"
+        info "Paranoid mode enabled"
+        if [ "$mode" = "cron" ]; then
+            info "Cron job installed (every 12 hours)."
+        else
+            info "Changes take effect in your next shell session."
+        fi
     fi
 }
 

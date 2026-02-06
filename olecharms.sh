@@ -132,6 +132,16 @@ check_command() {
     command -v "$1" >/dev/null 2>&1
 }
 
+_file_hash() {
+    if check_command md5sum; then
+        md5sum "$1" 2>/dev/null | cut -d' ' -f1
+    elif check_command md5; then
+        md5 -q "$1" 2>/dev/null
+    else
+        cksum "$1" 2>/dev/null | cut -d' ' -f1
+    fi
+}
+
 find_downloads_dirs() {
     local results
     results=$(find "$HOME" -maxdepth 1 -iname "downloads" -type d 2>/dev/null)
@@ -185,9 +195,10 @@ HOOK_EOF
 install_shell_hook() {
     local rc_files=()
     [ -f "$HOME/.bashrc" ] && rc_files+=("$HOME/.bashrc")
+    [ -f "$HOME/.bash_profile" ] && rc_files+=("$HOME/.bash_profile")
     [ -f "$HOME/.zshrc" ] && rc_files+=("$HOME/.zshrc")
 
-    # Default to .bashrc if neither exists
+    # Default to .bashrc if none exist
     if [ ${#rc_files[@]} -eq 0 ]; then
         rc_files=("$HOME/.bashrc")
     fi
@@ -206,7 +217,7 @@ install_shell_hook() {
 }
 
 remove_shell_hook() {
-    for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    for rc in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.zshrc"; do
         [ ! -f "$rc" ] && continue
         if grep -qF "$HOOK_MARKER" "$rc" 2>/dev/null; then
             local tmpfile
@@ -481,20 +492,20 @@ cmd_update() {
     if [ -d "$SCRIPT_DIR/.git" ]; then
         info "Updating olecharms repo..."
         local before_script before_conf
-        before_script=$(md5sum "$SCRIPT_DIR/olecharms.sh" 2>/dev/null | cut -d' ' -f1)
-        before_conf=$(md5sum "$CONF_FILE" 2>/dev/null | cut -d' ' -f1)
+        before_script=$(_file_hash "$SCRIPT_DIR/olecharms.sh")
+        before_conf=$(_file_hash "$CONF_FILE")
 
         git -C "$SCRIPT_DIR" pull --ff-only 2>/dev/null || {
             warn "Could not update olecharms repo (may have local changes)"
         }
 
         local after_script after_conf
-        after_script=$(md5sum "$SCRIPT_DIR/olecharms.sh" 2>/dev/null | cut -d' ' -f1)
-        after_conf=$(md5sum "$CONF_FILE" 2>/dev/null | cut -d' ' -f1)
+        after_script=$(_file_hash "$SCRIPT_DIR/olecharms.sh")
+        after_conf=$(_file_hash "$CONF_FILE")
 
         if [ "$before_script" != "$after_script" ] || [ "$before_conf" != "$after_conf" ]; then
-            warn "olecharms.sh or packages.conf was updated. Please re-run: ./olecharms.sh update"
-            exit 0
+            info "olecharms.sh or packages.conf was updated. Relaunching..."
+            exec "$SCRIPT_DIR/olecharms.sh" update
         fi
     fi
 

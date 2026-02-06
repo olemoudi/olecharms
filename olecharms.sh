@@ -1,6 +1,6 @@
 #!/bin/bash
 # olecharms.sh — Environment management script for olecharms
-# Usage: ./olecharms.sh {install|update|check|status|help}
+# Usage: ./olecharms.sh {install|update|check|status|config|help}
 
 # ─── Constants & Globals ─────────────────────────────────────────────────────
 
@@ -12,6 +12,15 @@ BUNDLED_DIR="$SCRIPT_DIR/vimthings"
 PATHOGEN_STAGING="$VIM_DIR/.pathogen-repo"
 FONTS_STAGING="$VIM_DIR/.fonts-repo"
 ERROR_COUNT=0
+SCRIPTS_DIR="$SCRIPT_DIR/scripts"
+CLEANUP_SCRIPT="$SCRIPTS_DIR/cleanup-downloads.sh"
+DOWNLOADS_MAX_AGE_DAYS=30
+PARANOID_SCRIPT="$SCRIPTS_DIR/paranoid-cleanup.sh"
+HOOK_SCRIPT="$SCRIPTS_DIR/olecharms-hook.sh"
+HOOK_MARKER="# olecharms managed hook - do not remove this line"
+LASTRUN_DIR="$SCRIPTS_DIR/.last-run"
+DOWNLOADS_INTERVAL=86400
+PARANOID_INTERVAL=43200
 
 # Source line we manage in ~/.vimrc
 SOURCE_MARKER="\" olecharms managed config - do not remove this line"
@@ -121,6 +130,168 @@ clone_or_pull() {
 
 check_command() {
     command -v "$1" >/dev/null 2>&1
+}
+
+find_downloads_dirs() {
+    local results
+    results=$(find "$HOME" -maxdepth 1 -iname "downloads" -type d 2>/dev/null)
+    if [ -z "$results" ]; then
+        return 1
+    fi
+    echo "$results"
+}
+
+is_downloads_cleanup_enabled() {
+    [ -x "$CLEANUP_SCRIPT" ]
+}
+
+is_paranoid_mode_enabled() {
+    [ -x "$PARANOID_SCRIPT" ]
+}
+
+any_feature_enabled() {
+    is_downloads_cleanup_enabled || is_paranoid_mode_enabled
+}
+
+generate_hook_script() {
+    mkdir -p "$SCRIPTS_DIR"
+
+    cat > "$HOOK_SCRIPT" <<HOOK_EOF
+#!/bin/bash
+# olecharms-hook.sh — sourced from shell profile for scheduled cleanups
+
+_olecharms_check_and_run() {
+    local script="\$1" name="\$2" interval="\$3"
+    [ ! -x "\$script" ] && return
+    local lastrun_file="$LASTRUN_DIR/\$name"
+    local now last=0
+    now=\$(date +%s)
+    [ -f "\$lastrun_file" ] && last=\$(cat "\$lastrun_file" 2>/dev/null)
+    if [ \$((now - last)) -ge "\$interval" ]; then
+        mkdir -p "$LASTRUN_DIR"
+        echo "\$now" > "\$lastrun_file"
+        "\$script" &
+    fi
+}
+
+_olecharms_check_and_run "$CLEANUP_SCRIPT" "downloads-cleanup" $DOWNLOADS_INTERVAL
+_olecharms_check_and_run "$PARANOID_SCRIPT" "paranoid-cleanup" $PARANOID_INTERVAL
+
+unset -f _olecharms_check_and_run
+HOOK_EOF
+    chmod +x "$HOOK_SCRIPT"
+}
+
+install_shell_hook() {
+    local rc_files=()
+    [ -f "$HOME/.bashrc" ] && rc_files+=("$HOME/.bashrc")
+    [ -f "$HOME/.zshrc" ] && rc_files+=("$HOME/.zshrc")
+
+    # Default to .bashrc if neither exists
+    if [ ${#rc_files[@]} -eq 0 ]; then
+        rc_files=("$HOME/.bashrc")
+    fi
+
+    for rc in "${rc_files[@]}"; do
+        if grep -qF "$HOOK_MARKER" "$rc" 2>/dev/null; then
+            continue
+        fi
+        {
+            echo ""
+            echo "$HOOK_MARKER"
+            echo "[ -f \"$HOOK_SCRIPT\" ] && source \"$HOOK_SCRIPT\""
+        } >> "$rc"
+        info "Shell hook installed in $rc"
+    done
+}
+
+remove_shell_hook() {
+    for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+        [ ! -f "$rc" ] && continue
+        if grep -qF "$HOOK_MARKER" "$rc" 2>/dev/null; then
+            local tmpfile
+            tmpfile=$(mktemp)
+            grep -vF "$HOOK_MARKER" "$rc" | grep -vF "source \"$HOOK_SCRIPT\"" > "$tmpfile"
+            mv "$tmpfile" "$rc"
+            info "Shell hook removed from $rc"
+        fi
+    done
+    rm -f "$HOOK_SCRIPT"
+}
+
+enable_downloads_cleanup() {
+    local downloads_dir="$1"
+
+    mkdir -p "$SCRIPTS_DIR"
+
+    cat > "$CLEANUP_SCRIPT" <<CLEANUP_EOF
+#!/bin/bash
+DOWNLOADS_DIR="$downloads_dir"
+MAX_AGE_DAYS=$DOWNLOADS_MAX_AGE_DAYS
+
+[ ! -d "\$DOWNLOADS_DIR" ] && exit 1
+find "\$DOWNLOADS_DIR" -type f -mtime +\${MAX_AGE_DAYS} -delete 2>/dev/null
+find "\$DOWNLOADS_DIR" -mindepth 1 -type d -empty -delete 2>/dev/null
+CLEANUP_EOF
+    chmod +x "$CLEANUP_SCRIPT"
+
+    generate_hook_script
+    install_shell_hook
+}
+
+disable_downloads_cleanup() {
+    if ! is_downloads_cleanup_enabled; then
+        warn "Downloads auto-cleanup is already disabled"
+        return
+    fi
+
+    rm -f "$CLEANUP_SCRIPT"
+    rm -f "$LASTRUN_DIR/downloads-cleanup"
+
+    if ! any_feature_enabled; then
+        remove_shell_hook
+    else
+        generate_hook_script
+    fi
+    info "Downloads auto-cleanup disabled"
+}
+
+enable_paranoid_mode() {
+    mkdir -p "$SCRIPTS_DIR"
+
+    cat > "$PARANOID_SCRIPT" <<PARANOID_EOF
+#!/bin/bash
+# Purge shell history
+rm -f "$HOME/.bash_history" 2>/dev/null
+rm -f "$HOME/.zsh_history" 2>/dev/null
+
+# Purge vim swap files
+find "$VIM_DIR/swapfiles" -type f -delete 2>/dev/null
+
+# Purge vim undo files
+find "$VIM_DIR/undodir" -type f -delete 2>/dev/null
+PARANOID_EOF
+    chmod +x "$PARANOID_SCRIPT"
+
+    generate_hook_script
+    install_shell_hook
+}
+
+disable_paranoid_mode() {
+    if ! is_paranoid_mode_enabled; then
+        warn "Paranoid mode is already disabled"
+        return
+    fi
+
+    rm -f "$PARANOID_SCRIPT"
+    rm -f "$LASTRUN_DIR/paranoid-cleanup"
+
+    if ! any_feature_enabled; then
+        remove_shell_hook
+    else
+        generate_hook_script
+    fi
+    info "Paranoid mode disabled"
 }
 
 # ─── Core Operations ─────────────────────────────────────────────────────────
@@ -473,6 +644,222 @@ cmd_status() {
     fi
 }
 
+config_downloads_cleanup() {
+    if is_downloads_cleanup_enabled; then
+        echo -e "  Status: ${GREEN}enabled${NC}"
+        echo ""
+        read -rp "  Disable auto-cleanup? [y/N] " answer
+        case "$answer" in
+            [yY])
+                disable_downloads_cleanup
+                ;;
+            *)
+                info "No changes made"
+                ;;
+        esac
+    else
+        echo -e "  Status: ${RED}disabled${NC}"
+        echo ""
+
+        local dirs
+        if ! dirs=$(find_downloads_dirs) || [ -z "$dirs" ]; then
+            error "No downloads folder found in $HOME"
+            echo "  Create one with: mkdir ~/Downloads"
+            return 1
+        fi
+
+        local dir_array=()
+        while IFS= read -r d; do
+            dir_array+=("$d")
+        done <<< "$dirs"
+
+        echo "  Found download folders:"
+        echo ""
+        local i
+        for i in "${!dir_array[@]}"; do
+            echo "    $((i + 1))) ${dir_array[$i]}"
+        done
+        echo ""
+        echo "    0) Cancel"
+        echo ""
+
+        local choice
+        read -rp "  Select folder: " choice
+
+        if [ "$choice" = "0" ] || [ -z "$choice" ]; then
+            info "Cancelled"
+            return
+        fi
+
+        if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#dir_array[@]} ]; then
+            error "Invalid selection"
+            return 1
+        fi
+
+        local selected="${dir_array[$((choice - 1))]}"
+        echo ""
+        echo "  Once a day (on next shell open), files older than ${DOWNLOADS_MAX_AGE_DAYS} days will be"
+        echo "  deleted from:"
+        echo "    $selected"
+        echo ""
+        read -rp "  Enable auto-cleanup? [y/N] " confirm
+        case "$confirm" in
+            [yY])
+                enable_downloads_cleanup "$selected"
+                info "Downloads auto-cleanup enabled for $selected"
+                info "Changes take effect in your next shell session."
+                ;;
+            *)
+                info "No changes made"
+                ;;
+        esac
+    fi
+}
+
+config_paranoid_mode() {
+    if is_paranoid_mode_enabled; then
+        echo -e "  Status: ${GREEN}enabled${NC}"
+        echo ""
+        echo "  Paranoid mode clears every 12 hours:"
+        echo "    - Bash history (~/.bash_history)"
+        echo "    - Zsh history (~/.zsh_history)"
+        echo "    - Vim swap files ($VIM_DIR/swapfiles/)"
+        echo "    - Vim undo files ($VIM_DIR/undodir/)"
+        echo ""
+        read -rp "  Disable paranoid mode? [y/N] " answer
+        case "$answer" in
+            [yY])
+                disable_paranoid_mode
+                ;;
+            *)
+                info "No changes made"
+                ;;
+        esac
+    else
+        echo -e "  Status: ${RED}disabled${NC}"
+        echo ""
+        echo "  Every 12 hours (checked on shell open), paranoid mode will delete:"
+        echo "    - Bash history (~/.bash_history)"
+        echo "    - Zsh history (~/.zsh_history)"
+        echo "    - Vim swap files ($VIM_DIR/swapfiles/)"
+        echo "    - Vim undo files ($VIM_DIR/undodir/)"
+        echo ""
+
+        if ! is_downloads_cleanup_enabled; then
+            echo -e "  ${YELLOW}Note:${NC} Downloads auto-cleanup is not enabled."
+            echo "  Paranoid mode will also enable it."
+            echo ""
+        fi
+
+        read -rp "  Enable paranoid mode? [y/N] " confirm
+        case "$confirm" in
+            [yY])
+                # Also enable downloads cleanup if not already on
+                if ! is_downloads_cleanup_enabled; then
+                    echo ""
+                    local dirs
+                    if ! dirs=$(find_downloads_dirs) || [ -z "$dirs" ]; then
+                        error "No downloads folder found in $HOME"
+                        echo "  Create one with: mkdir ~/Downloads"
+                        return 1
+                    fi
+
+                    local dir_array=()
+                    while IFS= read -r d; do
+                        dir_array+=("$d")
+                    done <<< "$dirs"
+
+                    echo "  Select downloads folder for auto-cleanup:"
+                    echo ""
+                    local i
+                    for i in "${!dir_array[@]}"; do
+                        echo "    $((i + 1))) ${dir_array[$i]}"
+                    done
+                    echo ""
+                    echo "    0) Cancel"
+                    echo ""
+
+                    local dl_choice
+                    read -rp "  Select folder: " dl_choice
+
+                    if [ "$dl_choice" = "0" ] || [ -z "$dl_choice" ]; then
+                        info "Cancelled"
+                        return
+                    fi
+
+                    if ! [[ "$dl_choice" =~ ^[0-9]+$ ]] || [ "$dl_choice" -lt 1 ] || [ "$dl_choice" -gt ${#dir_array[@]} ]; then
+                        error "Invalid selection"
+                        return 1
+                    fi
+
+                    local selected="${dir_array[$((dl_choice - 1))]}"
+                    enable_downloads_cleanup "$selected"
+                    info "Downloads auto-cleanup enabled for $selected"
+                fi
+
+                enable_paranoid_mode
+                info "Paranoid mode enabled"
+                info "Changes take effect in your next shell session."
+                ;;
+            *)
+                info "No changes made"
+                ;;
+        esac
+    fi
+}
+
+cmd_config() {
+    echo -e "${BOLD}olecharms config${NC}"
+    echo ""
+
+    while true; do
+        local dl_status
+        if is_downloads_cleanup_enabled 2>/dev/null; then
+            dl_status="${GREEN}enabled${NC}"
+        else
+            dl_status="${RED}disabled${NC}"
+        fi
+
+        local paranoid_status
+        if is_paranoid_mode_enabled 2>/dev/null; then
+            paranoid_status="${GREEN}enabled${NC}"
+        else
+            paranoid_status="${RED}disabled${NC}"
+        fi
+
+        echo "  Configuration options:"
+        echo ""
+        echo -e "    1) Downloads auto-cleanup  [$dl_status]"
+        echo -e "    2) Paranoid mode           [$paranoid_status]"
+        echo ""
+        echo "    0) Exit"
+        echo ""
+
+        local choice
+        read -rp "  Select option: " choice
+
+        case "$choice" in
+            1)
+                echo ""
+                config_downloads_cleanup
+                echo ""
+                ;;
+            2)
+                echo ""
+                config_paranoid_mode
+                echo ""
+                ;;
+            0|"")
+                return
+                ;;
+            *)
+                warn "Invalid selection"
+                echo ""
+                ;;
+        esac
+    done
+}
+
 cmd_help() {
     cat <<'EOF'
 olecharms.sh — Environment management for olecharms
@@ -484,6 +871,7 @@ Commands:
   update    Pull latest changes for repo, plugins, pathogen, and fonts
   check     Report installed/missing dependencies and plugin status
   status    Show what's installed with version info
+  config    Interactive menu to toggle system features (e.g. downloads cleanup)
   help      Show this help message
 
 Configuration:
@@ -494,6 +882,7 @@ Examples:
   ./olecharms.sh install    # First-time setup
   ./olecharms.sh update     # Update everything
   ./olecharms.sh check      # See what's installed/missing
+  ./olecharms.sh config     # Toggle system features
 EOF
 }
 
@@ -505,6 +894,7 @@ main() {
         update)  cmd_update ;;
         check)   cmd_check ;;
         status)  cmd_status ;;
+        config)  cmd_config ;;
         help|--help|-h) cmd_help ;;
         "")
             error "No command specified"

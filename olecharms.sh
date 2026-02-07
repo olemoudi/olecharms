@@ -29,6 +29,8 @@ PARANOID_CRON_SCHEDULE="0 */12 * * *"
 SHELL_DIR="$SCRIPT_DIR/shell"
 SHELL_LOADER="$SCRIPTS_DIR/olecharms-shell.sh"
 SHELL_MARKER="# olecharms shell commands - do not remove this line"
+BIN_DIR="$HOME/.local/bin"
+BIN_MARKER="# olecharms PATH - do not remove this line"
 
 # Source line we manage in ~/.vimrc
 SOURCE_MARKER="\" olecharms managed config - do not remove this line"
@@ -307,6 +309,38 @@ remove_shell_commands() {
         fi
     done
     rm -f "$SHELL_LOADER"
+}
+
+install_binary() {
+    mkdir -p "$BIN_DIR"
+    ln -sf "$SCRIPT_DIR/olecharms.sh" "$BIN_DIR/olecharms"
+    info "Symlinked olecharms → $BIN_DIR/olecharms"
+
+    # Check if ~/.local/bin is already on PATH
+    if echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR" 2>/dev/null; then
+        return
+    fi
+
+    local rc_files=()
+    [ -f "$HOME/.bashrc" ] && rc_files+=("$HOME/.bashrc")
+    [ -f "$HOME/.bash_profile" ] && rc_files+=("$HOME/.bash_profile")
+    [ -f "$HOME/.zshrc" ] && rc_files+=("$HOME/.zshrc")
+
+    if [ ${#rc_files[@]} -eq 0 ]; then
+        rc_files=("$HOME/.bashrc")
+    fi
+
+    for rc in "${rc_files[@]}"; do
+        if grep -qF "$BIN_MARKER" "$rc" 2>/dev/null; then
+            continue
+        fi
+        {
+            echo ""
+            echo "$BIN_MARKER"
+            echo "export PATH=\"\$HOME/.local/bin:\$PATH\""
+        } >> "$rc"
+        info "Added ~/.local/bin to PATH in $rc"
+    done
 }
 
 enable_downloads_cleanup() {
@@ -608,6 +642,7 @@ cmd_install() {
     install_fonts
     run_post_commands
     install_shell_commands
+    install_binary
 
     echo ""
     if [ $ERROR_COUNT -eq 0 ]; then
@@ -659,6 +694,7 @@ cmd_update() {
 
     # Ensure shell commands are installed
     install_shell_commands
+    install_binary
 
     echo ""
     if [ $ERROR_COUNT -eq 0 ]; then
@@ -1106,33 +1142,46 @@ cmd_config() {
 }
 
 cmd_help() {
-    cat <<'EOF'
-olecharms.sh — Environment management for olecharms
+    echo -e "${BOLD}olecharms${NC} — Environment management for olecharms"
+    echo ""
+    echo -e "Usage: ${BOLD}olecharms${NC} <command>"
+    echo ""
+    echo -e "${BLUE}Commands:${NC}"
+    echo "  install   Full install: packages, vim dirs, pathogen, plugins, vimrc, fonts"
+    echo "  update    Pull latest changes for repo, plugins, pathogen, and fonts"
+    echo "  check     Report installed/missing dependencies and plugin status"
+    echo "  status    Show what's installed with version info"
+    echo "  config    Interactive menu to toggle system features (e.g. downloads cleanup)"
+    echo "  help      Show this help message"
 
-Usage: ./olecharms.sh <command>
+    # Dynamically list shell commands from shell/*.sh
+    local shell_files=("$SHELL_DIR"/*.sh)
+    if [ -e "${shell_files[0]}" ]; then
+        echo ""
+        echo -e "${BLUE}Shell commands:${NC}"
+        for f in "${shell_files[@]}"; do
+            local line
+            line=$(head -1 "$f")
+            # Expect format: # name — description
+            local name detail
+            name=$(echo "$line" | sed -n 's/^# *\([^ ]*\).*/\1/p')
+            detail=$(echo "$line" | sed -n 's/^# *[^ ]* *— *//p')
+            if [ -n "$name" ]; then
+                printf "  %-10s %s\n" "$name" "$detail"
+            fi
+        done
+    fi
 
-Commands:
-  install   Full install: packages, vim dirs, pathogen, plugins, vimrc, fonts
-  update    Pull latest changes for repo, plugins, pathogen, and fonts
-  check     Report installed/missing dependencies and plugin status
-  status    Show what's installed with version info
-  config    Interactive menu to toggle system features (e.g. downloads cleanup)
-  help      Show this help message
-
-Shell commands:
-  Drop .sh files into the shell/ directory to define custom shell functions
-  (e.g. mkcd, mksh). They are sourced automatically after install/update.
-
-Configuration:
-  Edit packages.conf to add/remove system packages, vim plugins, font families,
-  and post-install commands.
-
-Examples:
-  ./olecharms.sh install    # First-time setup
-  ./olecharms.sh update     # Update everything
-  ./olecharms.sh check      # See what's installed/missing
-  ./olecharms.sh config     # Toggle system features
-EOF
+    echo ""
+    echo -e "${BLUE}Configuration:${NC}"
+    echo "  Edit packages.conf to add/remove system packages, vim plugins, font families,"
+    echo "  and post-install commands."
+    echo ""
+    echo -e "${BLUE}Examples:${NC}"
+    echo "  olecharms install    # First-time setup"
+    echo "  olecharms update     # Update everything"
+    echo "  olecharms check      # See what's installed/missing"
+    echo "  olecharms config     # Toggle system features"
 }
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -1146,10 +1195,7 @@ main() {
         config)  cmd_config ;;
         help|--help|-h) cmd_help ;;
         "")
-            error "No command specified"
-            echo ""
             cmd_help
-            exit 1
             ;;
         *)
             error "Unknown command: $1"

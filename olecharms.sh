@@ -26,6 +26,9 @@ DOWNLOADS_CRON_HOUR=16
 DOWNLOADS_CRON_MIN=0
 CRON_MARKER_PARANOID="# olecharms:paranoid-cleanup"
 PARANOID_CRON_SCHEDULE="0 */12 * * *"
+SHELL_DIR="$SCRIPT_DIR/shell"
+SHELL_LOADER="$SCRIPTS_DIR/olecharms-shell.sh"
+SHELL_MARKER="# olecharms shell commands - do not remove this line"
 
 # Source line we manage in ~/.vimrc
 SOURCE_MARKER="\" olecharms managed config - do not remove this line"
@@ -245,6 +248,65 @@ remove_shell_hook() {
         fi
     done
     rm -f "$HOOK_SCRIPT"
+}
+
+generate_shell_loader() {
+    mkdir -p "$SCRIPTS_DIR"
+
+    cat > "$SHELL_LOADER" <<LOADER_EOF
+#!/bin/bash
+# olecharms-shell.sh — sources shell command files from $SHELL_DIR
+for _olecharms_f in "$SHELL_DIR"/*.sh; do
+    [ -f "\$_olecharms_f" ] && source "\$_olecharms_f"
+done
+unset _olecharms_f
+LOADER_EOF
+    chmod +x "$SHELL_LOADER"
+}
+
+install_shell_commands() {
+    # Check if shell dir exists and has files
+    if [ ! -d "$SHELL_DIR" ] || [ -z "$(ls "$SHELL_DIR"/*.sh 2>/dev/null)" ]; then
+        return
+    fi
+
+    generate_shell_loader
+
+    local rc_files=()
+    [ -f "$HOME/.bashrc" ] && rc_files+=("$HOME/.bashrc")
+    [ -f "$HOME/.bash_profile" ] && rc_files+=("$HOME/.bash_profile")
+    [ -f "$HOME/.zshrc" ] && rc_files+=("$HOME/.zshrc")
+
+    # Default to .bashrc if none exist
+    if [ ${#rc_files[@]} -eq 0 ]; then
+        rc_files=("$HOME/.bashrc")
+    fi
+
+    for rc in "${rc_files[@]}"; do
+        if grep -qF "$SHELL_MARKER" "$rc" 2>/dev/null; then
+            continue
+        fi
+        {
+            echo ""
+            echo "$SHELL_MARKER"
+            echo "[ -f \"$SHELL_LOADER\" ] && source \"$SHELL_LOADER\""
+        } >> "$rc"
+        info "Shell commands installed in $rc"
+    done
+}
+
+remove_shell_commands() {
+    for rc in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.zshrc"; do
+        [ ! -f "$rc" ] && continue
+        if grep -qF "$SHELL_MARKER" "$rc" 2>/dev/null; then
+            local tmpfile
+            tmpfile=$(mktemp)
+            grep -vF "$SHELL_MARKER" "$rc" | grep -vF "source \"$SHELL_LOADER\"" > "$tmpfile"
+            mv "$tmpfile" "$rc"
+            info "Shell commands removed from $rc"
+        fi
+    done
+    rm -f "$SHELL_LOADER"
 }
 
 enable_downloads_cleanup() {
@@ -545,6 +607,7 @@ cmd_install() {
     install_vimrc
     install_fonts
     run_post_commands
+    install_shell_commands
 
     echo ""
     if [ $ERROR_COUNT -eq 0 ]; then
@@ -593,6 +656,9 @@ cmd_update() {
 
     # Run post-install commands
     run_post_commands
+
+    # Ensure shell commands are installed
+    install_shell_commands
 
     echo ""
     if [ $ERROR_COUNT -eq 0 ]; then
@@ -675,6 +741,25 @@ cmd_check() {
             echo -e "  ${RED}✗${NC} $family  (not found in $FONT_DIR)"
         fi
     done
+
+    # Check shell commands
+    echo ""
+    echo -e "${BLUE}Shell commands:${NC}"
+    if [ -d "$SHELL_DIR" ] && ls "$SHELL_DIR"/*.sh >/dev/null 2>&1; then
+        for f in "$SHELL_DIR"/*.sh; do
+            local cmd_name
+            cmd_name=$(basename "$f" .sh)
+            echo -e "  ${GREEN}✓${NC} $cmd_name  ($f)"
+        done
+    else
+        echo -e "  ${YELLOW}~${NC} No shell commands found in $SHELL_DIR"
+    fi
+    echo -e "${BLUE}Shell loader:${NC}"
+    if [ -f "$SHELL_LOADER" ]; then
+        echo -e "  ${GREEN}✓${NC} $SHELL_LOADER"
+    else
+        echo -e "  ${RED}✗${NC} $SHELL_LOADER  (not generated — run install or update)"
+    fi
 }
 
 cmd_status() {
@@ -725,6 +810,17 @@ cmd_status() {
         echo -e "  ${YELLOW}~${NC} installed (bundled copy)"
     else
         echo -e "  ${RED}✗${NC} not installed"
+    fi
+
+    # Shell commands
+    echo ""
+    echo -e "${BLUE}Shell commands:${NC}"
+    if [ -d "$SHELL_DIR" ] && ls "$SHELL_DIR"/*.sh >/dev/null 2>&1; then
+        for f in "$SHELL_DIR"/*.sh; do
+            echo -e "  ${GREEN}✓${NC} $(basename "$f" .sh)"
+        done
+    else
+        echo "  (none)"
     fi
 }
 
@@ -1022,6 +1118,10 @@ Commands:
   status    Show what's installed with version info
   config    Interactive menu to toggle system features (e.g. downloads cleanup)
   help      Show this help message
+
+Shell commands:
+  Drop .sh files into the shell/ directory to define custom shell functions
+  (e.g. mkcd, mksh). They are sourced automatically after install/update.
 
 Configuration:
   Edit packages.conf to add/remove system packages, vim plugins, font families,

@@ -4,7 +4,7 @@
 
 # ─── Constants & Globals ─────────────────────────────────────────────────────
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 CONF_FILE="$SCRIPT_DIR/packages.conf"
 VIM_DIR="$HOME/.vim"
 VIMRC="$HOME/.vimrc"

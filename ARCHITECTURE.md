@@ -235,6 +235,9 @@ Simple `key=value` pairs. Parsed safely without `source` — only alphanumeric k
 ### Idempotency
 Every operation checks current state before acting. Running `install` or `update` multiple times produces the same result. Marker strings prevent duplicate entries in RC files.
 
+### Preserving existing installations
+When multiple copies of the repo exist (e.g., a primary install at `/home/user/olecharms` and a dev copy elsewhere), running `install`/`update` from one copy will not overwrite valid entries from another. The shell hook, shell commands, and binary symlink functions extract the path from existing RC entries or symlinks and skip the update if the target file still exists on disk. Only stale entries (pointing to paths that no longer exist) are replaced.
+
 ### Bundled fallbacks
 All vim plugins, pathogen, and powerline fonts are bundled in `vimthings/`. If `git clone` fails (offline, firewalled), the bundled copy is used. This guarantees the environment works without network access.
 

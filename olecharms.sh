@@ -4,7 +4,14 @@
 
 # ─── Constants & Globals ─────────────────────────────────────────────────────
 
-SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+_src="${BASH_SOURCE[0]}"
+while [ -L "$_src" ]; do
+    _dir="$(cd "$(dirname "$_src")" && pwd)"
+    _src="$(readlink "$_src")"
+    [[ "$_src" != /* ]] && _src="$_dir/$_src"
+done
+SCRIPT_DIR="$(cd "$(dirname "$_src")" && pwd)"
+unset _src _dir
 CONF_FILE="$SCRIPT_DIR/packages.conf"
 VIM_DIR="$HOME/.vim"
 VIMRC="$HOME/.vimrc"
@@ -232,7 +239,15 @@ install_shell_hook() {
 
     for rc in "${rc_files[@]}"; do
         if grep -qF "$HOOK_MARKER" "$rc" 2>/dev/null; then
-            continue
+            local existing_path
+            existing_path=$(sed -n 's/.*\[ -f "\(.*olecharms-hook\.sh\)" \].*/\1/p' "$rc")
+            if [ -n "$existing_path" ] && [ -f "$existing_path" ]; then
+                continue
+            fi
+            local tmpfile
+            tmpfile=$(mktemp)
+            grep -vF "$HOOK_MARKER" "$rc" | grep -v "olecharms-hook\.sh" > "$tmpfile"
+            mv "$tmpfile" "$rc"
         fi
         {
             echo ""
@@ -249,7 +264,7 @@ remove_shell_hook() {
         if grep -qF "$HOOK_MARKER" "$rc" 2>/dev/null; then
             local tmpfile
             tmpfile=$(mktemp)
-            grep -vF "$HOOK_MARKER" "$rc" | grep -vF "source \"$HOOK_SCRIPT\"" > "$tmpfile"
+            grep -vF "$HOOK_MARKER" "$rc" | grep -v "olecharms-hook\.sh" > "$tmpfile"
             mv "$tmpfile" "$rc"
             info "Shell hook removed from $rc"
         fi
@@ -277,8 +292,6 @@ install_shell_commands() {
         return
     fi
 
-    generate_shell_loader
-
     local rc_files=()
     [ -f "$HOME/.bashrc" ] && rc_files+=("$HOME/.bashrc")
     [ -f "$HOME/.bash_profile" ] && rc_files+=("$HOME/.bash_profile")
@@ -289,17 +302,36 @@ install_shell_commands() {
         rc_files=("$HOME/.bashrc")
     fi
 
+    local needs_update=false
     for rc in "${rc_files[@]}"; do
         if grep -qF "$SHELL_MARKER" "$rc" 2>/dev/null; then
-            continue
+            local existing_path
+            existing_path=$(sed -n 's/.*\[ -f "\(.*olecharms-shell\.sh\)" \].*/\1/p' "$rc")
+            if [ -n "$existing_path" ] && [ -f "$existing_path" ]; then
+                continue
+            fi
+            local tmpfile
+            tmpfile=$(mktemp)
+            grep -vF "$SHELL_MARKER" "$rc" | grep -v "olecharms-shell\.sh" > "$tmpfile"
+            mv "$tmpfile" "$rc"
         fi
-        {
-            echo ""
-            echo "$SHELL_MARKER"
-            echo "[ -f \"$SHELL_LOADER\" ] && source \"$SHELL_LOADER\""
-        } >> "$rc"
-        info "Shell commands installed in $rc"
+        needs_update=true
     done
+
+    if [ "$needs_update" = true ]; then
+        generate_shell_loader
+        for rc in "${rc_files[@]}"; do
+            if grep -qF "$SHELL_MARKER" "$rc" 2>/dev/null; then
+                continue
+            fi
+            {
+                echo ""
+                echo "$SHELL_MARKER"
+                echo "[ -f \"$SHELL_LOADER\" ] && source \"$SHELL_LOADER\""
+            } >> "$rc"
+            info "Shell commands installed in $rc"
+        done
+    fi
 }
 
 remove_shell_commands() {
@@ -308,7 +340,7 @@ remove_shell_commands() {
         if grep -qF "$SHELL_MARKER" "$rc" 2>/dev/null; then
             local tmpfile
             tmpfile=$(mktemp)
-            grep -vF "$SHELL_MARKER" "$rc" | grep -vF "source \"$SHELL_LOADER\"" > "$tmpfile"
+            grep -vF "$SHELL_MARKER" "$rc" | grep -v "olecharms-shell\.sh" > "$tmpfile"
             mv "$tmpfile" "$rc"
             info "Shell commands removed from $rc"
         fi
@@ -318,8 +350,20 @@ remove_shell_commands() {
 
 install_binary() {
     mkdir -p "$BIN_DIR"
-    ln -sf "$SCRIPT_DIR/olecharms.sh" "$BIN_DIR/olecharms"
-    info "Symlinked olecharms → $BIN_DIR/olecharms"
+
+    if [ -L "$BIN_DIR/olecharms" ]; then
+        local existing_target
+        existing_target="$(readlink "$BIN_DIR/olecharms")"
+        if [ -f "$existing_target" ] && [ "$existing_target" != "$SCRIPT_DIR/olecharms.sh" ]; then
+            info "olecharms binary already linked to $existing_target (keeping existing)"
+        else
+            ln -sf "$SCRIPT_DIR/olecharms.sh" "$BIN_DIR/olecharms"
+            info "Symlinked olecharms → $BIN_DIR/olecharms"
+        fi
+    else
+        ln -sf "$SCRIPT_DIR/olecharms.sh" "$BIN_DIR/olecharms"
+        info "Symlinked olecharms → $BIN_DIR/olecharms"
+    fi
 
     # Check if ~/.local/bin is already on PATH
     if echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR" 2>/dev/null; then

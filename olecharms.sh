@@ -159,7 +159,7 @@ _file_hash() {
 
 find_downloads_dirs() {
     local results
-    results=$(find "$HOME" -maxdepth 1 -iname "downloads" -type d 2>/dev/null)
+    results=$(find -L "$HOME" -maxdepth 1 -iname "downloads" -type d 2>/dev/null)
     if [ -z "$results" ]; then
         return 1
     fi

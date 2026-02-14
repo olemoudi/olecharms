@@ -789,6 +789,12 @@ cmd_install() {
     else
         warn "Install complete with $ERROR_COUNT error(s). Review output above."
     fi
+
+    # Launch zsh session so the user sees the result
+    if check_command zsh; then
+        info "Launching zsh..."
+        exec zsh -l
+    fi
 }
 
 cmd_update() {

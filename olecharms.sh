@@ -622,6 +622,11 @@ install_fonts() {
 }
 
 install_omz() {
+    if ! check_command zsh; then
+        error "zsh is not installed. Install it manually: sudo apt-get install zsh"
+        return 1
+    fi
+
     # Install Oh My Zsh if not present
     if [ ! -d "$HOME/.oh-my-zsh" ]; then
         info "Installing Oh My Zsh..."

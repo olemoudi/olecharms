@@ -351,13 +351,14 @@ install_binary() {
 enable_downloads_cleanup() {
     local downloads_dir="$1"
     local mode="${2:-hook}"
+    local max_age="${3:-$(config_get downloads_cleanup_max_age_days $DOWNLOADS_MAX_AGE_DAYS)}"
 
     mkdir -p "$SCRIPTS_DIR"
 
     cat > "$CLEANUP_SCRIPT" <<CLEANUP_EOF
 #!/bin/bash
 DOWNLOADS_DIR="$downloads_dir"
-MAX_AGE_DAYS=$DOWNLOADS_MAX_AGE_DAYS
+MAX_AGE_DAYS=$max_age
 
 [ ! -d "\$DOWNLOADS_DIR" ] && exit 1
 find "\$DOWNLOADS_DIR" -type f -mtime +\${MAX_AGE_DAYS} -delete 2>/dev/null
@@ -387,6 +388,7 @@ CLEANUP_EOF
     config_set downloads_cleanup_enabled true
     config_set downloads_cleanup_dir "$downloads_dir"
     config_set downloads_cleanup_method "$mode"
+    config_set downloads_cleanup_max_age_days "$max_age"
 }
 
 disable_downloads_cleanup() {
@@ -1299,7 +1301,7 @@ config_paranoid_mode() {
 
         if ! is_downloads_cleanup_enabled; then
             echo -e "  ${YELLOW}Note:${NC} Downloads auto-cleanup is not enabled."
-            echo "  Paranoid mode will also enable it."
+            echo "  Paranoid mode will also enable it (with $(( DOWNLOADS_MAX_AGE_DAYS / 2 ))-day max age)."
             echo ""
         fi
 
@@ -1375,8 +1377,8 @@ config_paranoid_mode() {
             fi
 
             local selected="${dir_array[$((dl_choice - 1))]}"
-            enable_downloads_cleanup "$selected" "$mode"
-            info "Downloads auto-cleanup enabled for $selected"
+            enable_downloads_cleanup "$selected" "$mode" "$((DOWNLOADS_MAX_AGE_DAYS / 2))"
+            info "Downloads auto-cleanup enabled for $selected ($(( DOWNLOADS_MAX_AGE_DAYS / 2 ))-day max age)"
         fi
 
         enable_paranoid_mode "$mode"

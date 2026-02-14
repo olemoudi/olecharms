@@ -638,6 +638,12 @@ install_omz() {
             error "Neither curl nor wget available. Cannot install Oh My Zsh."
             return 1
         fi
+
+        # Verify the install actually worked
+        if [ ! -d "$HOME/.oh-my-zsh" ]; then
+            error "Oh My Zsh installation failed"
+            return 1
+        fi
     else
         info "Oh My Zsh already installed"
     fi
@@ -734,12 +740,37 @@ run_post_commands() {
 
 # ─── Subcommand Handlers ─────────────────────────────────────────────────────
 
+_self_update() {
+    if [ -d "$SCRIPT_DIR/.git" ]; then
+        info "Updating olecharms repo..."
+        local before_script before_conf
+        before_script=$(_file_hash "$SCRIPT_DIR/olecharms.sh")
+        before_conf=$(_file_hash "$CONF_FILE")
+
+        git -C "$SCRIPT_DIR" pull --rebase --autostash 2>/dev/null || {
+            warn "Could not update olecharms repo"
+        }
+
+        local after_script after_conf
+        after_script=$(_file_hash "$SCRIPT_DIR/olecharms.sh")
+        after_conf=$(_file_hash "$CONF_FILE")
+
+        if [ "$before_script" != "$after_script" ] || [ "$before_conf" != "$after_conf" ]; then
+            info "olecharms.sh or packages.conf was updated. Relaunching..."
+            exec "$SCRIPT_DIR/olecharms.sh" "$@"
+        fi
+    fi
+}
+
 cmd_install() {
     echo -e "${BOLD}olecharms install${NC}"
     echo ""
 
     load_config || return 1
     detect_os
+
+    # Self-update: pull the olecharms repo
+    _self_update install
 
     install_packages
     create_vim_dirs
@@ -768,39 +799,16 @@ cmd_update() {
     detect_os
 
     # Self-update: pull the olecharms repo
-    if [ -d "$SCRIPT_DIR/.git" ]; then
-        info "Updating olecharms repo..."
-        local before_script before_conf
-        before_script=$(_file_hash "$SCRIPT_DIR/olecharms.sh")
-        before_conf=$(_file_hash "$CONF_FILE")
+    _self_update update
 
-        git -C "$SCRIPT_DIR" pull --rebase --autostash 2>/dev/null || {
-            warn "Could not update olecharms repo"
-        }
-
-        local after_script after_conf
-        after_script=$(_file_hash "$SCRIPT_DIR/olecharms.sh")
-        after_conf=$(_file_hash "$CONF_FILE")
-
-        if [ "$before_script" != "$after_script" ] || [ "$before_conf" != "$after_conf" ]; then
-            info "olecharms.sh or packages.conf was updated. Relaunching..."
-            exec "$SCRIPT_DIR/olecharms.sh" update
-        fi
-    fi
-
-    # Update pathogen
+    install_packages
+    create_vim_dirs
     install_pathogen
-
-    # Update plugins
     install_plugins
-
-    # Update fonts
+    install_vimrc
     install_fonts
-
-    # Run post-install commands
+    install_omz
     run_post_commands
-
-    # Ensure shell commands are installed
     install_shell_commands
     install_binary
 
@@ -1255,8 +1263,8 @@ cmd_help() {
     echo -e "Usage: ${BOLD}olecharms${NC} <command>"
     echo ""
     echo -e "${BLUE}Commands:${NC}"
-    echo "  install   Full install: packages, vim dirs, pathogen, plugins, vimrc, fonts"
-    echo "  update    Pull latest changes for repo, plugins, pathogen, and fonts"
+    echo "  install   Full idempotent setup: self-update, packages, vim, plugins, fonts, omz"
+    echo "  update    Same as install (alias for convenience)"
     echo "  check     Report installed/missing dependencies and plugin status"
     echo "  status    Show what's installed with version info"
     echo "  config    Interactive menu to toggle system features (e.g. downloads cleanup)"

@@ -115,11 +115,13 @@ clone_or_pull() {
         fi
     fi
 
-    # If directory exists but is not a git repo, back it up
+    # If directory exists but is not a git repo, move to bundle_disabled and re-clone
     if [ -d "$dest" ] && [ ! -d "$dest/.git" ]; then
-        warn "$name exists but is not a git repo. Backing up and re-cloning."
-        backup_file "$dest"
-        rm -rf "$dest"
+        warn "$name exists but is not a git repo. Moving to bundle_disabled and re-cloning."
+        local disabled_dest="$VIM_DIR/bundle_disabled/${name}.replaced.$(date +%Y%m%d_%H%M%S)"
+        mkdir -p "$VIM_DIR/bundle_disabled"
+        mv "$dest" "$disabled_dest"
+        info "Moved $dest → $disabled_dest"
     fi
 
     info "Cloning $name..."
@@ -554,18 +556,24 @@ install_plugins() {
 }
 
 install_vimrc() {
-    # Check if source line already exists
-    if [ -f "$VIMRC" ] && grep -qF "$SOURCE_LINE" "$VIMRC"; then
-        info "vimrc source line already present in $VIMRC"
-        return
-    fi
-
-    # Backup existing vimrc if present
     if [ -f "$VIMRC" ]; then
+        # Already has the exact current source line — nothing to do
+        if grep -qF "$SOURCE_LINE" "$VIMRC"; then
+            info "vimrc source line already present in $VIMRC"
+            return
+        fi
+
+        # Has an old source line with a different path — replace it
+        if grep -q 'source .*/vimthings/olevimrc\.vim' "$VIMRC"; then
+            sed -i "s|source .*/vimthings/olevimrc\.vim|$SOURCE_LINE|" "$VIMRC"
+            info "Updated source line path in $VIMRC"
+            return
+        fi
+
         backup_file "$VIMRC"
     fi
 
-    # Append the source line
+    # Append fresh
     {
         echo ""
         echo "$SOURCE_MARKER"

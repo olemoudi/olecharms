@@ -621,6 +621,100 @@ install_fonts() {
     fi
 }
 
+install_omz() {
+    # Install Oh My Zsh if not present
+    if [ ! -d "$HOME/.oh-my-zsh" ]; then
+        info "Installing Oh My Zsh..."
+        if check_command curl; then
+            sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+        elif check_command wget; then
+            sh -c "$(wget -qO- https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+        else
+            error "Neither curl nor wget available. Cannot install Oh My Zsh."
+            return 1
+        fi
+    else
+        info "Oh My Zsh already installed"
+    fi
+
+    # Create custom theme with random host color (only on first install)
+    local theme_dir="$HOME/.oh-my-zsh/custom/themes"
+    local theme_file="$theme_dir/olecharms.zsh-theme"
+
+    if [ -f "$theme_file" ]; then
+        info "olecharms theme already exists (preserving existing color)"
+    else
+        mkdir -p "$theme_dir"
+
+        # Generate random HSL and convert to RGB for a bright, readable color
+        # H: 0-359, S: 70-90%, L: 50-70%
+        local h=$(( RANDOM % 360 ))
+        local s=$(( 70 + RANDOM % 21 ))
+        local l=$(( 50 + RANDOM % 21 ))
+        local rgb
+        rgb=$(awk -v h="$h" -v s="$s" -v l="$l" 'BEGIN {
+            s = s / 100; l = l / 100
+            c = (1 - (2*l - 1 < 0 ? 1 - 2*l : 2*l - 1)) * s
+            hp = h / 60.0
+            hmod2 = hp - 2 * int(hp / 2)
+            x = c * (1 - (hmod2 - 1 < 0 ? 1 - hmod2 : hmod2 - 1))
+            if (hp < 1)      { r1 = c; g1 = x; b1 = 0 }
+            else if (hp < 2) { r1 = x; g1 = c; b1 = 0 }
+            else if (hp < 3) { r1 = 0; g1 = c; b1 = x }
+            else if (hp < 4) { r1 = 0; g1 = x; b1 = c }
+            else if (hp < 5) { r1 = x; g1 = 0; b1 = c }
+            else              { r1 = c; g1 = 0; b1 = x }
+            m = l - c / 2
+            printf "%d;%d;%d", int((r1+m)*255+0.5), int((g1+m)*255+0.5), int((b1+m)*255+0.5)
+        }')
+
+        cat > "$theme_file" <<THEME_EOF
+# olecharms.zsh-theme — based on pmcgee with unique host color
+if [ \$UID -eq 0 ]; then NCOLOR="red"; else NCOLOR="green"; fi
+
+HOST_COLOR=\$'\\e[38;2;${rgb}m'
+
+PROMPT='
+%{\$fg[\$NCOLOR]%}%B%n@%{\$HOST_COLOR%}%m%b%{\$reset_color%} %{\$fg[white]%}%B\${PWD/#\$HOME/~}%b%{\$reset_color%}
+\$(git_prompt_info)%(!.#.\$) '
+RPROMPT='[%*]'
+
+# git theming
+ZSH_THEME_GIT_PROMPT_PREFIX="%{\$fg_no_bold[yellow]%}%B"
+ZSH_THEME_GIT_PROMPT_SUFFIX="%{\$reset_color%} "
+ZSH_THEME_GIT_PROMPT_CLEAN=""
+ZSH_THEME_GIT_PROMPT_DIRTY="%{\$fg_bold[red]%}*"
+
+# LS colors, made with https://geoff.greer.fm/lscolors/
+export LSCOLORS="Gxfxcxdxbxegedabagacad"
+export LS_COLORS='no=00:fi=00:di=01;34:ln=00;36:pi=40;33:so=01;35:do=01;35:bd=40;33;01:cd=40;33;01:or=41;33;01:ex=00;32:*.cmd=00;32:*.exe=01;32:*.com=01;32:*.bat=01;32:*.btm=01;32:*.dll=01;32:*.tar=00;31:*.tbz=00;31:*.tgz=00;31:*.rpm=00;31:*.deb=00;31:*.arj=00;31:*.taz=00;31:*.lzh=00;31:*.lzma=00;31:*.zip=00;31:*.zoo=00;31:*.z=00;31:*.Z=00;31:*.gz=00;31:*.bz2=00;31:*.tb2=00;31:*.tz2=00;31:*.tbz2=00;31:*.avi=01;35:*.bmp=01;35:*.fli=01;35:*.gif=01;35:*.jpg=01;35:*.jpeg=01;35:*.mng=01;35:*.mov=01;35:*.mpg=01;35:*.pcx=01;35:*.pbm=01;35:*.pgm=01;35:*.png=01;35:*.ppm=01;35:*.tga=01;35:*.tif=01;35:*.xbm=01;35:*.xpm=01;35:*.dl=01;35:*.gl=01;35:*.wmv=01;35:*.aiff=00;32:*.au=00;32:*.mid=00;32:*.mp3=00;32:*.ogg=00;32:*.voc=00;32:*.wav=00;32:'
+THEME_EOF
+
+        info "Created olecharms theme with host color rgb($rgb)"
+    fi
+
+    # Configure .zshrc
+    local zshrc="$HOME/.zshrc"
+    if [ -f "$zshrc" ]; then
+        # Set ZSH_THEME to olecharms
+        if grep -q '^ZSH_THEME=' "$zshrc"; then
+            sed -i 's/^ZSH_THEME=.*/ZSH_THEME="olecharms"/' "$zshrc"
+            info "Updated ZSH_THEME to olecharms in $zshrc"
+        else
+            echo 'ZSH_THEME="olecharms"' >> "$zshrc"
+            info "Added ZSH_THEME=olecharms to $zshrc"
+        fi
+
+        # Add COLORTERM if not present
+        if ! grep -q 'export COLORTERM=truecolor' "$zshrc"; then
+            echo 'export COLORTERM=truecolor' >> "$zshrc"
+            info "Added COLORTERM=truecolor to $zshrc"
+        fi
+    else
+        warn "No .zshrc found — skipping theme configuration"
+    fi
+}
+
 run_post_commands() {
     if [ -z "${POST_INSTALL_COMMANDS+x}" ] || [ ${#POST_INSTALL_COMMANDS[@]} -eq 0 ]; then
         return
@@ -648,6 +742,7 @@ cmd_install() {
     install_plugins
     install_vimrc
     install_fonts
+    install_omz
     run_post_commands
     install_shell_commands
     install_binary

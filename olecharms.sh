@@ -494,18 +494,39 @@ install_packages() {
         return
     fi
 
-    info "Installing system packages: ${packages[*]}"
+    # Filter out already-installed packages
+    local missing=()
+    if [ "$OS" = "linux" ]; then
+        for pkg in "${packages[@]}"; do
+            if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+                missing+=("$pkg")
+            fi
+        done
+    elif [ "$OS" = "macos" ]; then
+        for pkg in "${packages[@]}"; do
+            if ! brew list "$pkg" >/dev/null 2>&1; then
+                missing+=("$pkg")
+            fi
+        done
+    fi
+
+    if [ ${#missing[@]} -eq 0 ]; then
+        info "All system packages already installed"
+        return
+    fi
+
+    info "Installing missing packages: ${missing[*]}"
     if [ "$OS" = "linux" ]; then
         if check_command sudo; then
-            sudo apt-get update -qq && sudo apt-get install -y -qq "${packages[@]}" || {
+            sudo apt-get update -qq && sudo apt-get install -y -qq "${missing[@]}" || {
                 error "Some packages failed to install"
             }
         else
-            error "sudo not available. Install packages manually: apt-get install ${packages[*]}"
+            error "sudo not available. Install packages manually: apt-get install ${missing[*]}"
         fi
     elif [ "$OS" = "macos" ]; then
         if check_command brew; then
-            brew install "${packages[@]}" 2>/dev/null || {
+            brew install "${missing[@]}" 2>/dev/null || {
                 warn "Some brew packages may have already been installed"
             }
         else

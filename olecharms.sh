@@ -31,6 +31,9 @@ SHELL_LOADER="$SCRIPTS_DIR/olecharms-shell.sh"
 SHELL_MARKER="# olecharms shell commands - do not remove this line"
 BIN_DIR="$HOME/.local/bin"
 BIN_MARKER="# olecharms PATH - do not remove this line"
+OLECHARMS_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/olecharms"
+OLECHARMS_CONFIG_FILE="$OLECHARMS_CONFIG_DIR/config"
+CURRENT_CONFIG_VERSION=1
 
 # Source line we manage in ~/.vimrc
 SOURCE_MARKER="\" olecharms managed config - do not remove this line"
@@ -379,6 +382,11 @@ CLEANUP_EOF
         generate_hook_script
         install_shell_hook
     fi
+
+    # Sync to config file
+    config_set downloads_cleanup_enabled true
+    config_set downloads_cleanup_dir "$downloads_dir"
+    config_set downloads_cleanup_method "$mode"
 }
 
 disable_downloads_cleanup() {
@@ -407,6 +415,11 @@ disable_downloads_cleanup() {
         remove_shell_hook
     fi
     info "Downloads auto-cleanup disabled"
+
+    # Sync to config file
+    config_set downloads_cleanup_enabled false
+    config_set downloads_cleanup_dir ""
+    config_set downloads_cleanup_method hook
 }
 
 enable_paranoid_mode() {
@@ -445,6 +458,10 @@ PARANOID_EOF
         generate_hook_script
         install_shell_hook
     fi
+
+    # Sync to config file
+    config_set paranoid_mode_enabled true
+    config_set paranoid_mode_method "$mode"
 }
 
 disable_paranoid_mode() {
@@ -474,6 +491,136 @@ disable_paranoid_mode() {
         remove_shell_hook
     fi
     info "Paranoid mode disabled"
+
+    # Sync to config file
+    config_set paranoid_mode_enabled false
+    config_set paranoid_mode_method hook
+}
+
+# ─── Config Versioning ──────────────────────────────────────────────────────
+
+config_read() {
+    # Parse config file into OLECHARMS_CFG_* variables (safe, no source)
+    [ -f "$OLECHARMS_CONFIG_FILE" ] || return 1
+    while IFS='=' read -r key value; do
+        # Skip comments and blank lines
+        case "$key" in
+            \#*|"") continue ;;
+        esac
+        # Sanitize key: only allow alphanumeric and underscore
+        key=$(echo "$key" | tr -cd 'A-Za-z0-9_')
+        [ -z "$key" ] && continue
+        printf -v "OLECHARMS_CFG_${key}" '%s' "$value"
+    done < "$OLECHARMS_CONFIG_FILE"
+}
+
+config_get() {
+    local key="$1" default="${2:-}"
+    local var="OLECHARMS_CFG_${key}"
+    if [ -n "${!var+x}" ]; then
+        echo "${!var}"
+    else
+        echo "$default"
+    fi
+}
+
+config_set() {
+    local key="$1" value="$2"
+    mkdir -p "$OLECHARMS_CONFIG_DIR"
+
+    # Update in-memory
+    printf -v "OLECHARMS_CFG_${key}" '%s' "$value"
+
+    # Update on disk: replace existing line or append
+    if [ -f "$OLECHARMS_CONFIG_FILE" ] && grep -q "^${key}=" "$OLECHARMS_CONFIG_FILE"; then
+        local tmpfile
+        tmpfile=$(mktemp)
+        while IFS= read -r line; do
+            case "$line" in
+                "${key}="*) echo "${key}=${value}" ;;
+                *)          echo "$line" ;;
+            esac
+        done < "$OLECHARMS_CONFIG_FILE" > "$tmpfile"
+        mv "$tmpfile" "$OLECHARMS_CONFIG_FILE"
+    else
+        echo "${key}=${value}" >> "$OLECHARMS_CONFIG_FILE"
+    fi
+}
+
+config_write_all() {
+    mkdir -p "$OLECHARMS_CONFIG_DIR"
+    cat > "$OLECHARMS_CONFIG_FILE" <<CFG_EOF
+# olecharms configuration
+CONFIG_VERSION=$(config_get CONFIG_VERSION "$CURRENT_CONFIG_VERSION")
+
+downloads_cleanup_enabled=$(config_get downloads_cleanup_enabled false)
+downloads_cleanup_dir=$(config_get downloads_cleanup_dir)
+downloads_cleanup_method=$(config_get downloads_cleanup_method hook)
+downloads_cleanup_max_age_days=$(config_get downloads_cleanup_max_age_days 30)
+
+paranoid_mode_enabled=$(config_get paranoid_mode_enabled false)
+paranoid_mode_method=$(config_get paranoid_mode_method hook)
+CFG_EOF
+}
+
+config_bootstrap() {
+    # First run: detect existing state and create config from it
+    info "Creating config file at $OLECHARMS_CONFIG_FILE"
+
+    local dl_enabled=false dl_dir="" dl_method=hook dl_age="$DOWNLOADS_MAX_AGE_DAYS"
+    local paranoid_enabled=false paranoid_method=hook
+
+    if is_downloads_cleanup_enabled; then
+        dl_enabled=true
+        # Extract dir from existing cleanup script
+        if [ -f "$CLEANUP_SCRIPT" ]; then
+            dl_dir=$(grep '^DOWNLOADS_DIR=' "$CLEANUP_SCRIPT" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"')
+        fi
+        if is_downloads_cron_enabled; then
+            dl_method=cron
+        fi
+    fi
+
+    if is_paranoid_mode_enabled; then
+        paranoid_enabled=true
+        if is_paranoid_cron_enabled; then
+            paranoid_method=cron
+        fi
+    fi
+
+    printf -v OLECHARMS_CFG_CONFIG_VERSION '%s' "$CURRENT_CONFIG_VERSION"
+    printf -v OLECHARMS_CFG_downloads_cleanup_enabled '%s' "$dl_enabled"
+    printf -v OLECHARMS_CFG_downloads_cleanup_dir '%s' "$dl_dir"
+    printf -v OLECHARMS_CFG_downloads_cleanup_method '%s' "$dl_method"
+    printf -v OLECHARMS_CFG_downloads_cleanup_max_age_days '%s' "$dl_age"
+    printf -v OLECHARMS_CFG_paranoid_mode_enabled '%s' "$paranoid_enabled"
+    printf -v OLECHARMS_CFG_paranoid_mode_method '%s' "$paranoid_method"
+
+    config_write_all
+}
+
+migrate_config() {
+    local current
+    current=$(config_get CONFIG_VERSION 0)
+    while [ "$current" -lt "$CURRENT_CONFIG_VERSION" ]; do
+        local next=$((current + 1))
+        local func="migrate_config_${current}_to_${next}"
+        if declare -f "$func" >/dev/null 2>&1; then
+            info "Migrating config v${current} → v${next}"
+            "$func"
+        fi
+        config_set CONFIG_VERSION "$next"
+        current=$next
+    done
+}
+
+config_ensure() {
+    if [ ! -f "$OLECHARMS_CONFIG_FILE" ]; then
+        config_bootstrap
+    else
+        config_read
+        migrate_config
+    fi
 }
 
 # ─── Core Operations ─────────────────────────────────────────────────────────
@@ -792,6 +939,7 @@ cmd_install() {
 
     # Self-update: pull the olecharms repo
     _self_update install
+    config_ensure
 
     install_packages
     create_vim_dirs
@@ -827,6 +975,7 @@ cmd_update() {
 
     # Self-update: pull the olecharms repo
     _self_update update
+    config_ensure
 
     install_packages
     create_vim_dirs
@@ -952,6 +1101,14 @@ cmd_status() {
     echo -e "${BLUE}Repo:${NC} $SCRIPT_DIR"
     echo -e "${BLUE}Vim dir:${NC} $VIM_DIR"
     echo -e "${BLUE}Font dir:${NC} $FONT_DIR"
+
+    # Config file
+    if [ -f "$OLECHARMS_CONFIG_FILE" ]; then
+        config_read
+        echo -e "${BLUE}Config:${NC} $OLECHARMS_CONFIG_FILE (v$(config_get CONFIG_VERSION 0))"
+    else
+        echo -e "${BLUE}Config:${NC} not created yet"
+    fi
 
     # Repo version
     if [ -d "$SCRIPT_DIR/.git" ]; then

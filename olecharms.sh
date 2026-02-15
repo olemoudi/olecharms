@@ -192,36 +192,41 @@ is_paranoid_cron_enabled() {
 generate_hook_script() {
     mkdir -p "$SCRIPTS_DIR"
 
-    cat > "$HOOK_SCRIPT" <<HOOK_EOF
+    cat > "$HOOK_SCRIPT" <<'HOOK_EOF'
 #!/bin/bash
 # olecharms-hook.sh — sourced from shell profile for scheduled cleanups
 
+_olecharms_hook_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+
 _olecharms_check_and_run() {
-    local script="\$1" name="\$2" interval="\$3"
-    [ ! -x "\$script" ] && return
-    local lastrun_file="$LASTRUN_DIR/\$name"
+    local script="$1" name="$2" interval="$3"
+    [ ! -x "$script" ] && return
+    local lastrun_dir="$_olecharms_hook_dir/.last-run"
+    local lastrun_file="$lastrun_dir/$name"
     local now last=0
-    now=\$(date +%s)
-    [ -f "\$lastrun_file" ] && last=\$(cat "\$lastrun_file" 2>/dev/null)
-    if [ \$((now - last)) -ge "\$interval" ]; then
-        mkdir -p "$LASTRUN_DIR"
-        echo "\$now" > "\$lastrun_file"
-        "\$script" &
+    now=$(date +%s)
+    [ -f "$lastrun_file" ] && last=$(cat "$lastrun_file" 2>/dev/null)
+    if [ $((now - last)) -ge "$interval" ]; then
+        mkdir -p "$lastrun_dir"
+        echo "$now" > "$lastrun_file"
+        "$script" &
     fi
 }
 HOOK_EOF
 
     # Only include features that are hook-scheduled (not cron)
+    # Dynamic lines — interval values are numeric constants, fine to bake in
     if is_downloads_cleanup_enabled && ! is_downloads_cron_enabled; then
-        echo "_olecharms_check_and_run \"$CLEANUP_SCRIPT\" \"downloads-cleanup\" $DOWNLOADS_INTERVAL" >> "$HOOK_SCRIPT"
+        echo "_olecharms_check_and_run \"\$_olecharms_hook_dir/cleanup-downloads.sh\" \"downloads-cleanup\" $DOWNLOADS_INTERVAL" >> "$HOOK_SCRIPT"
     fi
     if is_paranoid_mode_enabled && ! is_paranoid_cron_enabled; then
-        echo "_olecharms_check_and_run \"$PARANOID_SCRIPT\" \"paranoid-cleanup\" $PARANOID_INTERVAL" >> "$HOOK_SCRIPT"
+        echo "_olecharms_check_and_run \"\$_olecharms_hook_dir/paranoid-cleanup.sh\" \"paranoid-cleanup\" $PARANOID_INTERVAL" >> "$HOOK_SCRIPT"
     fi
 
     {
         echo ""
         echo "unset -f _olecharms_check_and_run"
+        echo "unset _olecharms_hook_dir"
     } >> "$HOOK_SCRIPT"
     chmod +x "$HOOK_SCRIPT"
 }
@@ -275,13 +280,15 @@ remove_shell_hook() {
 generate_shell_loader() {
     mkdir -p "$SCRIPTS_DIR"
 
-    cat > "$SHELL_LOADER" <<LOADER_EOF
+    cat > "$SHELL_LOADER" <<'LOADER_EOF'
 #!/bin/bash
-# olecharms-shell.sh — sources shell command files from $SHELL_DIR
-for _olecharms_f in "$SHELL_DIR"/*.sh; do
-    [ -f "\$_olecharms_f" ] && source "\$_olecharms_f"
+# olecharms-shell.sh — sources shell command files
+_olecharms_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+_olecharms_shell_dir="${_olecharms_dir%/*}/shell"
+for _olecharms_f in "$_olecharms_shell_dir"/*.sh; do
+    [ -f "$_olecharms_f" ] && source "$_olecharms_f"
 done
-unset _olecharms_f
+unset _olecharms_f _olecharms_dir _olecharms_shell_dir
 LOADER_EOF
     chmod +x "$SHELL_LOADER"
 }

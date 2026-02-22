@@ -38,6 +38,7 @@ SHELL_LOADER="$SCRIPTS_DIR/olecharms-shell.sh"
 SHELL_MARKER="# olecharms shell commands - do not remove this line"
 BIN_DIR="$HOME/.local/bin"
 BIN_MARKER="# olecharms PATH - do not remove this line"
+EDITOR_MARKER="# olecharms editor - do not remove this line"
 OLECHARMS_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/olecharms"
 OLECHARMS_CONFIG_FILE="$OLECHARMS_CONFIG_DIR/config"
 CURRENT_CONFIG_VERSION=1
@@ -396,6 +397,30 @@ install_binary() {
             echo "export PATH=\"\$HOME/.local/bin:\$PATH\""
         } >> "$rc"
         info "Added ~/.local/bin to PATH in $rc"
+    done
+}
+
+install_editor_env() {
+    local rc_files=()
+    [ -f "$HOME/.bashrc" ] && rc_files+=("$HOME/.bashrc")
+    [ -f "$HOME/.bash_profile" ] && rc_files+=("$HOME/.bash_profile")
+    [ -f "$HOME/.zshrc" ] && rc_files+=("$HOME/.zshrc")
+
+    if [ ${#rc_files[@]} -eq 0 ]; then
+        rc_files=("$HOME/.bashrc")
+    fi
+
+    for rc in "${rc_files[@]}"; do
+        if grep -qF "$EDITOR_MARKER" "$rc" 2>/dev/null; then
+            continue
+        fi
+        {
+            echo ""
+            echo "$EDITOR_MARKER"
+            echo "export EDITOR=vim"
+            echo "export VISUAL=vim"
+        } >> "$rc"
+        info "Added EDITOR=vim to $rc"
     done
 }
 
@@ -1004,6 +1029,7 @@ cmd_install() {
     run_post_commands
     install_shell_commands
     install_binary
+    install_editor_env
 
     echo ""
     if [ $ERROR_COUNT -eq 0 ]; then
@@ -1040,6 +1066,7 @@ cmd_update() {
     run_post_commands
     install_shell_commands
     install_binary
+    install_editor_env
 
     echo ""
     if [ $ERROR_COUNT -eq 0 ]; then
@@ -1140,6 +1167,22 @@ cmd_check() {
         echo -e "  ${GREEN}✓${NC} $SHELL_LOADER"
     else
         echo -e "  ${RED}✗${NC} $SHELL_LOADER  (not generated — run install or update)"
+    fi
+
+    # Check EDITOR env
+    echo ""
+    echo -e "${BLUE}EDITOR environment:${NC}"
+    local editor_found=false
+    for rc in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.zshrc"; do
+        if [ -f "$rc" ] && grep -qF "$EDITOR_MARKER" "$rc" 2>/dev/null; then
+            editor_found=true
+            break
+        fi
+    done
+    if $editor_found; then
+        echo -e "  ${GREEN}✓${NC} EDITOR=vim exported"
+    else
+        echo -e "  ${RED}✗${NC} EDITOR=vim not found in RC files"
     fi
 }
 

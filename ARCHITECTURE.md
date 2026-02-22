@@ -77,6 +77,7 @@ General-purpose helpers:
 - `generate_shell_loader()` — writes the `shell/*.sh` loader script
 - `install_shell_commands()` / `remove_shell_commands()` — manages loader lines in RC files
 - `install_binary()` — symlinks `olecharms` to `~/.local/bin` and adds it to PATH
+- `install_editor_env()` — exports `EDITOR=vim` and `VISUAL=vim` in RC files
 - `enable_downloads_cleanup()` / `disable_downloads_cleanup()` — manages the downloads cleaner
 - `enable_paranoid_mode()` / `disable_paranoid_mode()` — manages paranoid-mode cleaner
 
@@ -134,7 +135,8 @@ Both run the exact same sequence:
 12. `run_post_commands` — execute user-defined commands
 13. `install_shell_commands` — generate loader, add to RC files
 14. `install_binary` — symlink `olecharms` to `~/.local/bin`
-15. On install only: launch `zsh -l` so the user sees the result
+15. `install_editor_env` — export `EDITOR=vim` and `VISUAL=vim` in RC files
+16. On install only: launch `zsh -l` so the user sees the result
 
 ### `check`
 Reads `packages.conf`, then reports presence/absence of:
@@ -145,6 +147,7 @@ Reads `packages.conf`, then reports presence/absence of:
 - Vimrc source line
 - Font families
 - Shell commands and loader
+- EDITOR environment variable
 
 ### `status`
 Shows OS, repo path, config version, repo commit, installed plugin versions (commit + date), pathogen status, and available shell commands.
@@ -265,4 +268,5 @@ These marker strings are used for idempotent management of lines in shell RC fil
 | `# olecharms managed hook - do not remove this line` | Shell hook for scheduled cleanups |
 | `# olecharms shell commands - do not remove this line` | Shell command loader |
 | `# olecharms PATH - do not remove this line` | `~/.local/bin` PATH entry |
+| `# olecharms editor - do not remove this line` | EDITOR/VISUAL environment variable |
 | `" olecharms managed config - do not remove this line` | Source line in `~/.vimrc` |

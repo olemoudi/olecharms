@@ -120,23 +120,22 @@ Dispatches `$1` to the appropriate `cmd_*` handler.
 ## Subcommand Flows
 
 ### `install` / `update`
-Both run the exact same sequence:
+`main()` calls `config_ensure` + `fix_moved_install` before dispatch (see [Auto-fix on move](#auto-fix-on-move)). Then both commands run the same sequence:
 1. `load_config` — source `packages.conf`
 2. `detect_os` — determine package manager and font directory
 3. `_self_update` — pull the olecharms repo; re-exec if script changed
-4. `config_ensure` — bootstrap or migrate XDG config file
-5. `install_packages` — install missing system packages (skip already-installed)
-6. `create_vim_dirs` — ensure vim directory structure
-7. `install_pathogen` — clone or use bundled pathogen
-8. `install_plugins` — clone/update all vim plugins
-9. `install_vimrc` — add/update source line in `~/.vimrc`
-10. `install_fonts` — install powerline fonts
-11. `install_omz` — set up Oh My Zsh with custom theme
-12. `run_post_commands` — execute user-defined commands
-13. `install_shell_commands` — generate loader, add to RC files
-14. `install_binary` — symlink `olecharms` to `~/.local/bin`
-15. `install_editor_env` — export `EDITOR=vim` and `VISUAL=vim` in RC files
-16. On install only: launch `zsh -l` so the user sees the result
+4. `install_packages` — install missing system packages (skip already-installed)
+5. `create_vim_dirs` — ensure vim directory structure
+6. `install_pathogen` — clone or use bundled pathogen
+7. `install_plugins` — clone/update all vim plugins
+8. `install_vimrc` — add/update source line in `~/.vimrc`
+9. `install_fonts` — install powerline fonts
+10. `install_omz` — set up Oh My Zsh with custom theme
+11. `run_post_commands` — execute user-defined commands
+12. `install_shell_commands` — generate loader, add to RC files
+13. `install_binary` — symlink `olecharms` to `~/.local/bin`
+14. `install_editor_env` — export `EDITOR=vim` and `VISUAL=vim` in RC files
+15. On install only: launch `zsh -l` so the user sees the result
 
 ### `check`
 Reads `packages.conf`, then reports presence/absence of:
@@ -225,13 +224,14 @@ Simple `key=value` pairs. Parsed safely without `source` — only alphanumeric k
 - `migrate_config()` loops from the file's `CONFIG_VERSION` up to `CURRENT_CONFIG_VERSION`, calling `migrate_config_N_to_M()` functions if they exist
 - To add a new config flag: increment `CURRENT_CONFIG_VERSION`, add a `migrate_config_N_to_M()` function that calls `config_set` for the new key, and update `config_write_all()` to include it
 
-### Current config keys (v1)
+### Current config keys (v2)
 - `downloads_cleanup_enabled` (true/false)
 - `downloads_cleanup_dir` (path)
 - `downloads_cleanup_method` (hook/cron)
 - `downloads_cleanup_max_age_days` (integer)
 - `paranoid_mode_enabled` (true/false)
 - `paranoid_mode_method` (hook/cron)
+- `install_dir` (path) — records the installation directory for stale-path detection after folder moves
 
 ## Design Decisions
 
@@ -240,6 +240,9 @@ Every operation checks current state before acting. Running `install` or `update
 
 ### Preserving existing installations
 When multiple copies of the repo exist (e.g., a primary install at `/home/user/olecharms` and a dev copy elsewhere), running `install`/`update` from one copy will not overwrite valid entries from another. The shell hook, shell commands, and binary symlink functions extract the path from existing RC entries or symlinks and skip the update if the target file still exists on disk. Only stale entries (pointing to paths that no longer exist) are replaced.
+
+### Auto-fix on move
+The config stores `install_dir` (the directory olecharms was last run from). On every operational command (`install`, `update`, `check`, `status`, `config`), `main()` calls `fix_moved_install()` which compares the stored path against the current `SCRIPT_DIR`. If they differ, the installation folder was moved. For mutating commands (`install`/`update`/`config`), all stale paths are repaired automatically (vimrc source line, RC file references, binary symlink). For read-only commands (`check`/`status`), a warning is printed directing the user to run `install` or `update`.
 
 ### Bundled fallbacks
 All vim plugins, pathogen, and powerline fonts are bundled in `vimthings/`. If `git clone` fails (offline, firewalled), the bundled copy is used. This guarantees the environment works without network access.

@@ -41,7 +41,7 @@ BIN_MARKER="# olecharms PATH - do not remove this line"
 EDITOR_MARKER="# olecharms editor - do not remove this line"
 OLECHARMS_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/olecharms"
 OLECHARMS_CONFIG_FILE="$OLECHARMS_CONFIG_DIR/config"
-CURRENT_CONFIG_VERSION=1
+CURRENT_CONFIG_VERSION=2
 
 # Source line we manage in ~/.vimrc
 SOURCE_MARKER="\" olecharms managed config - do not remove this line"
@@ -638,6 +638,8 @@ downloads_cleanup_max_age_days=$(config_get downloads_cleanup_max_age_days 30)
 
 paranoid_mode_enabled=$(config_get paranoid_mode_enabled false)
 paranoid_mode_method=$(config_get paranoid_mode_method hook)
+
+install_dir=$(config_get install_dir "$SCRIPT_DIR")
 CFG_EOF
 }
 
@@ -673,6 +675,7 @@ config_bootstrap() {
     printf -v OLECHARMS_CFG_downloads_cleanup_max_age_days '%s' "$dl_age"
     printf -v OLECHARMS_CFG_paranoid_mode_enabled '%s' "$paranoid_enabled"
     printf -v OLECHARMS_CFG_paranoid_mode_method '%s' "$paranoid_method"
+    printf -v OLECHARMS_CFG_install_dir '%s' "$SCRIPT_DIR"
 
     config_write_all
 }
@@ -692,6 +695,10 @@ migrate_config() {
     done
 }
 
+migrate_config_1_to_2() {
+    config_set install_dir "$SCRIPT_DIR"
+}
+
 config_ensure() {
     if [ ! -f "$OLECHARMS_CONFIG_FILE" ]; then
         config_bootstrap
@@ -699,6 +706,33 @@ config_ensure() {
         config_read
         migrate_config
     fi
+}
+
+fix_moved_install() {
+    local mode="${1:-fix}"
+    local stored_dir
+    stored_dir=$(config_get install_dir "")
+    [ -z "$stored_dir" ] && return
+    [ "$stored_dir" = "$SCRIPT_DIR" ] && return
+
+    if [ "$mode" = "warn" ]; then
+        warn "Install directory moved: $stored_dir → $SCRIPT_DIR"
+        warn "Run 'olecharms install' or 'olecharms update' to fix stale paths."
+        return
+    fi
+
+    warn "Install directory moved: $stored_dir → $SCRIPT_DIR"
+    warn "Updating stale paths..."
+
+    install_vimrc
+    install_shell_commands
+    if [ -f "$HOOK_SCRIPT" ] || grep -qlF "$HOOK_MARKER" "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.bash_profile" 2>/dev/null; then
+        install_shell_hook
+    fi
+    install_binary
+
+    config_set install_dir "$SCRIPT_DIR"
+    info "All paths updated to new location."
 }
 
 # ─── Core Operations ─────────────────────────────────────────────────────────
@@ -1017,7 +1051,6 @@ cmd_install() {
 
     # Self-update: pull the olecharms repo
     _self_update install
-    config_ensure
 
     install_packages
     create_vim_dirs
@@ -1054,7 +1087,6 @@ cmd_update() {
 
     # Self-update: pull the olecharms repo
     _self_update update
-    config_ensure
 
     install_packages
     create_vim_dirs
@@ -1583,6 +1615,18 @@ cmd_help() {
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 main() {
+    # For operational commands, ensure config is loaded and check for moved install
+    case "${1:-}" in
+        install|update|config)
+            config_ensure
+            fix_moved_install fix
+            ;;
+        check|status)
+            config_ensure
+            fix_moved_install warn
+            ;;
+    esac
+
     case "${1:-}" in
         install) cmd_install ;;
         update)  cmd_update ;;

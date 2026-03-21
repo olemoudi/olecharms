@@ -1,14 +1,33 @@
-# switchsshkey — manage and switch between named SSH key pairs
+# switchsshkey — manage and switch between named SSH key pairs (alias: ssk)
 switchsshkey() {
-    local cmd="${1:-help}"
+    local cmd="${1:-current}"
 
     case "$cmd" in
         help)
             echo "Usage:" >&2
+            echo "  switchsshkey              — show which named key is currently active" >&2
             echo "  switchsshkey add <name> <private_key_file> <public_key_file>" >&2
-            echo "  switchsshkey <name>" >&2
-            echo "  switchsshkey list" >&2
-            echo "  switchsshkey help" >&2
+            echo "  switchsshkey <name>       — switch to named key pair" >&2
+            echo "  switchsshkey list         — list available key pairs" >&2
+            echo "  switchsshkey help         — show this help" >&2
+            echo "  (alias: ssk)" >&2
+            ;;
+        current)
+            if [ ! -f ~/.ssh/id_ed25519.pub ]; then
+                echo "switchsshkey: no active key (id_ed25519.pub not found)" >&2
+                return 1
+            fi
+            local f name
+            for f in ~/.ssh/*.pubkey; do
+                [ -f "$f" ] || continue
+                if cmp -s ~/.ssh/id_ed25519.pub "$f"; then
+                    name=$(basename "$f" .pubkey)
+                    echo "$name"
+                    return 0
+                fi
+            done
+            echo "unknown (no matching named key)" >&2
+            return 1
             ;;
         list)
             local f
@@ -77,3 +96,4 @@ switchsshkey() {
             ;;
     esac
 }
+ssk() { switchsshkey "$@"; }

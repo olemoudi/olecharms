@@ -837,17 +837,31 @@ install_plugins() {
 
 install_vimrc() {
     if [ -f "$VIMRC" ]; then
-        # Already has the exact current source line — nothing to do
-        if grep -qF "$SOURCE_LINE" "$VIMRC"; then
-            info "vimrc source line already present in $VIMRC"
-            return
-        fi
+        local stale_count
+        stale_count=$(grep -c 'source .*/vimthings/olevimrc\.vim' "$VIMRC" 2>/dev/null || echo 0)
 
-        # Has an old source line with a different path — replace it
-        if grep -q 'source .*/vimthings/olevimrc\.vim' "$VIMRC"; then
-            sed -i "s|source .*/vimthings/olevimrc\.vim|$SOURCE_LINE|" "$VIMRC"
-            info "Updated source line path in $VIMRC"
-            return
+        if [ "$stale_count" -gt 0 ]; then
+            local has_correct=false
+            grep -qF "$SOURCE_LINE" "$VIMRC" && has_correct=true
+
+            # Remove source lines that don't match the exact current path
+            sed -i "\|source .*/vimthings/olevimrc\.vim|{
+                \|$SOURCE_LINE|!d
+            }" "$VIMRC"
+
+            # Clean up orphaned marker comments (marker not followed by a source line)
+            sed -i '/^" olecharms managed config - do not remove this line$/{
+                N
+                /\nsource .*\/vimthings\/olevimrc\.vim/!{
+                    s/^" olecharms managed config - do not remove this line\n//
+                }
+            }' "$VIMRC"
+
+            if $has_correct; then
+                info "vimrc source line already present in $VIMRC"
+                [ "$stale_count" -gt 1 ] && info "Removed stale source line(s) from $VIMRC"
+                return
+            fi
         fi
 
         backup_file "$VIMRC"

@@ -44,8 +44,9 @@ filetype on
 filetype plugin on
 filetype indent on
 set undofile " Maintain history of undos between sessions
-set undodir=$HOME/.vim/undodir
-set directory=$HOME/.vim/swapfiles
+" Use let &opt so a $HOME containing spaces does not need escaping
+let &undodir = expand('$HOME/.vim/undodir')
+let &directory = expand('$HOME/.vim/swapfiles')
  
 " Highlight search terms...
 set hlsearch

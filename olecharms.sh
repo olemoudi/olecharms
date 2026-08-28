@@ -5,17 +5,23 @@
 # ─── Constants & Globals ─────────────────────────────────────────────────────
 
 _src="${BASH_SOURCE[0]}"
-while [ -L "$_src" ]; do
-    _dir="$(cd "$(dirname "$_src")" && pwd)"
-    _src="$(readlink "$_src")"
+_guard=0
+while [ -L "$_src" ] && [ "$_guard" -lt 32 ]; do
+    _dir="$(cd "$(dirname "$_src")" && pwd)" || break
+    _src="$(readlink "$_src")" || break
     [[ "$_src" != /* ]] && _src="$_dir/$_src"
+    _guard=$((_guard + 1))
 done
 SCRIPT_DIR="$(cd "$(dirname "$_src")" && pwd)"
-unset _src _dir
+# Use the real filename rather than assuming "olecharms.sh", so a renamed
+# checkout still symlinks and relaunches correctly.
+SCRIPT_PATH="$SCRIPT_DIR/$(basename "$_src")"
+unset _src _dir _guard
 CONF_FILE="$SCRIPT_DIR/packages.conf"
 VIM_DIR="$HOME/.vim"
 VIMRC="$HOME/.vimrc"
 BUNDLED_DIR="$SCRIPT_DIR/vimthings"
+BUNDLED_STAMP=".olecharms-bundled"
 PATHOGEN_STAGING="$VIM_DIR/.pathogen-repo"
 FONTS_STAGING="$VIM_DIR/.fonts-repo"
 ERROR_COUNT=0
@@ -43,9 +49,20 @@ OLECHARMS_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/olecharms"
 OLECHARMS_CONFIG_FILE="$OLECHARMS_CONFIG_DIR/config"
 CURRENT_CONFIG_VERSION=2
 
+# olecharms is a userland install: everything it writes lives under $HOME
+# (plus the checkout itself). Nothing here needs root except optional system
+# package installation, which is delegated to sudo.
+if [ -z "${HOME:-}" ] || [ ! -d "$HOME" ] || [ ! -w "$HOME" ]; then
+    echo "olecharms: \$HOME is unset, missing or not writable — cannot continue" >&2
+    exit 1
+fi
+
 # Source line we manage in ~/.vimrc
 SOURCE_MARKER="\" olecharms managed config - do not remove this line"
-SOURCE_LINE="source $SCRIPT_DIR/vimthings/olevimrc.vim"
+# :source takes a bare path, so spaces and other vim-special characters have to
+# be backslash-escaped rather than quoted.
+_vim_escape() { printf '%s' "$1" | sed 's/[ \\|"%#]/\\&/g'; }
+SOURCE_LINE="source $(_vim_escape "$SCRIPT_DIR/vimthings/olevimrc.vim")"
 
 # ─── Color / Output Helpers ──────────────────────────────────────────────────
 
@@ -80,7 +97,7 @@ detect_os() {
         Linux*)
             OS="linux"
             PKG_MANAGER="apt-get"
-            FONT_DIR="$HOME/.local/share/fonts"
+            FONT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/fonts"
             ;;
         Darwin*)
             OS="macos"
@@ -115,26 +132,57 @@ clone_or_pull() {
         info "Updating $name..."
         if git -C "$dest" pull --ff-only 2>/dev/null; then
             return 0
-        else
-            warn "git pull failed for $name, trying reset"
-            git -C "$dest" fetch origin 2>/dev/null
-            local branch
-            branch=$(git -C "$dest" symbolic-ref --short HEAD 2>/dev/null || echo "master")
-            git -C "$dest" reset --hard "origin/$branch" 2>/dev/null && return 0
-            warn "Could not update $name (may be offline)"
-            return 1
         fi
+        warn "git pull failed for $name, trying reset"
+        if git -C "$dest" fetch origin 2>/dev/null; then
+            local branch
+            branch=$(git -C "$dest" symbolic-ref --short HEAD 2>/dev/null)
+            if [ -z "$branch" ]; then
+                # Detached HEAD: fall back to the remote's default branch
+                branch=$(git -C "$dest" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null)
+                branch="${branch#origin/}"
+            fi
+            [ -z "$branch" ] && branch="master"
+            git -C "$dest" reset --hard "origin/$branch" 2>/dev/null && return 0
+        fi
+        warn "Could not update $name (may be offline)"
+        return 1
     fi
 
-    # If directory exists but is not a git repo, move to bundle_disabled and re-clone
-    if [ -d "$dest" ] && [ ! -d "$dest/.git" ]; then
+    # A copy we made from the bundled fallback on a previous offline run. Try to
+    # upgrade it to a real clone, but keep it untouched if we are still offline.
+    # (Without this, every offline run would shunt it into bundle_disabled and
+    # re-copy it, which grows without bound.)
+    if [ -d "$dest" ] && [ -f "$dest/$BUNDLED_STAMP" ]; then
+        local tmp_clone="${dest}.clone.$$"
+        rm -rf "$tmp_clone"
+        if git clone --depth 1 "$url" "$tmp_clone" 2>/dev/null; then
+            rm -rf "$dest"
+            if mv "$tmp_clone" "$dest"; then
+                info "Replaced bundled $name with a fresh clone"
+                return 0
+            fi
+            error "Could not install fresh clone of $name"
+            return 1
+        fi
+        rm -rf "$tmp_clone"
+        info "Keeping bundled copy of $name (offline)"
+        return 0
+    fi
+
+    # Directory exists but is neither a git repo nor one of ours: preserve it.
+    if [ -d "$dest" ]; then
         warn "$name exists but is not a git repo. Moving to bundle_disabled and re-cloning."
         local disabled_dest="$VIM_DIR/bundle_disabled/${name}.replaced.$(date +%Y%m%d_%H%M%S)"
         mkdir -p "$VIM_DIR/bundle_disabled"
-        mv "$dest" "$disabled_dest"
+        if ! mv "$dest" "$disabled_dest"; then
+            error "Could not move $dest out of the way"
+            return 1
+        fi
         info "Moved $dest → $disabled_dest"
     fi
 
+    mkdir -p "$(dirname "$dest")"
     info "Cloning $name..."
     if git clone --depth 1 "$url" "$dest" 2>/dev/null; then
         return 0
@@ -143,16 +191,196 @@ clone_or_pull() {
     # Fallback to bundled copy
     if [ -n "$fallback" ] && [ -d "$fallback" ]; then
         warn "Clone failed for $name. Using bundled copy from $fallback"
-        cp -r "$fallback" "$dest"
-        return 0
+        rm -rf "$dest"
+        if cp -r "$fallback" "$dest"; then
+            : > "$dest/$BUNDLED_STAMP"
+            return 0
+        fi
+        error "Could not copy bundled $name from $fallback"
+        return 1
     fi
 
-    error "Failed to clone $name and no bundled fallback available"
+    warn "Could not fetch $name and no bundled fallback is available"
     return 1
 }
 
 check_command() {
     command -v "$1" >/dev/null 2>&1
+}
+
+# Resolve a symlink chain to its final target. Portable: `readlink -f` is GNU
+# and only reached macOS in Monterey.
+resolve_link() {
+    local path="$1" dir guard=0
+    while [ -L "$path" ] && [ "$guard" -lt 32 ]; do
+        dir=$(cd "$(dirname "$path")" 2>/dev/null && pwd) || break
+        path=$(readlink "$path") || break
+        case "$path" in
+            /*) ;;
+            *)  path="$dir/$path" ;;
+        esac
+        guard=$((guard + 1))
+    done
+    echo "$path"
+}
+
+# Replace $2's contents with $1's. Writes through symlinks (so stow/chezmoi
+# dotfiles keep working) and swaps in via rename, so an interrupted run cannot
+# leave a half-written RC file behind. Preserves the original mode/ownership.
+write_file_contents() {
+    local src="$1" dest="$2"
+    local target tmp
+    if [ ! -f "$src" ]; then
+        error "Internal error: temp file $src is missing"
+        return 1
+    fi
+
+    target=$(resolve_link "$dest")
+    [ -n "$target" ] || target="$dest"
+    tmp="${target}.olecharms.$$"
+
+    # Seed the temp file next to the target so the rename below stays atomic,
+    # copying the target's permissions and ownership where we can.
+    if [ -e "$target" ]; then
+        cp -p "$target" "$tmp" 2>/dev/null || : > "$tmp" 2>/dev/null
+    else
+        : > "$tmp" 2>/dev/null
+    fi
+
+    if [ ! -f "$tmp" ]; then
+        # Directory not writable — fall back to an in-place rewrite
+        if ! cat "$src" > "$target"; then
+            error "Could not write to $target"
+            return 1
+        fi
+        return 0
+    fi
+
+    if ! cat "$src" > "$tmp"; then
+        rm -f "$tmp"
+        error "Could not write to $target"
+        return 1
+    fi
+    if ! mv -f "$tmp" "$target"; then
+        rm -f "$tmp"
+        error "Could not replace $target"
+        return 1
+    fi
+    return 0
+}
+
+# Portable in-place sed: BSD/macOS sed requires an argument to -i, GNU does not.
+sed_inplace() {
+    local file="$1"; shift
+    local tmpfile status
+    tmpfile=$(mktemp) || { error "mktemp failed"; return 1; }
+    if ! sed "$@" "$file" > "$tmpfile"; then
+        rm -f "$tmpfile"
+        error "sed failed on $file"
+        return 1
+    fi
+    write_file_contents "$tmpfile" "$file"
+    status=$?
+    rm -f "$tmpfile"
+    return $status
+}
+
+# Remove an olecharms-managed block from an RC file: the marker line, any line
+# containing $3, and the blank line we insert before each block (so repeated
+# install/remove cycles do not accumulate blank lines).
+rc_strip_block() {
+    local rc="$1" marker="$2" pat="${3:-}"
+    local tmpfile status
+    [ -f "$rc" ] || return 0
+    tmpfile=$(mktemp) || { error "mktemp failed"; return 1; }
+    if ! awk -v marker="$marker" -v pat="$pat" '
+        function flush() { if (pending) { print ""; pending = 0 } }
+        {
+            if (index($0, marker) > 0 || (pat != "" && index($0, pat) > 0)) {
+                pending = 0
+                next
+            }
+            if ($0 == "") { flush(); pending = 1; next }
+            flush()
+            print
+        }
+    ' "$rc" > "$tmpfile"; then
+        rm -f "$tmpfile"
+        error "Could not rewrite $rc"
+        return 1
+    fi
+    write_file_contents "$tmpfile" "$rc"
+    status=$?
+    rm -f "$tmpfile"
+    return $status
+}
+
+# Append a block to $1, preceded by one blank separator line — but not when the
+# file is new or empty, which would leave a stray blank line at the top. Makes
+# sure the file ends with a newline first.
+append_block() {
+    local file="$1"; shift
+    if [ -s "$file" ]; then
+        [ -n "$(tail -c 1 "$file" 2>/dev/null)" ] && printf '\n' >> "$file"
+        printf '\n' >> "$file"
+    fi
+    printf '%s\n' "$@" >> "$file"
+}
+
+# The RC files we manage, one per line. Falls back to ~/.bashrc if none exist.
+managed_rc_files() {
+    local rc found=0
+    for rc in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.zshrc"; do
+        if [ -f "$rc" ]; then
+            echo "$rc"
+            found=1
+        fi
+    done
+    [ "$found" -eq 0 ] && echo "$HOME/.bashrc"
+    return 0
+}
+
+# True if any managed RC file contains $1.
+rc_has_marker() {
+    local marker="$1" rc
+    for rc in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.zshrc"; do
+        [ -f "$rc" ] && grep -qF "$marker" "$rc" 2>/dev/null && return 0
+    done
+    return 1
+}
+
+# Quote a path for a crontab command line: cron hands the line to /bin/sh, and
+# an unescaped % is turned into a newline.
+cron_quote_path() {
+    local path="$1"
+    path=${path//\'/\'\\\'\'}
+    path=${path//%/\\%}
+    printf "'%s'" "$path"
+}
+
+# Replace (or, with an empty $2, remove) the crontab entry tagged with marker $1.
+cron_replace_entry() {
+    local marker="$1" entry="${2:-}"
+    local existing new_content
+    if ! check_command crontab; then
+        error "crontab is not available"
+        return 1
+    fi
+    existing=$(crontab -l 2>/dev/null | grep -vF "$marker")
+    if [ -n "$entry" ]; then
+        if [ -n "$existing" ]; then
+            new_content=$(printf '%s\n%s' "$existing" "$entry")
+        else
+            new_content="$entry"
+        fi
+    else
+        new_content="$existing"
+    fi
+    if [ -z "$new_content" ]; then
+        crontab -r 2>/dev/null || true
+        return 0
+    fi
+    printf '%s\n' "$new_content" | crontab -
 }
 
 _file_hash() {
@@ -190,8 +418,18 @@ is_paranoid_cron_enabled() {
     check_command crontab && crontab -l 2>/dev/null | grep -qF "$CRON_MARKER_PARANOID"
 }
 
+# scripts/ lives inside the checkout; bail out clearly if it is read-only
+# instead of writing broken half-generated files.
+ensure_scripts_dir() {
+    if ! mkdir -p "$SCRIPTS_DIR" 2>/dev/null || [ ! -w "$SCRIPTS_DIR" ]; then
+        error "Cannot write to $SCRIPTS_DIR — is the olecharms checkout read-only?"
+        return 1
+    fi
+    return 0
+}
+
 generate_hook_script() {
-    mkdir -p "$SCRIPTS_DIR"
+    ensure_scripts_dir || return 1
 
     cat > "$HOOK_SCRIPT" <<'HOOK_EOF'
 #!/bin/bash
@@ -233,33 +471,19 @@ HOOK_EOF
 }
 
 install_shell_hook() {
-    local rc_files=()
-    [ -f "$HOME/.bashrc" ] && rc_files+=("$HOME/.bashrc")
-    [ -f "$HOME/.bash_profile" ] && rc_files+=("$HOME/.bash_profile")
-    [ -f "$HOME/.zshrc" ] && rc_files+=("$HOME/.zshrc")
-
-    # Default to .bashrc if none exist
-    if [ ${#rc_files[@]} -eq 0 ]; then
-        rc_files=("$HOME/.bashrc")
-    fi
+    local rc_files=() rc
+    while IFS= read -r rc; do rc_files+=("$rc"); done < <(managed_rc_files)
 
     for rc in "${rc_files[@]}"; do
         if grep -qF "$HOOK_MARKER" "$rc" 2>/dev/null; then
-            local existing_path
-            existing_path=$(sed -n 's/.*\[ -f "\(.*olecharms-hook\.sh\)" \].*/\1/p' "$rc")
-            if [ -n "$existing_path" ] && [ -f "$existing_path" ]; then
+            if grep -qF "source \"$HOOK_SCRIPT\"" "$rc" 2>/dev/null; then
                 continue
             fi
-            local tmpfile
-            tmpfile=$(mktemp)
-            grep -vF "$HOOK_MARKER" "$rc" | grep -v "olecharms-hook\.sh" > "$tmpfile"
-            mv "$tmpfile" "$rc"
+            rc_strip_block "$rc" "$HOOK_MARKER" "olecharms-hook.sh" || return 1
         fi
-        {
-            echo ""
-            echo "$HOOK_MARKER"
-            echo "[ -f \"$HOOK_SCRIPT\" ] && source \"$HOOK_SCRIPT\""
-        } >> "$rc"
+        append_block "$rc" \
+            "$HOOK_MARKER" \
+            "[ -f \"$HOOK_SCRIPT\" ] && source \"$HOOK_SCRIPT\""
         info "Shell hook installed in $rc"
     done
 }
@@ -268,18 +492,15 @@ remove_shell_hook() {
     for rc in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.zshrc"; do
         [ ! -f "$rc" ] && continue
         if grep -qF "$HOOK_MARKER" "$rc" 2>/dev/null; then
-            local tmpfile
-            tmpfile=$(mktemp)
-            grep -vF "$HOOK_MARKER" "$rc" | grep -v "olecharms-hook\.sh" > "$tmpfile"
-            mv "$tmpfile" "$rc"
-            info "Shell hook removed from $rc"
+            rc_strip_block "$rc" "$HOOK_MARKER" "olecharms-hook.sh" \
+                && info "Shell hook removed from $rc"
         fi
     done
     rm -f "$HOOK_SCRIPT"
 }
 
 generate_shell_loader() {
-    mkdir -p "$SCRIPTS_DIR"
+    ensure_scripts_dir || return 1
 
     cat > "$SHELL_LOADER" <<'LOADER_EOF'
 #!/bin/bash
@@ -296,130 +517,99 @@ LOADER_EOF
 
 install_shell_commands() {
     # Check if shell dir exists and has files
-    if [ ! -d "$SHELL_DIR" ] || [ -z "$(ls "$SHELL_DIR"/*.sh 2>/dev/null)" ]; then
+    local shell_files=("$SHELL_DIR"/*.sh)
+    if [ ! -d "$SHELL_DIR" ] || [ ! -e "${shell_files[0]}" ]; then
         return
     fi
 
-    local rc_files=()
-    [ -f "$HOME/.bashrc" ] && rc_files+=("$HOME/.bashrc")
-    [ -f "$HOME/.bash_profile" ] && rc_files+=("$HOME/.bash_profile")
-    [ -f "$HOME/.zshrc" ] && rc_files+=("$HOME/.zshrc")
+    # Cheap and idempotent, and the loader lives in the gitignored scripts/ dir,
+    # so regenerate unconditionally rather than only when an RC file changes.
+    generate_shell_loader || return 1
 
-    # Default to .bashrc if none exist
-    if [ ${#rc_files[@]} -eq 0 ]; then
-        rc_files=("$HOME/.bashrc")
-    fi
+    local rc_files=() rc
+    while IFS= read -r rc; do rc_files+=("$rc"); done < <(managed_rc_files)
 
-    local needs_update=false
     for rc in "${rc_files[@]}"; do
         if grep -qF "$SHELL_MARKER" "$rc" 2>/dev/null; then
-            local existing_path
-            existing_path=$(sed -n 's/.*\[ -f "\(.*olecharms-shell\.sh\)" \].*/\1/p' "$rc")
-            if [ -n "$existing_path" ] && [ -f "$existing_path" ]; then
+            if grep -qF "source \"$SHELL_LOADER\"" "$rc" 2>/dev/null; then
                 continue
             fi
-            local tmpfile
-            tmpfile=$(mktemp)
-            grep -vF "$SHELL_MARKER" "$rc" | grep -v "olecharms-shell\.sh" > "$tmpfile"
-            mv "$tmpfile" "$rc"
+            rc_strip_block "$rc" "$SHELL_MARKER" "olecharms-shell.sh" || return 1
         fi
-        needs_update=true
+        append_block "$rc" \
+            "$SHELL_MARKER" \
+            "[ -f \"$SHELL_LOADER\" ] && source \"$SHELL_LOADER\""
+        info "Shell commands installed in $rc"
     done
-
-    if [ "$needs_update" = true ]; then
-        generate_shell_loader
-        for rc in "${rc_files[@]}"; do
-            if grep -qF "$SHELL_MARKER" "$rc" 2>/dev/null; then
-                continue
-            fi
-            {
-                echo ""
-                echo "$SHELL_MARKER"
-                echo "[ -f \"$SHELL_LOADER\" ] && source \"$SHELL_LOADER\""
-            } >> "$rc"
-            info "Shell commands installed in $rc"
-        done
-    fi
 }
 
 remove_shell_commands() {
     for rc in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.zshrc"; do
         [ ! -f "$rc" ] && continue
         if grep -qF "$SHELL_MARKER" "$rc" 2>/dev/null; then
-            local tmpfile
-            tmpfile=$(mktemp)
-            grep -vF "$SHELL_MARKER" "$rc" | grep -v "olecharms-shell\.sh" > "$tmpfile"
-            mv "$tmpfile" "$rc"
-            info "Shell commands removed from $rc"
+            rc_strip_block "$rc" "$SHELL_MARKER" "olecharms-shell.sh" \
+                && info "Shell commands removed from $rc"
         fi
     done
     rm -f "$SHELL_LOADER"
 }
 
 install_binary() {
-    mkdir -p "$BIN_DIR"
+    if ! mkdir -p "$BIN_DIR" 2>/dev/null; then
+        error "Could not create $BIN_DIR"
+        return 1
+    fi
 
     if [ -L "$BIN_DIR/olecharms" ]; then
         local existing_target
         existing_target="$(readlink "$BIN_DIR/olecharms")"
-        if [ -f "$existing_target" ] && [ "$existing_target" != "$SCRIPT_DIR/olecharms.sh" ]; then
+        # readlink may return a relative path; resolve it against the link's dir
+        case "$existing_target" in
+            /*) ;;
+            *)  existing_target="$BIN_DIR/$existing_target" ;;
+        esac
+        if [ -f "$existing_target" ] && [ "$existing_target" != "$SCRIPT_PATH" ]; then
             info "olecharms binary already linked to $existing_target (keeping existing)"
         else
-            ln -sf "$SCRIPT_DIR/olecharms.sh" "$BIN_DIR/olecharms"
+            ln -sf "$SCRIPT_PATH" "$BIN_DIR/olecharms"
             info "Symlinked olecharms → $BIN_DIR/olecharms"
         fi
     else
-        ln -sf "$SCRIPT_DIR/olecharms.sh" "$BIN_DIR/olecharms"
+        ln -sf "$SCRIPT_PATH" "$BIN_DIR/olecharms"
         info "Symlinked olecharms → $BIN_DIR/olecharms"
     fi
 
     # Check if ~/.local/bin is already on PATH
-    if echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR" 2>/dev/null; then
+    if echo "$PATH" | tr ':' '\n' | grep -qxF -- "$BIN_DIR" 2>/dev/null; then
         return
     fi
 
-    local rc_files=()
-    [ -f "$HOME/.bashrc" ] && rc_files+=("$HOME/.bashrc")
-    [ -f "$HOME/.bash_profile" ] && rc_files+=("$HOME/.bash_profile")
-    [ -f "$HOME/.zshrc" ] && rc_files+=("$HOME/.zshrc")
-
-    if [ ${#rc_files[@]} -eq 0 ]; then
-        rc_files=("$HOME/.bashrc")
-    fi
+    local rc_files=() rc
+    while IFS= read -r rc; do rc_files+=("$rc"); done < <(managed_rc_files)
 
     for rc in "${rc_files[@]}"; do
         if grep -qF "$BIN_MARKER" "$rc" 2>/dev/null; then
             continue
         fi
-        {
-            echo ""
-            echo "$BIN_MARKER"
-            echo "export PATH=\"\$HOME/.local/bin:\$PATH\""
-        } >> "$rc"
+        append_block "$rc" \
+            "$BIN_MARKER" \
+            "export PATH=\"\$HOME/.local/bin:\$PATH\""
         info "Added ~/.local/bin to PATH in $rc"
     done
 }
 
 install_editor_env() {
-    local rc_files=()
-    [ -f "$HOME/.bashrc" ] && rc_files+=("$HOME/.bashrc")
-    [ -f "$HOME/.bash_profile" ] && rc_files+=("$HOME/.bash_profile")
-    [ -f "$HOME/.zshrc" ] && rc_files+=("$HOME/.zshrc")
-
-    if [ ${#rc_files[@]} -eq 0 ]; then
-        rc_files=("$HOME/.bashrc")
-    fi
+    local rc_files=() rc
+    while IFS= read -r rc; do rc_files+=("$rc"); done < <(managed_rc_files)
 
     for rc in "${rc_files[@]}"; do
         if grep -qF "$EDITOR_MARKER" "$rc" 2>/dev/null; then
             continue
         fi
-        {
-            echo ""
-            echo "$EDITOR_MARKER"
-            echo "export EDITOR=vim"
-            echo "export VISUAL=vim"
-        } >> "$rc"
+        append_block "$rc" \
+            "$EDITOR_MARKER" \
+            "export EDITOR=vim" \
+            "export VISUAL=vim"
         info "Added EDITOR=vim to $rc"
     done
 }
@@ -429,33 +619,46 @@ enable_downloads_cleanup() {
     local mode="${2:-hook}"
     local max_age="${3:-$(config_get downloads_cleanup_max_age_days $DOWNLOADS_MAX_AGE_DAYS)}"
 
-    mkdir -p "$SCRIPTS_DIR"
+    if [ -z "$downloads_dir" ] || [ ! -d "$downloads_dir" ]; then
+        error "Downloads directory not found: ${downloads_dir:-<empty>}"
+        return 1
+    fi
+    if ! [[ "$max_age" =~ ^[0-9]+$ ]] || [ "$max_age" -lt 1 ]; then
+        warn "Invalid max age '$max_age'; using $DOWNLOADS_MAX_AGE_DAYS days"
+        max_age="$DOWNLOADS_MAX_AGE_DAYS"
+    fi
+    if [ "$mode" = "cron" ] && ! check_command crontab; then
+        warn "crontab is not available; falling back to the shell hook"
+        mode="hook"
+    fi
+
+    ensure_scripts_dir || return 1
 
     cat > "$CLEANUP_SCRIPT" <<CLEANUP_EOF
 #!/bin/bash
-DOWNLOADS_DIR="$downloads_dir"
+# Generated by olecharms — edit via 'olecharms config', not by hand.
+DOWNLOADS_DIR=$(printf '%q' "$downloads_dir")
 MAX_AGE_DAYS=$max_age
 
-[ ! -d "\$DOWNLOADS_DIR" ] && exit 1
-find "\$DOWNLOADS_DIR" -type f -mtime +\${MAX_AGE_DAYS} -delete 2>/dev/null
+# Never let a bad config point this at a whole home directory or the root.
+case "\$DOWNLOADS_DIR" in
+    ""|"/"|"$HOME"|"$HOME/") exit 1 ;;
+esac
+[ -d "\$DOWNLOADS_DIR" ] || exit 1
+find "\$DOWNLOADS_DIR" -type f -mtime "+\$MAX_AGE_DAYS" -delete 2>/dev/null
 find "\$DOWNLOADS_DIR" -mindepth 1 -type d -empty -delete 2>/dev/null
 CLEANUP_EOF
     chmod +x "$CLEANUP_SCRIPT"
 
     if [ "$mode" = "cron" ]; then
-        local new_entry="$DOWNLOADS_CRON_MIN $DOWNLOADS_CRON_HOUR * * * $CLEANUP_SCRIPT $CRON_MARKER_DOWNLOADS"
-        local existing
-        existing=$(crontab -l 2>/dev/null | grep -v "$CRON_MARKER_DOWNLOADS") || true
-        if [ -n "$existing" ]; then
-            printf '%s\n%s\n' "$existing" "$new_entry" | crontab -
-        else
-            echo "$new_entry" | crontab -
-        fi
+        local new_entry="$DOWNLOADS_CRON_MIN $DOWNLOADS_CRON_HOUR * * * $(cron_quote_path "$CLEANUP_SCRIPT") $CRON_MARKER_DOWNLOADS"
+        cron_replace_entry "$CRON_MARKER_DOWNLOADS" "$new_entry" || return 1
         # Regenerate hook script to exclude downloads if paranoid uses it
         if is_paranoid_mode_enabled && ! is_paranoid_cron_enabled; then
             generate_hook_script
         fi
     else
+        check_command crontab && cron_replace_entry "$CRON_MARKER_DOWNLOADS" ""
         generate_hook_script
         install_shell_hook
     fi
@@ -475,13 +678,7 @@ disable_downloads_cleanup() {
 
     # Remove cron entry if present
     if is_downloads_cron_enabled; then
-        local existing
-        existing=$(crontab -l 2>/dev/null | grep -v "$CRON_MARKER_DOWNLOADS") || true
-        if [ -n "$existing" ]; then
-            echo "$existing" | crontab -
-        else
-            crontab -r 2>/dev/null || true
-        fi
+        cron_replace_entry "$CRON_MARKER_DOWNLOADS" ""
     fi
 
     rm -f "$CLEANUP_SCRIPT"
@@ -503,10 +700,16 @@ disable_downloads_cleanup() {
 enable_paranoid_mode() {
     local mode="${1:-hook}"
 
-    mkdir -p "$SCRIPTS_DIR"
+    if [ "$mode" = "cron" ] && ! check_command crontab; then
+        warn "crontab is not available; falling back to the shell hook"
+        mode="hook"
+    fi
+
+    ensure_scripts_dir || return 1
 
     cat > "$PARANOID_SCRIPT" <<PARANOID_EOF
 #!/bin/bash
+# Generated by olecharms — edit via 'olecharms config', not by hand.
 # Purge shell history
 rm -f "$HOME/.bash_history" 2>/dev/null
 rm -f "$HOME/.zsh_history" 2>/dev/null
@@ -520,19 +723,14 @@ PARANOID_EOF
     chmod +x "$PARANOID_SCRIPT"
 
     if [ "$mode" = "cron" ]; then
-        local new_entry="$PARANOID_CRON_SCHEDULE $PARANOID_SCRIPT $CRON_MARKER_PARANOID"
-        local existing
-        existing=$(crontab -l 2>/dev/null | grep -v "$CRON_MARKER_PARANOID") || true
-        if [ -n "$existing" ]; then
-            printf '%s\n%s\n' "$existing" "$new_entry" | crontab -
-        else
-            echo "$new_entry" | crontab -
-        fi
+        local new_entry="$PARANOID_CRON_SCHEDULE $(cron_quote_path "$PARANOID_SCRIPT") $CRON_MARKER_PARANOID"
+        cron_replace_entry "$CRON_MARKER_PARANOID" "$new_entry" || return 1
         # Regenerate hook script to exclude paranoid if downloads uses it
         if is_downloads_cleanup_enabled && ! is_downloads_cron_enabled; then
             generate_hook_script
         fi
     else
+        check_command crontab && cron_replace_entry "$CRON_MARKER_PARANOID" ""
         generate_hook_script
         install_shell_hook
     fi
@@ -550,13 +748,7 @@ disable_paranoid_mode() {
 
     # Remove cron entry if present
     if is_paranoid_cron_enabled; then
-        local existing
-        existing=$(crontab -l 2>/dev/null | grep -v "$CRON_MARKER_PARANOID") || true
-        if [ -n "$existing" ]; then
-            echo "$existing" | crontab -
-        else
-            crontab -r 2>/dev/null || true
-        fi
+        cron_replace_entry "$CRON_MARKER_PARANOID" ""
     fi
 
     rm -f "$PARANOID_SCRIPT"
@@ -612,14 +804,15 @@ config_set() {
     # Update on disk: replace existing line or append
     if [ -f "$OLECHARMS_CONFIG_FILE" ] && grep -q "^${key}=" "$OLECHARMS_CONFIG_FILE"; then
         local tmpfile
-        tmpfile=$(mktemp)
-        while IFS= read -r line; do
+        tmpfile=$(mktemp) || { error "mktemp failed"; return 1; }
+        while IFS= read -r line || [ -n "$line" ]; do
             case "$line" in
                 "${key}="*) echo "${key}=${value}" ;;
                 *)          echo "$line" ;;
             esac
         done < "$OLECHARMS_CONFIG_FILE" > "$tmpfile"
-        mv "$tmpfile" "$OLECHARMS_CONFIG_FILE"
+        write_file_contents "$tmpfile" "$OLECHARMS_CONFIG_FILE"
+        rm -f "$tmpfile"
     else
         echo "${key}=${value}" >> "$OLECHARMS_CONFIG_FILE"
     fi
@@ -683,6 +876,10 @@ config_bootstrap() {
 migrate_config() {
     local current
     current=$(config_get CONFIG_VERSION 0)
+    if ! [[ "$current" =~ ^[0-9]+$ ]]; then
+        warn "Invalid CONFIG_VERSION '$current' in $OLECHARMS_CONFIG_FILE; treating as 0"
+        current=0
+    fi
     while [ "$current" -lt "$CURRENT_CONFIG_VERSION" ]; do
         local next=$((current + 1))
         local func="migrate_config_${current}_to_${next}"
@@ -708,6 +905,45 @@ config_ensure() {
     fi
 }
 
+# scripts/ is gitignored, so a fresh clone (or a moved install) has no generated
+# cleanup scripts even when the config says the feature is on. Bring the
+# filesystem and crontab back in line with the config.
+restore_scheduled_features() {
+    local force="${1:-}"
+    local dl_enabled dl_dir dl_method dl_age p_enabled p_method needs
+
+    dl_enabled=$(config_get downloads_cleanup_enabled false)
+    if [ "$dl_enabled" = "true" ]; then
+        dl_dir=$(config_get downloads_cleanup_dir)
+        dl_method=$(config_get downloads_cleanup_method hook)
+        dl_age=$(config_get downloads_cleanup_max_age_days "$DOWNLOADS_MAX_AGE_DAYS")
+        if [ -z "$dl_dir" ] || [ ! -d "$dl_dir" ]; then
+            warn "Downloads auto-cleanup is enabled but ${dl_dir:-<unset>} is missing; disabling"
+            config_set downloads_cleanup_enabled false
+        else
+            needs="$force"
+            [ -x "$CLEANUP_SCRIPT" ] || needs=force
+            [ "$dl_method" = "cron" ] && ! is_downloads_cron_enabled && needs=force
+            if [ -n "$needs" ]; then
+                info "Restoring downloads auto-cleanup ($dl_method)"
+                enable_downloads_cleanup "$dl_dir" "$dl_method" "$dl_age"
+            fi
+        fi
+    fi
+
+    p_enabled=$(config_get paranoid_mode_enabled false)
+    if [ "$p_enabled" = "true" ]; then
+        p_method=$(config_get paranoid_mode_method hook)
+        needs="$force"
+        [ -x "$PARANOID_SCRIPT" ] || needs=force
+        [ "$p_method" = "cron" ] && ! is_paranoid_cron_enabled && needs=force
+        if [ -n "$needs" ]; then
+            info "Restoring paranoid mode ($p_method)"
+            enable_paranoid_mode "$p_method"
+        fi
+    fi
+}
+
 fix_moved_install() {
     local mode="${1:-fix}"
     local stored_dir
@@ -726,10 +962,13 @@ fix_moved_install() {
 
     install_vimrc
     install_shell_commands
-    if [ -f "$HOOK_SCRIPT" ] || grep -qlF "$HOOK_MARKER" "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.bash_profile" 2>/dev/null; then
+    if [ -f "$HOOK_SCRIPT" ] || rc_has_marker "$HOOK_MARKER"; then
+        generate_hook_script
         install_shell_hook
     fi
     install_binary
+    # Cron entries and generated scripts hold absolute paths — rewrite them
+    restore_scheduled_features force
 
     config_set install_dir "$SCRIPT_DIR"
     info "All paths updated to new location."
@@ -756,6 +995,10 @@ install_packages() {
     # Filter out already-installed packages
     local missing=()
     if [ "$OS" = "linux" ]; then
+        if ! check_command dpkg || ! check_command apt-get; then
+            warn "Not a Debian/Ubuntu system — install these yourself: ${packages[*]}"
+            return
+        fi
         for pkg in "${packages[@]}"; do
             if ! dpkg -s "$pkg" >/dev/null 2>&1; then
                 missing+=("$pkg")
@@ -776,13 +1019,25 @@ install_packages() {
 
     info "Installing missing packages: ${missing[*]}"
     if [ "$OS" = "linux" ]; then
-        if check_command sudo; then
-            sudo apt-get update -qq && sudo apt-get install -y -qq "${missing[@]}" || {
-                error "Some packages failed to install"
-            }
-        else
-            error "sudo not available. Install packages manually: apt-get install ${missing[*]}"
+        # System packages are the one step that needs root; everything else
+        # olecharms does stays in userland.
+        local sudo_cmd=()
+        if [ "$(id -u 2>/dev/null)" != "0" ]; then
+            if ! check_command sudo; then
+                error "sudo not available. Install packages manually: apt-get install ${missing[*]}"
+                return
+            fi
+            # Without a terminal, sudo would block on a password prompt forever
+            if [ ! -t 0 ] && ! sudo -n true 2>/dev/null; then
+                warn "sudo needs a password and there is no terminal; skipping: ${missing[*]}"
+                return
+            fi
+            sudo_cmd=(sudo)
         fi
+        "${sudo_cmd[@]}" apt-get update -qq \
+            && "${sudo_cmd[@]}" apt-get install -y -qq "${missing[@]}" || {
+            error "Some packages failed to install"
+        }
     elif [ "$OS" = "macos" ]; then
         if check_command brew; then
             brew install "${missing[@]}" 2>/dev/null || {
@@ -804,8 +1059,17 @@ create_vim_dirs() {
 }
 
 install_pathogen() {
-    clone_or_pull "$PATHOGEN_REPO" "$PATHOGEN_STAGING" "vim-pathogen" \
-        "$BUNDLED_DIR"
+    # Older versions passed all of vimthings/ (~50MB, mostly fonts) as the
+    # offline fallback for the pathogen clone. Reclaim that if we find it.
+    if [ -d "$PATHOGEN_STAGING" ] && [ ! -d "$PATHOGEN_STAGING/.git" ] \
+       && [ -d "$PATHOGEN_STAGING/fonts" ] && [ -d "$PATHOGEN_STAGING/bundle" ]; then
+        warn "Removing oversized legacy pathogen staging dir $PATHOGEN_STAGING"
+        rm -rf "$PATHOGEN_STAGING"
+    fi
+
+    # No bundled fallback here: pathogen is a single file and the copy below
+    # already reads it straight out of vimthings/autoload/.
+    clone_or_pull "$PATHOGEN_REPO" "$PATHOGEN_STAGING" "vim-pathogen"
 
     # Copy pathogen.vim to autoload
     if [ -f "$PATHOGEN_STAGING/autoload/pathogen.vim" ]; then
@@ -831,48 +1095,42 @@ install_plugins() {
         local dest="$VIM_DIR/bundle/$name"
         local fallback="$BUNDLED_DIR/bundle/$name"
 
-        clone_or_pull "$url" "$dest" "$name" "$fallback"
+        if ! clone_or_pull "$url" "$dest" "$name" "$fallback"; then
+            [ -d "$dest" ] || error "Plugin $name is not installed and could not be fetched"
+        fi
     done
 }
 
 install_vimrc() {
     if [ -f "$VIMRC" ]; then
-        local stale_count
-        stale_count=$(grep -c 'source .*/vimthings/olevimrc\.vim' "$VIMRC" 2>/dev/null || echo 0)
+        # Count what is already there: our exact line, source lines pointing at
+        # some other checkout, and marker comments.
+        local exact=0 stale=0 markers=0 line
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+                "$SOURCE_MARKER")            markers=$((markers + 1)) ;;
+                "$SOURCE_LINE")              exact=$((exact + 1)) ;;
+                *"/vimthings/olevimrc.vim"*) stale=$((stale + 1)) ;;
+            esac
+        done < "$VIMRC"
 
-        if [ "$stale_count" -gt 0 ]; then
-            local has_correct=false
-            grep -qF "$SOURCE_LINE" "$VIMRC" && has_correct=true
-
-            # Remove source lines that don't match the exact current path
-            sed -i "\|source .*/vimthings/olevimrc\.vim|{
-                \|$SOURCE_LINE|!d
-            }" "$VIMRC"
-
-            # Clean up orphaned marker comments (marker not followed by a source line)
-            sed -i '/^" olecharms managed config - do not remove this line$/{
-                N
-                /\nsource .*\/vimthings\/olevimrc\.vim/!{
-                    s/^" olecharms managed config - do not remove this line\n//
-                }
-            }' "$VIMRC"
-
-            if $has_correct; then
-                info "vimrc source line already present in $VIMRC"
-                [ "$stale_count" -gt 1 ] && info "Removed stale source line(s) from $VIMRC"
-                return
-            fi
+        if [ "$exact" -eq 1 ] && [ "$stale" -eq 0 ] && [ "$markers" -eq 1 ]; then
+            info "vimrc source line already present in $VIMRC"
+            return
         fi
 
         backup_file "$VIMRC"
+
+        # Strip every olecharms entry (duplicates, stale paths, orphaned marker
+        # comments) and re-append a single clean block below.
+        if [ $((exact + stale + markers)) -gt 0 ]; then
+            rc_strip_block "$VIMRC" "$SOURCE_MARKER" "/vimthings/olevimrc.vim" || return 1
+            info "Removed stale olecharms entries from $VIMRC"
+        fi
     fi
 
     # Append fresh
-    {
-        echo ""
-        echo "$SOURCE_MARKER"
-        echo "$SOURCE_LINE"
-    } >> "$VIMRC"
+    append_block "$VIMRC" "$SOURCE_MARKER" "$SOURCE_LINE"
     info "Added source line to $VIMRC"
 }
 
@@ -887,7 +1145,7 @@ install_fonts() {
 
     # Determine source directory for fonts
     local font_source=""
-    if [ -d "$FONTS_STAGING" ]; then
+    if [ -d "$FONTS_STAGING" ] && [ -n "$(ls -A "$FONTS_STAGING" 2>/dev/null)" ]; then
         font_source="$FONTS_STAGING"
     elif [ -d "$BUNDLED_DIR/fonts/powerline" ]; then
         font_source="$BUNDLED_DIR/fonts/powerline"
@@ -898,13 +1156,21 @@ install_fonts() {
     fi
 
     # Copy selected font families
+    local family f copied
     for family in "${FONT_FAMILIES[@]}"; do
-        if [ -d "$font_source/$family" ]; then
-            cp "$font_source/$family"/*.ttf "$FONT_DIR/" 2>/dev/null
-            cp "$font_source/$family"/*.otf "$FONT_DIR/" 2>/dev/null
-            info "Installed font family: $family"
-        else
+        if [ ! -d "$font_source/$family" ]; then
             warn "Font family not found: $family"
+            continue
+        fi
+        copied=0
+        for f in "$font_source/$family"/*.ttf "$font_source/$family"/*.otf; do
+            [ -f "$f" ] || continue
+            cp "$f" "$FONT_DIR/" 2>/dev/null && copied=$((copied + 1))
+        done
+        if [ "$copied" -gt 0 ]; then
+            info "Installed font family: $family ($copied files)"
+        else
+            warn "No font files found for family: $family"
         fi
     done
 
@@ -921,9 +1187,13 @@ install_omz() {
         return 1
     fi
 
+    # Honour $ZSH / $ZSH_CUSTOM: the upstream installer does, and reinstalling
+    # over an existing non-default checkout fails on every run otherwise.
+    local omz_dir="${ZSH:-$HOME/.oh-my-zsh}"
+
     # Install Oh My Zsh if not present
-    if [ ! -d "$HOME/.oh-my-zsh" ]; then
-        info "Installing Oh My Zsh..."
+    if [ ! -d "$omz_dir" ]; then
+        info "Installing Oh My Zsh into $omz_dir..."
         if check_command curl; then
             sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
         elif check_command wget; then
@@ -934,16 +1204,16 @@ install_omz() {
         fi
 
         # Verify the install actually worked
-        if [ ! -d "$HOME/.oh-my-zsh" ]; then
+        if [ ! -d "$omz_dir" ]; then
             error "Oh My Zsh installation failed"
             return 1
         fi
     else
-        info "Oh My Zsh already installed"
+        info "Oh My Zsh already installed ($omz_dir)"
     fi
 
     # Create custom theme with random host color (only on first install)
-    local theme_dir="$HOME/.oh-my-zsh/custom/themes"
+    local theme_dir="${ZSH_CUSTOM:-$omz_dir/custom}/themes"
     local theme_file="$theme_dir/olecharms.zsh-theme"
 
     if [ -f "$theme_file" ]; then
@@ -1003,7 +1273,7 @@ THEME_EOF
     if [ -f "$zshrc" ]; then
         # Set ZSH_THEME to olecharms
         if grep -q '^ZSH_THEME=' "$zshrc"; then
-            sed -i 's/^ZSH_THEME=.*/ZSH_THEME="olecharms"/' "$zshrc"
+            sed_inplace "$zshrc" 's/^ZSH_THEME=.*/ZSH_THEME="olecharms"/'
             info "Updated ZSH_THEME to olecharms in $zshrc"
         else
             echo 'ZSH_THEME="olecharms"' >> "$zshrc"
@@ -1035,10 +1305,14 @@ run_post_commands() {
 # ─── Subcommand Handlers ─────────────────────────────────────────────────────
 
 _self_update() {
+    # Set by the relaunch below so a bad hash comparison can't loop forever
+    if [ -n "${OLECHARMS_RELAUNCHED:-}" ]; then
+        return
+    fi
     if [ -d "$SCRIPT_DIR/.git" ]; then
         info "Updating olecharms repo..."
         local before_script before_conf
-        before_script=$(_file_hash "$SCRIPT_DIR/olecharms.sh")
+        before_script=$(_file_hash "$SCRIPT_PATH")
         before_conf=$(_file_hash "$CONF_FILE")
 
         git -C "$SCRIPT_DIR" pull --rebase --autostash 2>/dev/null || {
@@ -1046,12 +1320,16 @@ _self_update() {
         }
 
         local after_script after_conf
-        after_script=$(_file_hash "$SCRIPT_DIR/olecharms.sh")
+        after_script=$(_file_hash "$SCRIPT_PATH")
         after_conf=$(_file_hash "$CONF_FILE")
 
         if [ "$before_script" != "$after_script" ] || [ "$before_conf" != "$after_conf" ]; then
+            if ! bash -n "$SCRIPT_PATH" 2>/dev/null; then
+                error "Updated $SCRIPT_PATH has syntax errors — not relaunching"
+                return 1
+            fi
             info "olecharms.sh or packages.conf was updated. Relaunching..."
-            exec "$SCRIPT_DIR/olecharms.sh" "$@"
+            OLECHARMS_RELAUNCHED=1 exec "$SCRIPT_PATH" "$@"
         fi
     fi
 }
@@ -1077,6 +1355,7 @@ cmd_install() {
     install_shell_commands
     install_binary
     install_editor_env
+    restore_scheduled_features
 
     echo ""
     if [ $ERROR_COUNT -eq 0 ]; then
@@ -1085,11 +1364,14 @@ cmd_install() {
         warn "Install complete with $ERROR_COUNT error(s). Review output above."
     fi
 
-    # Launch zsh session so the user sees the result
-    if check_command zsh; then
+    # Launch a zsh session so the user sees the result — only when we actually
+    # have a terminal, otherwise this hangs scripted/CI runs and hides the
+    # exit status.
+    if [ $ERROR_COUNT -eq 0 ] && [ -t 0 ] && [ -t 1 ] && check_command zsh; then
         info "Launching zsh..."
         exec zsh -l
     fi
+    return 0
 }
 
 cmd_update() {
@@ -1113,6 +1395,7 @@ cmd_update() {
     install_shell_commands
     install_binary
     install_editor_env
+    restore_scheduled_features
 
     echo ""
     if [ $ERROR_COUNT -eq 0 ]; then
@@ -1149,6 +1432,14 @@ cmd_check() {
             echo -e "  ${RED}✗${NC} $VIM_DIR/$d  (missing)"
         fi
     done
+
+    # Check for leftovers from the old re-copy loop
+    local replaced_count
+    replaced_count=$(find "$VIM_DIR/bundle_disabled" -maxdepth 1 -name '*.replaced.*' 2>/dev/null | wc -l)
+    if [ "$replaced_count" -gt 2 ]; then
+        echo ""
+        warn "$VIM_DIR/bundle_disabled holds $replaced_count '*.replaced.*' dirs ($(du -sh "$VIM_DIR/bundle_disabled" 2>/dev/null | cut -f1)). Safe to delete."
+    fi
 
     # Check pathogen
     echo ""
@@ -1240,9 +1531,26 @@ cmd_status() {
     detect_os
 
     echo -e "${BLUE}OS:${NC} $OS ($PKG_MANAGER)"
+    echo -e "${BLUE}User:${NC} $(id -un 2>/dev/null) (uid $(id -u 2>/dev/null)), HOME=$HOME"
     echo -e "${BLUE}Repo:${NC} $SCRIPT_DIR"
     echo -e "${BLUE}Vim dir:${NC} $VIM_DIR"
     echo -e "${BLUE}Font dir:${NC} $FONT_DIR"
+    echo -e "${BLUE}Scripts dir:${NC} $SCRIPTS_DIR"
+
+    # The launcher symlink is the path most likely to go stale after a move
+    if [ -L "$BIN_DIR/olecharms" ]; then
+        local link_target
+        link_target=$(resolve_link "$BIN_DIR/olecharms")
+        if [ -f "$link_target" ]; then
+            echo -e "${BLUE}Launcher:${NC} $BIN_DIR/olecharms → $link_target"
+        else
+            echo -e "${BLUE}Launcher:${NC} ${RED}broken symlink${NC} $BIN_DIR/olecharms → $link_target"
+        fi
+    elif [ -e "$BIN_DIR/olecharms" ]; then
+        echo -e "${BLUE}Launcher:${NC} $BIN_DIR/olecharms (regular file, not managed)"
+    else
+        echo -e "${BLUE}Launcher:${NC} ${YELLOW}not installed${NC}"
+    fi
 
     # Config file
     if [ -f "$OLECHARMS_CONFIG_FILE" ]; then
@@ -1629,6 +1937,17 @@ cmd_help() {
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 main() {
+    # Everything olecharms installs lands in $HOME. Running as root silently
+    # sets up root's environment instead of the user's.
+    if [ "$(id -u 2>/dev/null)" = "0" ] && [ -z "${OLECHARMS_ALLOW_ROOT:-}" ]; then
+        case "${1:-}" in
+            install|update|config)
+                warn "Running as root — everything will be installed under $HOME, not your user's home."
+                warn "Run as your normal user, or set OLECHARMS_ALLOW_ROOT=1 to silence this."
+                ;;
+        esac
+    fi
+
     # For operational commands, ensure config is loaded and check for moved install
     case "${1:-}" in
         install|update|config)
@@ -1658,6 +1977,11 @@ main() {
             exit 1
             ;;
     esac
+
+    # Surface failures to callers (CI, cron, `&&` chains) instead of always 0
+    [ "$ERROR_COUNT" -gt 0 ] && return 1
+    return 0
 }
 
 main "$@"
+exit $?

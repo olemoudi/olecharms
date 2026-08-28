@@ -52,24 +52,37 @@ olecharms/
 
 `olecharms.sh` is organized into 9 logical sections, delimited by comment banners:
 
-### 1. Constants & Globals (lines 5-40)
+### 1. Constants & Globals (lines 5-65)
 All paths, markers, intervals, and config variables. Key globals:
-- `SCRIPT_DIR` — resolved repo root
+- `SCRIPT_DIR` — resolved repo root (symlink chain walked, with a loop guard)
+- `SCRIPT_PATH` — the script's own resolved path; used for the `~/.local/bin` symlink and the self-update re-exec, so a renamed checkout still works
 - `CONF_FILE` — path to `packages.conf`
+- `BUNDLED_STAMP` — `.olecharms-bundled`, dropped into any directory populated from a bundled fallback
 - `OLECHARMS_CONFIG_FILE` — XDG config at `~/.config/olecharms/config`
 - `CURRENT_CONFIG_VERSION` — drives migration logic
+- `SOURCE_LINE` — the `~/.vimrc` source line, with the path run through `_vim_escape()` (`:source` takes a bare path, so spaces and `\ | " % #` must be backslash-escaped)
 - Marker strings for idempotent RC file management (see [File Markers](#file-markers))
 
-### 2. Color / Output Helpers (lines 42-57)
-`info()`, `warn()`, `error()` with color support. Colors auto-disable when stdout is not a terminal.
+This section also aborts immediately if `$HOME` is unset, missing, or not writable — every path olecharms writes lives under it.
 
-### 3. Utility Functions (lines 59-498)
+### 2. Color / Output Helpers (lines 67-82)
+`info()`, `warn()`, `error()` with color support. Colors auto-disable when stdout is not a terminal. `error()` increments `ERROR_COUNT`, which `main()` turns into a non-zero exit status.
+
+### 3. Utility Functions (lines 84-768)
 General-purpose helpers:
 - `load_config()` — sources `packages.conf`
-- `detect_os()` — sets `OS`, `PKG_MANAGER`, `FONT_DIR`
+- `detect_os()` — sets `OS`, `PKG_MANAGER`, `FONT_DIR` (XDG-aware on Linux: `${XDG_DATA_HOME:-~/.local/share}/fonts`)
 - `backup_file()` — timestamped backup before destructive operations
 - `clone_or_pull()` — git clone with update, offline fallback, and non-destructive plugin replacement
 - `check_command()` — `command -v` wrapper
+- `resolve_link()` — portable symlink-chain resolution (no `readlink -f`, which is GNU-only)
+- `write_file_contents()` — replaces a file's contents by writing through symlinks and swapping in via rename, preserving mode/ownership. Used everywhere instead of `mv tmpfile rcfile`, which would replace a symlinked dotfile with a regular file and reset its permissions
+- `sed_inplace()` — portable `sed -i` (BSD/macOS sed requires an argument to `-i`)
+- `rc_strip_block()` — removes an olecharms block (marker line, associated lines, and the blank separator) from an RC file
+- `append_block()` — appends a block with exactly one blank separator line, and none at all when the file is new or empty
+- `managed_rc_files()` / `rc_has_marker()` — the RC file list (defaulting to `~/.bashrc`) and a marker lookup
+- `cron_replace_entry()` / `cron_quote_path()` — single point of crontab manipulation; paths are single-quoted and `%` escaped, since cron hands the line to `/bin/sh` and turns a bare `%` into a newline
+- `ensure_scripts_dir()` — fails loudly if the checkout is read-only rather than generating half-written scripts
 - `_file_hash()` — portable file hashing (md5sum → md5 → cksum)
 - `find_downloads_dirs()` — locates `~/Downloads` (case-insensitive)
 - `generate_hook_script()` — writes the shell-hook dispatcher
@@ -81,7 +94,7 @@ General-purpose helpers:
 - `enable_downloads_cleanup()` / `disable_downloads_cleanup()` — manages the downloads cleaner
 - `enable_paranoid_mode()` / `disable_paranoid_mode()` — manages paranoid-mode cleaner
 
-### 4. Config Versioning (lines 500-624)
+### 4. Config Versioning (lines 770-975)
 XDG-based configuration persistence:
 - `config_read()` — parses key=value file into `OLECHARMS_CFG_*` variables (no `source`, safe)
 - `config_get()` / `config_set()` — read/write individual keys
@@ -89,8 +102,10 @@ XDG-based configuration persistence:
 - `config_bootstrap()` — first-run detection of existing state
 - `migrate_config()` — version-driven migration loop
 - `config_ensure()` — bootstrap or read+migrate on every run
+- `restore_scheduled_features()` — reconciles config → filesystem. `scripts/` is gitignored, so a fresh clone (or a moved install) has no generated cleanup scripts even when the config says a feature is on; this regenerates them and rewrites the crontab entries. Called by `install`/`update`, and with `force` by `fix_moved_install()`
+- `fix_moved_install()` — repairs stale absolute paths after the checkout is moved
 
-### 5. Core Operations (lines 626-907)
+### 5. Core Operations (lines 977-1303)
 The installation steps called by subcommands:
 - `install_packages()` — apt/brew install with smart skip of already-installed packages
 - `create_vim_dirs()` — creates `~/.vim/{autoload,bundle,bundle_disabled,undodir,swapfiles}`
@@ -101,7 +116,7 @@ The installation steps called by subcommands:
 - `install_omz()` — installs Oh My Zsh, creates custom theme with random host color
 - `run_post_commands()` — runs user-defined post-install commands
 
-### 6. Subcommand Handlers (lines 909-1485)
+### 6. Subcommand Handlers (lines 1305-1935)
 - `_self_update()` — pulls the olecharms repo itself, re-execs if the script changed
 - `cmd_install()` — full idempotent setup sequence
 - `cmd_update()` — same as install (alias)
@@ -114,8 +129,8 @@ The installation steps called by subcommands:
 - `config_downloads_cleanup()` — interactive enable/disable of downloads auto-cleanup
 - `config_paranoid_mode()` — interactive enable/disable of paranoid mode
 
-### 8. Main (lines 1487-1509)
-Dispatches `$1` to the appropriate `cmd_*` handler.
+### 8. Main (lines 1937-1987)
+Dispatches `$1` to the appropriate `cmd_*` handler, warns when running as root (everything would be installed into root's home; `OLECHARMS_ALLOW_ROOT=1` silences it), and exits non-zero if `ERROR_COUNT > 0`.
 
 ## Subcommand Flows
 
@@ -238,26 +253,46 @@ Simple `key=value` pairs. Parsed safely without `source` — only alphanumeric k
 ### Idempotency
 Every operation checks current state before acting. Running `install` or `update` multiple times produces the same result. Marker strings prevent duplicate entries in RC files.
 
+### Userland install
+Everything olecharms writes lives under `$HOME`: `~/.vim`, `~/.vimrc`, `~/.local/bin`, `${XDG_DATA_HOME:-~/.local/share}/fonts`, `~/.config/olecharms`, `~/.oh-my-zsh` (or `$ZSH`), the user's own crontab, and the checkout's `scripts/` directory. Nothing needs root except optional system package installation, which is delegated to `sudo`; `install_packages()` skips that step rather than blocking on a password prompt when there is no terminal, and skips it entirely on non-Debian Linux. `main()` warns when run as root, since that would set up root's environment rather than the user's.
+
+### Path robustness
+Absolute paths are unavoidable — RC files, the vimrc source line, the launcher symlink, and crontab entries all need them — so the script is built to survive them going stale or containing awkward characters:
+
+- `SCRIPT_DIR`/`SCRIPT_PATH` are resolved from `BASH_SOURCE` through the symlink chain (guarded against loops), never assumed.
+- The generated `scripts/olecharms-hook.sh` and `scripts/olecharms-shell.sh` locate themselves at source time, so only the RC line that sources them holds an absolute path.
+- Paths written into other languages are escaped for their target: backslash-escaping for vim's `:source`, single-quoting plus `%` escaping for crontab command lines.
+- `olevimrc.vim` uses `let &undodir = expand(...)` rather than `set undodir=...`, which would need escaping for a `$HOME` containing spaces.
+- `fix_moved_install()` repairs every stale path in one pass (see below), and `status` prints the paths it depends on, flagging a broken launcher symlink.
+
 ### Preserving existing installations
-When multiple copies of the repo exist (e.g., a primary install at `/home/user/olecharms` and a dev copy elsewhere), running `install`/`update` from one copy will not overwrite valid entries from another. The shell hook, shell commands, and binary symlink functions extract the path from existing RC entries or symlinks and skip the update if the target file still exists on disk. Only stale entries (pointing to paths that no longer exist) are replaced.
+When multiple copies of the repo exist (e.g., a primary install at `/home/user/olecharms` and a dev copy elsewhere), running `install`/`update` from one copy will not overwrite valid entries from another. The binary symlink function keeps an existing symlink that points at a different, still-present checkout. RC entries are rewritten only when they do not already point at the current checkout's generated script.
 
 ### Auto-fix on move
-The config stores `install_dir` (the directory olecharms was last run from). On every operational command (`install`, `update`, `check`, `status`, `config`), `main()` calls `fix_moved_install()` which compares the stored path against the current `SCRIPT_DIR`. If they differ, the installation folder was moved. For mutating commands (`install`/`update`/`config`), all stale paths are repaired automatically (vimrc source line, RC file references, binary symlink). For read-only commands (`check`/`status`), a warning is printed directing the user to run `install` or `update`.
+The config stores `install_dir` (the directory olecharms was last run from). On every operational command (`install`, `update`, `check`, `status`, `config`), `main()` calls `fix_moved_install()` which compares the stored path against the current `SCRIPT_DIR`. If they differ, the installation folder was moved. For mutating commands (`install`/`update`/`config`), all stale paths are repaired automatically: the vimrc source line, RC file references, the binary symlink, and — via `restore_scheduled_features force` — the generated cleanup scripts and their crontab entries, which would otherwise point at the old location. For read-only commands (`check`/`status`), a warning is printed directing the user to run `install` or `update`.
 
 ### Bundled fallbacks
 All vim plugins, pathogen, and powerline fonts are bundled in `vimthings/`. If `git clone` fails (offline, firewalled), the bundled copy is used. This guarantees the environment works without network access.
+
+A directory populated this way gets a `.olecharms-bundled` stamp file. On later runs `clone_or_pull()` sees the stamp and tries to upgrade the copy to a real clone, leaving it untouched if still offline — rather than treating it as a foreign directory, shunting it into `bundle_disabled/`, and re-copying it on every single run. `install_pathogen()` deliberately passes no fallback (pathogen is one file, copied straight out of `vimthings/autoload/`) and reclaims the oversized staging directory older versions left behind.
+
+### Exit status
+`error()` increments `ERROR_COUNT` and `main()` exits 1 when it is non-zero, so `olecharms update && ...` and cron jobs see failures. `cmd_install()` ends by `exec`ing a login zsh only when stdin and stdout are both terminals and the run was clean; otherwise it returns normally so the exit status survives.
 
 ### Smart package check
 On Linux, `dpkg -s` checks each package individually before invoking `sudo apt-get`. If all packages are already installed, `sudo` is never called. This avoids unnecessary password prompts.
 
 ### Self-update with re-exec
-`_self_update()` hashes `olecharms.sh` and `packages.conf` before and after `git pull`. If either changed, it `exec`s the new version so the rest of the install runs with updated code.
+`_self_update()` hashes `olecharms.sh` and `packages.conf` before and after `git pull`. If either changed, it `bash -n`-checks the new file and then `exec`s it so the rest of the install runs with updated code. The re-exec sets `OLECHARMS_RELAUNCHED=1`, which makes the new process skip self-update entirely — a mis-comparing hash can never loop.
 
 ### Dual scheduling (hook + cron)
 Cleanup features can be scheduled via shell hooks (checked on every shell open, throttled by timestamp files) or via cron jobs. The hook approach works without a cron daemon and runs even on systems where cron isn't available.
 
 ### Non-destructive plugin management
-When a plugin directory exists but isn't a git repo (e.g., from a bundled fallback install), it's moved to `~/.vim/bundle_disabled/` with a timestamp before re-cloning. Nothing is deleted.
+When a plugin directory exists, isn't a git repo, and carries no `.olecharms-bundled` stamp — i.e. it is the user's own — it's moved to `~/.vim/bundle_disabled/` with a timestamp before re-cloning. Nothing is deleted.
+
+### Editing RC files in place
+RC files are rewritten with `write_file_contents()`, which follows symlinks and swaps the new content in by rename. Symlinked dotfiles (stow, chezmoi, a `~/dotfiles` checkout) keep pointing at the real file, permissions and ownership survive, and an interrupted run cannot leave a half-written `~/.bashrc` behind.
 
 ### Random host color theme
 On first Oh My Zsh install, a random HSL color (bright, readable range) is generated via awk and embedded in the zsh theme. This gives each machine a unique prompt color for visual identification. The color is preserved across updates.
@@ -273,3 +308,11 @@ These marker strings are used for idempotent management of lines in shell RC fil
 | `# olecharms PATH - do not remove this line` | `~/.local/bin` PATH entry |
 | `# olecharms editor - do not remove this line` | EDITOR/VISUAL environment variable |
 | `" olecharms managed config - do not remove this line` | Source line in `~/.vimrc` |
+
+Blocks are added with `append_block()` (one blank separator line, none when the file is new) and removed with `rc_strip_block()`, which also absorbs that separator so repeated install/remove cycles do not accumulate blank lines.
+
+## Testing
+
+- **Syntax check:** `bash -n olecharms.sh`
+- **Non-destructive:** `./olecharms.sh check` and `./olecharms.sh status`
+- **Sandboxed end-to-end:** point `HOME` and `XDG_CONFIG_HOME` at a scratch directory and run `update` twice against a copy of the checkout; the second run must report no errors and leave the RC files byte-identical.

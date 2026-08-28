@@ -50,9 +50,9 @@ olecharms/
 
 ## Script Sections
 
-`olecharms.sh` is organized into 9 logical sections, delimited by comment banners:
+`olecharms.sh` is organized into logical sections, delimited by comment banners:
 
-### 1. Constants & Globals (lines 5-65)
+### 1. Constants & Globals (lines 5-69)
 All paths, markers, intervals, and config variables. Key globals:
 - `SCRIPT_DIR` — resolved repo root (symlink chain walked, with a loop guard)
 - `SCRIPT_PATH` — the script's own resolved path; used for the `~/.local/bin` symlink and the self-update re-exec, so a renamed checkout still works
@@ -65,10 +65,10 @@ All paths, markers, intervals, and config variables. Key globals:
 
 This section also aborts immediately if `$HOME` is unset, missing, or not writable — every path olecharms writes lives under it.
 
-### 2. Color / Output Helpers (lines 67-82)
+### 2. Color / Output Helpers (lines 71-86)
 `info()`, `warn()`, `error()` with color support. Colors auto-disable when stdout is not a terminal. `error()` increments `ERROR_COUNT`, which `main()` turns into a non-zero exit status.
 
-### 3. Utility Functions (lines 84-768)
+### 3. Utility Functions (lines 88-798)
 General-purpose helpers:
 - `load_config()` — sources `packages.conf`
 - `detect_os()` — sets `OS`, `PKG_MANAGER`, `FONT_DIR` (XDG-aware on Linux: `${XDG_DATA_HOME:-~/.local/share}/fonts`)
@@ -88,13 +88,23 @@ General-purpose helpers:
 - `generate_hook_script()` — writes the shell-hook dispatcher
 - `install_shell_hook()` / `remove_shell_hook()` — manages hook lines in RC files
 - `generate_shell_loader()` — writes the `shell/*.sh` loader script
-- `install_shell_commands()` / `remove_shell_commands()` — manages loader lines in RC files
+- `install_shell_commands()` / `remove_shell_commands()` — manages loader lines in RC files. Installed even when `shell/` is empty, since the loader also carries the aliases and the `olecharms` wrapper function
 - `install_binary()` — symlinks `olecharms` to `~/.local/bin` and adds it to PATH
 - `install_editor_env()` — exports `EDITOR=vim` and `VISUAL=vim` in RC files
 - `enable_downloads_cleanup()` / `disable_downloads_cleanup()` — manages the downloads cleaner
 - `enable_paranoid_mode()` / `disable_paranoid_mode()` — manages paranoid-mode cleaner
 
-### 4. Config Versioning (lines 770-975)
+### 3b. Aliases (lines 800-886)
+User-defined shell aliases, stored in `~/.config/olecharms/aliases` (next to the config, not in the gitignored `scripts/`, so they survive a fresh clone and a moved checkout):
+- `alias_name_valid()` / `alias_quote()` — name validation and single-quote escaping
+- `alias_list_raw()` / `alias_get()` / `alias_count()` — parse the file back into `name<TAB>command` records
+- `alias_write_all()` — rewrites the file from records on stdin
+- `alias_set()` / `alias_unset()` — add-or-replace and remove, kept sorted
+- `confirm_default_yes()` — `[Y/n]` prompt where Enter and EOF mean yes, but a piped answer is still honoured
+
+The file is directly sourceable and ends with a generated `_olecharms_unload_aliases()` function that unaliases everything it defined. The loader calls it before re-sourcing, so a deleted alias also disappears from the running shell. It is a function rather than a name list because zsh does not word-split unquoted parameters.
+
+### 4. Config Versioning (lines 888-1093)
 XDG-based configuration persistence:
 - `config_read()` — parses key=value file into `OLECHARMS_CFG_*` variables (no `source`, safe)
 - `config_get()` / `config_set()` — read/write individual keys
@@ -105,7 +115,7 @@ XDG-based configuration persistence:
 - `restore_scheduled_features()` — reconciles config → filesystem. `scripts/` is gitignored, so a fresh clone (or a moved install) has no generated cleanup scripts even when the config says a feature is on; this regenerates them and rewrites the crontab entries. Called by `install`/`update`, and with `force` by `fix_moved_install()`
 - `fix_moved_install()` — repairs stale absolute paths after the checkout is moved
 
-### 5. Core Operations (lines 977-1303)
+### 5. Core Operations (lines 1095-1421)
 The installation steps called by subcommands:
 - `install_packages()` — apt/brew install with smart skip of already-installed packages
 - `create_vim_dirs()` — creates `~/.vim/{autoload,bundle,bundle_disabled,undodir,swapfiles}`
@@ -116,20 +126,21 @@ The installation steps called by subcommands:
 - `install_omz()` — installs Oh My Zsh, creates custom theme with random host color
 - `run_post_commands()` — runs user-defined post-install commands
 
-### 6. Subcommand Handlers (lines 1305-1935)
+### 6. Subcommand Handlers (lines 1423-2204)
 - `_self_update()` — pulls the olecharms repo itself, re-execs if the script changed
 - `cmd_install()` — full idempotent setup sequence
 - `cmd_update()` — same as install (alias)
 - `cmd_check()` — reports installed/missing status for all components
 - `cmd_status()` — shows versions and commit hashes for all installed components
 - `cmd_config()` — interactive menu for toggling features
+- `cmd_alias()` — dispatches `add` / `list` / `delete`; `alias_add()`, `alias_delete()` and `alias_show_list()` do the work
 - `cmd_help()` — usage text with dynamically listed shell commands
 
 ### 7. Config Submenus (within Subcommand Handlers)
 - `config_downloads_cleanup()` — interactive enable/disable of downloads auto-cleanup
 - `config_paranoid_mode()` — interactive enable/disable of paranoid mode
 
-### 8. Main (lines 1937-1987)
+### 8. Main (lines 2206-2260)
 Dispatches `$1` to the appropriate `cmd_*` handler, warns when running as root (everything would be installed into root's home; `OLECHARMS_ALLOW_ROOT=1` silences it), and exits non-zero if `ERROR_COUNT > 0`.
 
 ## Subcommand Flows
@@ -165,6 +176,13 @@ Reads `packages.conf`, then reports presence/absence of:
 
 ### `status`
 Shows OS, repo path, config version, repo commit, installed plugin versions (commit + date), pathogen status, and available shell commands.
+
+### `alias`
+- `olecharms alias add <name> <command...>` — everything after the name is the command, so both `alias add gs git status` and `alias add claude "claude --update && claude"` work. Shows what will change, warns if the name shadows an existing command, then asks `[Y/n]` (Enter = yes) before writing.
+- `olecharms alias list` — name/command table.
+- `olecharms alias delete <name>` — same confirmation.
+
+Because a child process cannot change its parent shell's aliases, the generated loader defines an `olecharms()` shell function that runs the real script and reloads the alias file afterwards. That makes a new alias usable immediately in the shell that created it; the script prints `Ready to use in this session.` when it detects the wrapper (via `OLECHARMS_SHELL_WRAPPER`) and otherwise points at the file to `source`.
 
 ### `config`
 Interactive menu loop offering:
@@ -308,6 +326,7 @@ These marker strings are used for idempotent management of lines in shell RC fil
 | `# olecharms PATH - do not remove this line` | `~/.local/bin` PATH entry |
 | `# olecharms editor - do not remove this line` | EDITOR/VISUAL environment variable |
 | `" olecharms managed config - do not remove this line` | Source line in `~/.vimrc` |
+| `# olecharms managed aliases - edit with 'olecharms alias'` | Header of `~/.config/olecharms/aliases` |
 
 Blocks are added with `append_block()` (one blank separator line, none when the file is new) and removed with `rc_strip_block()`, which also absorbs that separator so repeated install/remove cycles do not accumulate blank lines.
 

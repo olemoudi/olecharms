@@ -47,6 +47,10 @@ BIN_MARKER="# olecharms PATH - do not remove this line"
 EDITOR_MARKER="# olecharms editor - do not remove this line"
 OLECHARMS_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/olecharms"
 OLECHARMS_CONFIG_FILE="$OLECHARMS_CONFIG_DIR/config"
+# User aliases live next to the config, not in the gitignored scripts/ dir, so
+# they survive a fresh clone and a moved checkout.
+ALIAS_FILE="$OLECHARMS_CONFIG_DIR/aliases"
+ALIAS_MARKER="# olecharms managed aliases - edit with 'olecharms alias'"
 CURRENT_CONFIG_VERSION=2
 
 # olecharms is a userland install: everything it writes lives under $HOME
@@ -502,26 +506,52 @@ remove_shell_hook() {
 generate_shell_loader() {
     ensure_scripts_dir || return 1
 
-    cat > "$SHELL_LOADER" <<'LOADER_EOF'
-#!/bin/bash
-# olecharms-shell.sh — sources shell command files
+    # Static part first; the two absolute paths below are appended separately so
+    # the heredoc itself stays unexpanded.
+    {
+        echo "#!/bin/bash"
+        echo "# olecharms-shell.sh — sources shell command files and user aliases"
+        echo "_olecharms_alias_file=\"$ALIAS_FILE\""
+        echo "_olecharms_bin=\"$SCRIPT_PATH\""
+    } > "$SHELL_LOADER"
+
+    cat >> "$SHELL_LOADER" <<'LOADER_EOF'
 _olecharms_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 _olecharms_shell_dir="${_olecharms_dir%/*}/shell"
 for _olecharms_f in "$_olecharms_shell_dir"/*.sh; do
     [ -f "$_olecharms_f" ] && source "$_olecharms_f"
 done
 unset _olecharms_f _olecharms_dir _olecharms_shell_dir
+
+# Drop the aliases loaded last time, then load the current set. Run at shell
+# start, and again by the wrapper below after an `olecharms alias` command.
+_olecharms_reload_aliases() {
+    if command -v _olecharms_unload_aliases >/dev/null 2>&1; then
+        _olecharms_unload_aliases
+        unset -f _olecharms_unload_aliases 2>/dev/null
+    fi
+    [ -f "$_olecharms_alias_file" ] && . "$_olecharms_alias_file"
+    return 0
+}
+_olecharms_reload_aliases
+
+# A child process cannot change its parent shell's aliases, so wrap the command
+# and reload them here once it has written the file.
+olecharms() {
+    OLECHARMS_SHELL_WRAPPER=1 "$_olecharms_bin" "$@"
+    local _olecharms_rc=$?
+    case "${1:-}" in
+        alias) [ $_olecharms_rc -eq 0 ] && _olecharms_reload_aliases ;;
+    esac
+    return $_olecharms_rc
+}
 LOADER_EOF
     chmod +x "$SHELL_LOADER"
 }
 
 install_shell_commands() {
-    # Check if shell dir exists and has files
-    local shell_files=("$SHELL_DIR"/*.sh)
-    if [ ! -d "$SHELL_DIR" ] || [ ! -e "${shell_files[0]}" ]; then
-        return
-    fi
-
+    # Installed even with an empty shell/ dir: the loader also carries user
+    # aliases and the `olecharms` wrapper, which must not depend on it.
     # Cheap and idempotent, and the loader lives in the gitignored scripts/ dir,
     # so regenerate unconditionally rather than only when an RC file changes.
     generate_shell_loader || return 1
@@ -765,6 +795,94 @@ disable_paranoid_mode() {
     # Sync to config file
     config_set paranoid_mode_enabled false
     config_set paranoid_mode_method hook
+}
+
+# ─── Aliases ─────────────────────────────────────────────────────────────────
+
+# Alias names have to be usable as a shell word.
+alias_name_valid() {
+    [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]]
+}
+
+# Wrap a command in single quotes for `alias name=...`, escaping any it holds.
+alias_quote() {
+    local cmd="$1"
+    cmd=${cmd//\'/\'\\\'\'}
+    printf "'%s'" "$cmd"
+}
+
+# Emit "name<TAB>command" for every stored alias.
+alias_list_raw() {
+    [ -f "$ALIAS_FILE" ] || return 0
+    sed -n "s/^alias \([^=]*\)='\(.*\)'$/\1\t\2/p" "$ALIAS_FILE" \
+        | sed "s/'\\\\''/'/g"
+}
+
+alias_get() {
+    local name="$1"
+    alias_list_raw | awk -F'\t' -v n="$name" '$1 == n { print substr($0, index($0, "\t") + 1); exit }'
+}
+
+alias_names() {
+    alias_list_raw | cut -f1
+}
+
+alias_count() {
+    alias_list_raw | grep -c . || true
+}
+
+# Rewrite the alias file from "name<TAB>command" lines on stdin.
+alias_write_all() {
+    local tmpfile status
+    mkdir -p "$OLECHARMS_CONFIG_DIR" || { error "Could not create $OLECHARMS_CONFIG_DIR"; return 1; }
+    tmpfile=$(mktemp) || { error "mktemp failed"; return 1; }
+
+    {
+        echo "$ALIAS_MARKER"
+        echo "# Sourced by scripts/olecharms-shell.sh from your shell rc files."
+        local name cmd unload=""
+        while IFS=$'\t' read -r name cmd; do
+            [ -n "$name" ] || continue
+            echo "alias ${name}=$(alias_quote "$cmd")"
+            unload="$unload unalias ${name} 2>/dev/null;"
+        done
+        # The loader calls this before re-sourcing the file, so an alias that
+        # was just deleted also disappears from the running shell. Emitted as a
+        # function rather than a name list because zsh does not word-split
+        # unquoted parameters.
+        echo "_olecharms_unload_aliases() {${unload} return 0; }"
+    } > "$tmpfile"
+
+    write_file_contents "$tmpfile" "$ALIAS_FILE"
+    status=$?
+    rm -f "$tmpfile"
+    return $status
+}
+
+alias_set() {
+    local name="$1" cmd="$2"
+    { alias_list_raw | grep -v "^${name}$(printf '\t')"; printf '%s\t%s\n' "$name" "$cmd"; } \
+        | sort -f | alias_write_all
+}
+
+alias_unset() {
+    local name="$1"
+    alias_list_raw | grep -v "^${name}$(printf '\t')" | alias_write_all
+}
+
+# Ask before changing anything. Enter means yes, and so does EOF — but a piped
+# answer is still honoured, so `echo n | olecharms ...` declines.
+confirm_default_yes() {
+    local prompt="$1" answer
+    if [ -t 0 ]; then
+        read -rp "$prompt [Y/n] " answer || return 0
+    else
+        read -r answer || return 0
+    fi
+    case "$answer" in
+        [nN]|[nN][oO]) return 1 ;;
+        *)             return 0 ;;
+    esac
 }
 
 # ─── Config Versioning ──────────────────────────────────────────────────────
@@ -1506,6 +1624,17 @@ cmd_check() {
         echo -e "  ${RED}✗${NC} $SHELL_LOADER  (not generated — run install or update)"
     fi
 
+    # Aliases
+    echo ""
+    echo -e "${BLUE}Aliases:${NC}"
+    local alias_n
+    alias_n=$(alias_count)
+    if [ "$alias_n" -gt 0 ]; then
+        echo -e "  ${GREEN}✓${NC} $alias_n defined in $ALIAS_FILE"
+    else
+        echo -e "  ${YELLOW}~${NC} none defined  (olecharms alias add <name> <command...>)"
+    fi
+
     # Check EDITOR env
     echo ""
     echo -e "${BLUE}EDITOR environment:${NC}"
@@ -1608,6 +1737,11 @@ cmd_status() {
     else
         echo "  (none)"
     fi
+
+    # Aliases
+    echo ""
+    echo -e "${BLUE}Aliases:${NC}"
+    alias_show_list
 }
 
 config_downloads_cleanup() {
@@ -1891,6 +2025,133 @@ cmd_config() {
     done
 }
 
+# How the new alias becomes usable right away, if at all
+alias_activation_note() {
+    if [ -n "${OLECHARMS_SHELL_WRAPPER:-}" ]; then
+        info "Ready to use in this session."
+    else
+        info "Active in new shells. For this one: source \"$ALIAS_FILE\""
+    fi
+}
+
+alias_add() {
+    local name="$1"; shift
+    local cmd="$*"
+
+    if [ -z "$name" ] || [ -z "$cmd" ]; then
+        error "Usage: olecharms alias add <name> <command...>"
+        return 1
+    fi
+    if ! alias_name_valid "$name"; then
+        error "Invalid alias name: $name (letters, digits, _ . - ; must not start with a digit)"
+        return 1
+    fi
+
+    local existing
+    existing=$(alias_get "$name")
+
+    echo ""
+    if [ -n "$existing" ]; then
+        echo -e "  ${BOLD}Replace${NC} alias ${BOLD}${name}${NC}"
+        echo "    old: $existing"
+        echo "    new: $cmd"
+    else
+        echo -e "  ${BOLD}Add${NC} alias ${BOLD}${name}${NC}"
+        echo "    $cmd"
+        if check_command "$name"; then
+            warn "  Note: '$name' is also a command at $(command -v "$name") — the alias will shadow it."
+        fi
+    fi
+    echo ""
+
+    if ! confirm_default_yes "  Add this alias?"; then
+        info "Cancelled"
+        return 0
+    fi
+
+    alias_set "$name" "$cmd" || return 1
+    info "Alias '$name' saved to $ALIAS_FILE"
+    alias_activation_note
+}
+
+alias_delete() {
+    local name="$1"
+
+    if [ -z "$name" ]; then
+        error "Usage: olecharms alias delete <name>"
+        return 1
+    fi
+
+    local existing
+    existing=$(alias_get "$name")
+    if [ -z "$existing" ]; then
+        error "No such alias: $name"
+        return 1
+    fi
+
+    echo ""
+    echo -e "  ${BOLD}Delete${NC} alias ${BOLD}${name}${NC}"
+    echo "    $existing"
+    echo ""
+
+    if ! confirm_default_yes "  Delete this alias?"; then
+        info "Cancelled"
+        return 0
+    fi
+
+    alias_unset "$name" || return 1
+    info "Alias '$name' deleted"
+    alias_activation_note
+}
+
+alias_show_list() {
+    local count
+    count=$(alias_count)
+    if [ "$count" -eq 0 ]; then
+        echo "  (no aliases defined — add one with: olecharms alias add <name> <command...>)"
+        return 0
+    fi
+
+    # Pad the name column to the widest name
+    local width=0 name cmd
+    while IFS=$'\t' read -r name cmd; do
+        [ ${#name} -gt "$width" ] && width=${#name}
+    done < <(alias_list_raw)
+
+    while IFS=$'\t' read -r name cmd; do
+        printf "  ${GREEN}%-${width}s${NC}  %s\n" "$name" "$cmd"
+    done < <(alias_list_raw)
+}
+
+cmd_alias() {
+    local sub="${1:-list}"
+    [ $# -gt 0 ] && shift
+
+    case "$sub" in
+        add|set)
+            alias_add "$@"
+            ;;
+        delete|remove|rm|del)
+            alias_delete "$@"
+            ;;
+        list|ls|"")
+            echo -e "${BOLD}olecharms aliases${NC}"
+            echo ""
+            alias_show_list
+            echo ""
+            echo "  Stored in $ALIAS_FILE"
+            ;;
+        *)
+            error "Unknown alias subcommand: $sub"
+            echo ""
+            echo "  olecharms alias add <name> <command...>   Create or replace an alias"
+            echo "  olecharms alias list                      Show all aliases"
+            echo "  olecharms alias delete <name>             Remove an alias"
+            return 1
+            ;;
+    esac
+}
+
 cmd_help() {
     echo -e "${BOLD}olecharms${NC} — Environment management for olecharms"
     echo ""
@@ -1902,7 +2163,13 @@ cmd_help() {
     echo "  check     Report installed/missing dependencies and plugin status"
     echo "  status    Show what's installed with version info"
     echo "  config    Interactive menu to toggle system features (e.g. downloads cleanup)"
+    echo "  alias     Manage shell aliases (add / list / delete)"
     echo "  help      Show this help message"
+    echo ""
+    echo -e "${BLUE}Aliases:${NC}"
+    echo "  olecharms alias add <name> <command...>   Create or replace an alias"
+    echo "  olecharms alias list                      Show all aliases"
+    echo "  olecharms alias delete <name>             Remove an alias"
 
     # Dynamically list shell commands from shell/*.sh
     local shell_files=("$SHELL_DIR"/*.sh)
@@ -1932,6 +2199,8 @@ cmd_help() {
     echo "  olecharms update     # Update everything"
     echo "  olecharms check      # See what's installed/missing"
     echo "  olecharms config     # Toggle system features"
+    echo "  olecharms alias add gs git status"
+    echo "  olecharms alias add claude \"claude --update && claude\""
 }
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -1954,6 +2223,9 @@ main() {
             config_ensure
             fix_moved_install fix
             ;;
+        alias)
+            config_ensure
+            ;;
         check|status)
             config_ensure
             fix_moved_install warn
@@ -1966,6 +2238,7 @@ main() {
         check)   cmd_check ;;
         status)  cmd_status ;;
         config)  cmd_config ;;
+        alias)   shift; cmd_alias "$@" ;;
         help|--help|-h) cmd_help ;;
         "")
             cmd_help

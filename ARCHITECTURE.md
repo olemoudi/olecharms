@@ -2,19 +2,21 @@
 
 ## Overview
 
-**olecharms** is a single-script environment manager that sets up a consistent development environment (vim, zsh, fonts, shell utilities) across Linux and macOS machines. It follows a **clone → install → config → update** lifecycle:
+**olecharms** is a single-script environment manager that sets up a consistent development environment (vim, zsh, fonts, shell utilities) across Linux, macOS and WSL. From WSL it also manages the Windows side: Windows' own gVim gets the same config and plugins as the terminal vim, and the Powerline fonts are installed for the Windows user. It follows a **clone → install → config → update** lifecycle:
 
 1. Clone the repo to any machine
 2. Run `./olecharms.sh install` for idempotent first-time setup
 3. Optionally run `olecharms config` to enable features like downloads cleanup or paranoid mode
 4. Run `olecharms update` at any time to pull changes and re-apply everything
+5. Run `olecharms doctor` when something looks off (`--fix` repairs what it can offline)
 
 ## Project Structure
 
 ```
 olecharms/
 ├── olecharms.sh              # The single main script (all logic lives here)
-├── packages.conf              # User-editable config: packages, plugins, fonts, post-install commands
+├── packages.conf              # Shared config: packages, plugins, fonts, post-install commands
+│                              #   (per-machine additions: ~/.config/olecharms/packages.local.conf)
 ├── shell/                     # Shell commands auto-sourced into bash/zsh sessions
 │   ├── mkcd.sh                #   mkdir + cd in one step
 │   ├── mksh.sh                #   create a new shell script with boilerplate
@@ -22,7 +24,7 @@ olecharms/
 │   ├── each.sh                #   run a command for each line of stdin
 │   └── switchsshkey.sh        #   manage and switch between named SSH key pairs
 ├── vimthings/                 # Bundled vim configuration and fallback copies
-│   ├── olevimrc.vim           #   Main vimrc (sourced from ~/.vimrc)
+│   ├── olevimrc.vim           #   Main vimrc (sourced from ~/.vimrc, and from Windows' _vimrc on WSL)
 │   ├── configure.sh           #   Legacy standalone vim configurator (unused by olecharms.sh)
 │   ├── autoload/
 │   │   └── pathogen.vim       #   Bundled fallback copy of pathogen
@@ -41,18 +43,18 @@ olecharms/
 ├── scripts/                   # Generated at runtime (not committed)
 │   ├── olecharms-hook.sh      #   Shell profile hook for scheduled cleanups
 │   ├── olecharms-shell.sh     #   Loader that sources shell/*.sh files
-│   ├── cleanup-downloads.sh   #   Generated downloads cleanup script
+│   ├── cleanup-downloads.sh   #   Launcher for `olecharms cleanup --scheduled`
 │   ├── paranoid-cleanup.sh    #   Generated paranoid-mode cleanup script
 │   └── .last-run/             #   Timestamps for hook-based scheduling
-├── ARCHITECTURE.md            # This file
-└── CLAUDE.md                  # Project instructions for Claude Code
+├── .gitattributes             # Forces LF for *.sh/*.conf/*.vim (CRLF breaks bash and vim)
+└── ARCHITECTURE.md            # This file
 ```
 
 ## Script Sections
 
 `olecharms.sh` is organized into logical sections, delimited by comment banners:
 
-### 1. Constants & Globals (lines 5-69)
+### 1. Constants & Globals (lines 5-81)
 All paths, markers, intervals, and config variables. Key globals:
 - `SCRIPT_DIR` — resolved repo root (symlink chain walked, with a loop guard)
 - `SCRIPT_PATH` — the script's own resolved path; used for the `~/.local/bin` symlink and the self-update re-exec, so a renamed checkout still works
@@ -60,19 +62,24 @@ All paths, markers, intervals, and config variables. Key globals:
 - `BUNDLED_STAMP` — `.olecharms-bundled`, dropped into any directory populated from a bundled fallback
 - `OLECHARMS_CONFIG_FILE` — XDG config at `~/.config/olecharms/config`
 - `CURRENT_CONFIG_VERSION` — drives migration logic
+- `LOCAL_CONF_FILE` — `~/.config/olecharms/packages.local.conf`, per-machine additions sourced after `packages.conf`
+- `OLECHARMS_STATE_DIR` / `CLEANUP_LOG` — `${XDG_STATE_HOME:-~/.local/state}/olecharms`, holding the cleanup log and lock
+- `GENERATOR_VERSION` / `GENERATOR_STAMP` — stamped into every generated script so `doctor` can tell stale ones apart
+- `WIN_MANAGED_STAMP` / `WIN_VIMRC_LINE` — mark the plugin copies olecharms owns in Windows' `vimfiles\bundle`, and the line it puts in Windows' `_vimrc`
 - `SOURCE_LINE` — the `~/.vimrc` source line, with the path run through `_vim_escape()` (`:source` takes a bare path, so spaces and `\ | " % #` must be backslash-escaped)
 - Marker strings for idempotent RC file management (see [File Markers](#file-markers))
 
 This section also aborts immediately if `$HOME` is unset, missing, or not writable — every path olecharms writes lives under it.
 
-### 2. Color / Output Helpers (lines 71-86)
+### 2. Color / Output Helpers (lines 83-98)
 `info()`, `warn()`, `error()` with color support. Colors auto-disable when stdout is not a terminal. `error()` increments `ERROR_COUNT`, which `main()` turns into a non-zero exit status.
 
-### 3. Utility Functions (lines 88-798)
+### 3. Utility Functions (lines 100-1000)
 General-purpose helpers:
-- `load_config()` — sources `packages.conf`
-- `detect_os()` — sets `OS`, `PKG_MANAGER`, `FONT_DIR` (XDG-aware on Linux: `${XDG_DATA_HOME:-~/.local/share}/fonts`)
-- `backup_file()` — timestamped backup before destructive operations
+- `load_config()` — sources `packages.conf`, then `packages.local.conf` when present, with `OLECHARMS_OS` / `OLECHARMS_WSL` set so the local file can branch per machine
+- `ensure_local_conf_template()` — creates a commented `packages.local.conf` on install/update (never touches an existing one)
+- `detect_os()` — idempotent; sets `OS`, `PKG_MANAGER`, `FONT_DIR` (XDG-aware on Linux: `${XDG_DATA_HOME:-~/.local/share}/fonts`) and `IS_WSL`
+- `backup_file()` — timestamped backup before destructive operations; dereferences symlinks, so a stow/chezmoi dotfile is really backed up
 - `clone_or_pull()` — git clone with update, offline fallback, and non-destructive plugin replacement
 - `check_command()` — `command -v` wrapper
 - `resolve_link()` — portable symlink-chain resolution (no `readlink -f`, which is GNU-only)
@@ -80,21 +87,25 @@ General-purpose helpers:
 - `sed_inplace()` — portable `sed -i` (BSD/macOS sed requires an argument to `-i`)
 - `rc_strip_block()` — removes an olecharms block (marker line, associated lines, and the blank separator) from an RC file
 - `append_block()` — appends a block with exactly one blank separator line, and none at all when the file is new or empty
-- `managed_rc_files()` / `rc_has_marker()` — the RC file list (defaulting to `~/.bashrc`) and a marker lookup
-- `cron_replace_entry()` / `cron_quote_path()` — single point of crontab manipulation; paths are single-quoted and `%` escaped, since cron hands the line to `/bin/sh` and turns a bare `%` into a newline
+- `managed_rc_files()` — the RC file list (defaulting to `~/.bashrc`)
+- `cron_replace_entry()` / `cron_quote_path()` — single point of crontab manipulation; paths are single-quoted and `%` escaped, since cron hands the line to `/bin/sh` and turns a bare `%` into a newline. Reads through `cron_read()`, which fails instead of returning an empty table when `crontab -l` errors for any reason other than "no crontab" — so a failed read can never wipe the user's other jobs — and leaves the crontab untouched when the result would be identical
+- `cron_daemon_running()` / `warn_if_no_cron_daemon()` — warn when cron mode is chosen but no daemon runs (the default on WSL and in containers); always true on macOS, where launchd starts cron on demand
+- `_git_net()` — `git` for third-party repos with `GIT_TERMINAL_PROMPT=0` (a renamed or deleted GitHub repo answers with an auth prompt) and a low-speed timeout, so one bad plugin cannot hang the update
 - `ensure_scripts_dir()` — fails loudly if the checkout is read-only rather than generating half-written scripts
 - `_file_hash()` — portable file hashing (md5sum → md5 → cksum)
-- `find_downloads_dirs()` — locates `~/Downloads` (case-insensitive)
+- `find_downloads_dirs()` — locates `~/Downloads` (case-insensitive) and, on WSL, the Windows user's real Downloads folder (asked from Windows, so redirected or OneDrive folders are found); folders reaching the same place are listed once
+- `commit_generated()` — moves a generated script into place with an atomic same-directory rename, so a shell starting mid-update never sources half a file
 - `generate_hook_script()` — writes the shell-hook dispatcher
 - `install_shell_hook()` / `remove_shell_hook()` — manages hook lines in RC files
-- `generate_shell_loader()` — writes the `shell/*.sh` loader script
-- `install_shell_commands()` / `remove_shell_commands()` — manages loader lines in RC files. Installed even when `shell/` is empty, since the loader also carries the aliases and the `olecharms` wrapper function
+- `sync_shell_hook()` / `hook_needed()` — the single place that reconciles the hook with the enabled features: regenerates it and ensures the RC lines when any feature is hook-scheduled, removes both otherwise. Every enable/disable path ends here, so switching a feature between hook and cron cannot leave it running from both
+- `generate_shell_loader()` — writes the loader: sources `shell/*.sh` with alias expansion off (zsh `no_aliases`/`null_glob` inside a function, bash `expand_aliases` toggled), because shells expand aliases when a function is *defined* and the loader runs after oh-my-zsh — common-aliases' `cp='cp -i'` would otherwise be baked into every function, and an empty `shell/` would abort zsh startup with "no matches found"; activates autojump for the running shell (manual `~/.autojump`, Debian/Ubuntu or Homebrew install, unless `j` already exists — packages install autojump but nothing activates it), loads the aliases and defines the `olecharms()` wrapper function
+- `install_shell_commands()` / `remove_shell_commands()` — manages loader lines in RC files. Installed even when `shell/` is empty, since the loader also carries the aliases and the `olecharms` wrapper function. If `.zshrc` sources the loader before `oh-my-zsh.sh` (`loader_before_omz()`), the block is moved to the end: oh-my-zsh defines its aliases when sourced, so it would override the user's
 - `install_binary()` — symlinks `olecharms` to `~/.local/bin` and adds it to PATH
 - `install_editor_env()` — exports `EDITOR=vim` and `VISUAL=vim` in RC files
-- `enable_downloads_cleanup()` / `disable_downloads_cleanup()` — manages the downloads cleaner
+- `enable_downloads_cleanup()` / `disable_downloads_cleanup()` — manages the downloads cleaner: writes the `scripts/cleanup-downloads.sh` launcher, the cron entry or hook, and the config keys
 - `enable_paranoid_mode()` / `disable_paranoid_mode()` — manages paranoid-mode cleaner
 
-### 3b. Aliases (lines 800-886)
+### 3b. Aliases (lines 1002-1110)
 User-defined shell aliases, stored in `~/.config/olecharms/aliases` (next to the config, not in the gitignored `scripts/`, so they survive a fresh clone and a moved checkout):
 - `alias_name_valid()` / `alias_quote()` — name validation and single-quote escaping
 - `alias_list_raw()` / `alias_get()` / `alias_count()` — parse the file back into `name<TAB>command` records
@@ -104,7 +115,27 @@ User-defined shell aliases, stored in `~/.config/olecharms/aliases` (next to the
 
 The file is directly sourceable and ends with a generated `_olecharms_unload_aliases()` function that unaliases everything it defined. The loader calls it before re-sourcing, so a deleted alias also disappears from the running shell. It is a function rather than a name list because zsh does not word-split unquoted parameters.
 
-### 4. Config Versioning (lines 888-1093)
+### 3c. Downloads Cleanup Engine (lines 1112-1382)
+One implementation behind `olecharms cleanup`, its `--dry-run`, the config-menu preview, `doctor` and the scheduled runs:
+- `cleanup_real_dir()` — resolves the folder and refuses anything that is, or leads to, `$HOME` or `/`
+- `cleanup_collect()` — NUL-separated list of files older than N days; `desktop.ini` (Windows) and `.localized` (macOS) always stay, since they give the folder its localized name ("Descargas")
+- `cleanup_trash_backend()` / `cleanup_effective_backend()` — picks what happens to old files from `downloads_cleanup_action`: `auto` uses the Windows Recycle Bin (a Windows drive seen from WSL) or the macOS Trash and deletes otherwise — a desktop trash on a headless box would just grow; `trash` also accepts `gio` / `trash-put`; `delete` deletes
+- `cleanup_apply()` — acts on the list, then counts whatever is gone as done, so a backend failing halfway is reported truthfully; one log line per file
+- `cleanup_run()` — one pass: `mkdir` lock (a lock older than a day is taken over), collect, apply, remove empty dirs, log, trim the log to `CLEANUP_LOG_MAX_LINES`. Scheduled runs are silent and leave their trace in the log
+- `cleanup_print_preview()` / `cleanup_show_log()` — what the menu, `cleanup` and `--log` print
+
+### 3d. Windows (WSL) Integration (lines 1384-1795)
+Everything that reaches into Windows goes through PowerShell:
+- `win_ps_run()` — runs a PowerShell script as `-EncodedCommand` (UTF-16LE base64): nothing to quote through the interop layer, no execution-policy prompt, no temp `.ps1`. Output comes back as UTF-8; stdin is `/dev/null`, because `powershell.exe` otherwise swallows the user's pending input. The scripts (`PS_WIN_ENV`, `PS_FONTS`, `PS_RECYCLE`) are defined at top level with `read -d ''` — a heredoc inside `$(...)` is misparsed by the bash 3.2 that macOS ships
+- `win_powershell()` — finds `powershell.exe`, falling back to its standard path (cron's `PATH` has no Windows dirs)
+- `win_env_load()` — one PowerShell start per run (~1–2 s) for `USERPROFILE`, `LOCALAPPDATA`, `%HOME%`, the real Downloads folder, Program Files, gVim's registry key and the registered fonts; `WIN_VIM_HOME` follows Vim's rule (`%HOME%` if set, else `%USERPROFILE%`)
+- `win_find_gvim()` — installer registry key, `Program Files*/Vim/vimNN` (newest first), Scoop, `%PATH%`
+- `install_windows_fonts()` — copies missing `FONT_FAMILIES` files into `%LOCALAPPDATA%\Microsoft\Windows\Fonts`, registers them under HKCU and loads them with `AddFontResource` (no admin; same as Explorer's "Install for me"). Windows Terminal and gVim draw with Windows fonts, so the Linux-side copies do nothing for them
+- `install_windows_vim()` — mirrors pathogen, `olevimrc.vim` (to `vimfiles\olecharms\`) and every plugin (`win_sync_plugins()`: rsync without `.git`, stamped with `.olecharms-managed`; copies of plugins no longer listed are removed, folders olecharms did not create are never touched), creates `undodir`/`swapfiles`, and adds the managed block to the user `_vimrc` (`win_install_vimrc()`, keeping the file's own line endings; a new file gets CRLF). A user `_vimrc` takes precedence over the system `$VIM\_vimrc`
+- `sync_windows_side()` — the install/update step; skipped when `windows_integration=off` or Windows is unreachable
+- `win_recycle()` — the Recycle Bin backend: maps paths with one `wslpath` call for the root, then `SHFileOperation` with `ALLOWUNDO|SILENT|NOCONFIRMATION|NOERRORUI`, so no dialog ever opens from a background run
+
+### 4. Config Versioning (lines 1797-2022)
 XDG-based configuration persistence:
 - `config_read()` — parses key=value file into `OLECHARMS_CFG_*` variables (no `source`, safe)
 - `config_get()` / `config_set()` — read/write individual keys
@@ -112,10 +143,10 @@ XDG-based configuration persistence:
 - `config_bootstrap()` — first-run detection of existing state
 - `migrate_config()` — version-driven migration loop
 - `config_ensure()` — bootstrap or read+migrate on every run
-- `restore_scheduled_features()` — reconciles config → filesystem. `scripts/` is gitignored, so a fresh clone (or a moved install) has no generated cleanup scripts even when the config says a feature is on; this regenerates them and rewrites the crontab entries. Called by `install`/`update`, and with `force` by `fix_moved_install()`
+- `restore_scheduled_features()` — reconciles config → filesystem. `scripts/` is gitignored, so a fresh clone (or a moved install) has no generated cleanup scripts even when the config says a feature is on. It regenerates them on every run — not only when missing — because that is how fixes to their templates reach existing installs; the crontab and config are only rewritten when something differs. A downloads folder that is not reachable (an unmounted `/mnt/c`, an external drive) is skipped with a warning, never disabled in the config. Ends with `sync_shell_hook()`. Called by `install`/`update` and by `fix_moved_install()`
 - `fix_moved_install()` — repairs stale absolute paths after the checkout is moved
 
-### 5. Core Operations (lines 1095-1421)
+### 5. Core Operations (lines 2024-2355)
 The installation steps called by subcommands:
 - `install_packages()` — apt/brew install with smart skip of already-installed packages
 - `create_vim_dirs()` — creates `~/.vim/{autoload,bundle,bundle_disabled,undodir,swapfiles}`
@@ -126,30 +157,35 @@ The installation steps called by subcommands:
 - `install_omz()` — installs Oh My Zsh, creates custom theme with random host color
 - `run_post_commands()` — runs user-defined post-install commands
 
-### 6. Subcommand Handlers (lines 1423-2204)
-- `_self_update()` — pulls the olecharms repo itself, re-execs if the script changed
+### 6. Subcommand Handlers (lines 2357-3807)
+- `_self_update()` — pulls the olecharms repo itself, re-execs (through `bash`, so a lost exec bit cannot abort it) if the script changed. Warns when `packages.conf` has local edits, and when `--autostash` had to park them in `git stash` because they clashed with the update
+- `run_setup_steps()` — the step sequence shared by install and update
 - `cmd_install()` — full idempotent setup sequence
-- `cmd_update()` — same as install (alias)
-- `cmd_check()` — reports installed/missing status for all components
+- `cmd_update()` — same steps; tells the user to `exec zsh` when RC files, the loader or aliases changed (`shell_config_snapshot()`)
+- `cmd_doctor()` — see [Doctor](#doctor); `check` is an alias
+- `cmd_cleanup()` — `olecharms cleanup [--dry-run|--log|--yes]`, and `--scheduled` for the launcher
+- `cmd_windows()` — WSL only: `sync` (default) or `status`
 - `cmd_status()` — shows versions and commit hashes for all installed components
-- `cmd_config()` — interactive menu for toggling features
+- `cmd_config()` — interactive menu for toggling features (plus the Windows integration switch on WSL)
 - `cmd_alias()` — dispatches `add` / `list` / `delete`; `alias_add()`, `alias_delete()` and `alias_show_list()` do the work
 - `cmd_help()` — usage text with dynamically listed shell commands
 
-### 7. Config Submenus (within Subcommand Handlers)
-- `config_downloads_cleanup()` — interactive enable/disable of downloads auto-cleanup
+### 7. Doctor and Config Submenus (within Subcommand Handlers)
+- `doctor_check_*()` — one function per area; `doc_ok/doc_warn/doc_fail` count results, `doc_hint` prints the fix
+- `config_downloads_cleanup()` — when enabling: folder, schedule, trash-or-delete, then a preview of what the first run would remove and a confirmation. When enabled: preview, change action, change max age, history, disable
+- `choose_downloads_dir()` / `choose_cleanup_action()` — prompts shared with paranoid mode; they run inside `$(...)`, so their messages go to stderr
 - `config_paranoid_mode()` — interactive enable/disable of paranoid mode
 
-### 8. Main (lines 2206-2260)
-Dispatches `$1` to the appropriate `cmd_*` handler, warns when running as root (everything would be installed into root's home; `OLECHARMS_ALLOW_ROOT=1` silences it), and exits non-zero if `ERROR_COUNT > 0`.
+### 8. Main (lines 3809-3876)
+Calls `detect_os`, dispatches `$1` to the appropriate `cmd_*` handler, warns when running as root (everything would be installed into root's home; `OLECHARMS_ALLOW_ROOT=1` silences it), and exits non-zero if `ERROR_COUNT > 0`.
 
 ## Subcommand Flows
 
 ### `install` / `update`
-`main()` calls `config_ensure` + `fix_moved_install` before dispatch (see [Auto-fix on move](#auto-fix-on-move)). Then both commands run the same sequence:
-1. `load_config` — source `packages.conf`
-2. `detect_os` — determine package manager and font directory
-3. `_self_update` — pull the olecharms repo; re-exec if script changed
+`main()` calls `detect_os`, `config_ensure` + `fix_moved_install` before dispatch (see [Auto-fix on move](#auto-fix-on-move)). Then both commands run the same sequence:
+1. `load_config` — source `packages.conf`, then `packages.local.conf`
+2. `_self_update` — pull the olecharms repo; re-exec if script changed
+3. `ensure_local_conf_template` — create the commented per-machine file if missing
 4. `install_packages` — install missing system packages (skip already-installed)
 5. `create_vim_dirs` — ensure vim directory structure
 6. `install_pathogen` — clone or use bundled pathogen
@@ -161,24 +197,29 @@ Dispatches `$1` to the appropriate `cmd_*` handler, warns when running as root (
 12. `install_shell_commands` — generate loader, add to RC files
 13. `install_binary` — symlink `olecharms` to `~/.local/bin`
 14. `install_editor_env` — export `EDITOR=vim` and `VISUAL=vim` in RC files
-15. On install only: launch `zsh -l` so the user sees the result
+15. `restore_scheduled_features` — regenerate cleanup launchers, cron entries and the hook
+16. `sync_windows_side` — WSL only: Windows fonts, then Windows gVim config and plugins
+17. On install only, with a terminal and a clean run: show the result in zsh without nesting shells. Through the `olecharms()` shell function the calling shell itself is replaced (`exec zsh -l`); from a zsh started any other way olecharms only prints the command; from another shell it `exec`s zsh as before. On update, it says when the shell configuration changed
 
-### `check`
-Reads `packages.conf`, then reports presence/absence of:
-- System commands (git, vim, curl, etc.)
-- Vim directories
-- Pathogen
-- Each plugin (git repo vs bundled copy vs missing)
-- Vimrc source line
-- Font families
-- Shell commands and loader
-- EDITOR environment variable
+### `doctor` (alias `check`)
+Checks every area olecharms touches and prints `✓` / `~` (warning) / `✗` (problem) with a `→` hint for each failure: system commands; launcher symlink, exec bit and PATH; shell loader (generator stamp), its line in each RC file (and whether `.zshrc` loads it before oh-my-zsh), EDITOR, aliases, autojump activation, login shell; vim dirs, pathogen, plugins, the `~/.vimrc` line (and an old full copy of olevimrc in it, which loads the config twice); fonts; Oh My Zsh and theme; downloads cleanup (folder, backend, schedule, cron daemon, last run, what is due); paranoid mode; config version, moved checkout, local edits to `packages.conf`; and on WSL the Windows side (fonts, Windows Terminal font, gVim, `_vimrc`, `olevimrc.vim` copy, plugins). Exits 1 when there is a problem.
+
+`doctor --fix` first re-runs the local, offline steps — vim dirs, `~/.vimrc`, loader and RC lines, launcher, EDITOR, scheduled features, the Windows side — then checks. Packages and plugins need the network and stay with `update`.
+
+### `cleanup`
+- `olecharms cleanup` — shows folder, rule, action and how many files (and how much space) match, asks, then runs on exactly those files. Without a terminal it refuses unless `--yes`.
+- `olecharms cleanup --dry-run` — the full list; changes nothing.
+- `olecharms cleanup --log` — the last 20 runs from `~/.local/state/olecharms/cleanup.log` (which lists every file each run removed).
+- `--scheduled` — what the launcher calls: does nothing unless the feature is enabled.
+
+### `windows` (WSL)
+`olecharms windows` syncs fonts and gVim now (also part of every update); `olecharms windows status` runs the doctor's Windows checks.
 
 ### `status`
-Shows OS, repo path, config version, repo commit, installed plugin versions (commit + date), pathogen status, and available shell commands.
+Shows OS, repo path, config version, repo commit, installed plugin versions (commit + date), pathogen status, available shell commands, the downloads cleanup settings and last run, and on WSL the Windows gVim found and where its config lives.
 
 ### `alias`
-- `olecharms alias add <name> <command...>` — everything after the name is the command, so both `alias add gs git status` and `alias add claude "claude --update && claude"` work. Shows what will change, warns if the name shadows an existing command, then asks `[Y/n]` (Enter = yes) before writing.
+- `olecharms alias add <name> <command...>` — everything after the name is the command, so both `alias add gs git status` and `alias add claude "claude --update && claude"` work. Shows what will change, warns if the name already means something — through the wrapper, which passes the running shell's `type` output in `OLECHARMS_NAME_TYPE`, this includes oh-my-zsh aliases and functions the child bash cannot see; without it, only commands on `PATH` — then asks `[Y/n]` (Enter = yes) before writing.
 - `olecharms alias list` — name/command table.
 - `olecharms alias delete <name>` — same confirmation.
 
@@ -186,8 +227,9 @@ Because a child process cannot change its parent shell's aliases, the generated 
 
 ### `config`
 Interactive menu loop offering:
-1. **Downloads auto-cleanup** — toggle on/off, choose folder, choose hook vs cron scheduling
+1. **Downloads auto-cleanup** — enable with folder, schedule (hook/cron), trash-or-delete and a preview; once enabled, preview / change action / change max age / history / disable
 2. **Paranoid mode** — toggle on/off, choose hook vs cron; auto-enables downloads cleanup if not already on
+3. **Windows gVim & fonts** (WSL only) — `auto` / `off`
 
 ## packages.conf
 
@@ -203,11 +245,13 @@ Sourced by `olecharms.sh` to define what gets installed:
 | `FONT_FAMILIES` | Which font families to install from the fonts repo |
 | `POST_INSTALL_COMMANDS` | Optional commands to run after install/update |
 
+`~/.config/olecharms/packages.local.conf` is sourced right after it, for additions that only apply to one machine (`APT_PACKAGES+=( htop )`, `VIM_PLUGINS+=(...)`, branches on `$OLECHARMS_OS` / `$OLECHARMS_WSL`). It lives outside the checkout, so updates never touch it and local edits never collide with `git pull`.
+
 ## vimthings/
 
 Bundled vim configuration:
 
-- **`olevimrc.vim`** — the main vim config file, sourced from `~/.vimrc`. Configures pathogen loading, editor settings, key mappings, and plugin options.
+- **`olevimrc.vim`** — the main vim config file, sourced from `~/.vimrc` and — copied into `vimfiles\olecharms\` — from Windows' `_vimrc`. Configures pathogen loading, editor settings, key mappings, and plugin options. Portable on purpose: sets UTF-8 first (Windows Vim starts in the legacy code page), keeps undo/swap files under `~/vimfiles` on Windows and `~/.vim` elsewhere, and spells `guifont` the way each GUI expects.
 - **`autoload/pathogen.vim`** — bundled fallback copy of pathogen, used when cloning fails (offline installs).
 - **`bundle/`** — bundled fallback copies of all 9 vim plugins. Used when `git clone` fails. Each is a full copy of the plugin repository.
 - **`fonts/powerline/`** — bundled copy of the powerline fonts repository (30 families). `DejaVuSansMono` is installed by default.
@@ -240,9 +284,11 @@ These files are generated by `olecharms.sh` and are not committed to the repo:
 
 - **`olecharms-shell.sh`** — sources all `shell/*.sh` files; resolves its own directory at runtime to find `shell/`
 - **`olecharms-hook.sh`** — shell-hook dispatcher; resolves its own directory at runtime to find sibling scripts and `.last-run/`
-- **`cleanup-downloads.sh`** — deletes files older than 30 days from the configured downloads folder
+- **`cleanup-downloads.sh`** — a launcher for `olecharms cleanup --scheduled`, which reads folder, age and action from the config at run time (see [Downloads Cleanup Engine](#3c-downloads-cleanup-engine-lines-1112-1382)). The engine works on the folder's resolved path — on WSL `~/downloads` is usually a symlink into `/mnt/c`, and plain `find` does not descend into a symlinked starting point
 - **`paranoid-cleanup.sh`** — purges shell history and vim swap/undo files
 - **`.last-run/`** — directory of timestamp files used by the hook to enforce intervals
+
+Each generated script carries `# olecharms-generator: N`; `doctor` flags any older than the running script.
 
 ## Config Versioning
 
@@ -257,13 +303,15 @@ Simple `key=value` pairs. Parsed safely without `source` — only alphanumeric k
 - `migrate_config()` loops from the file's `CONFIG_VERSION` up to `CURRENT_CONFIG_VERSION`, calling `migrate_config_N_to_M()` functions if they exist
 - To add a new config flag: increment `CURRENT_CONFIG_VERSION`, add a `migrate_config_N_to_M()` function that calls `config_set` for the new key, and update `config_write_all()` to include it
 
-### Current config keys (v2)
+### Current config keys (v3)
 - `downloads_cleanup_enabled` (true/false)
 - `downloads_cleanup_dir` (path)
 - `downloads_cleanup_method` (hook/cron)
 - `downloads_cleanup_max_age_days` (integer)
+- `downloads_cleanup_action` (auto/trash/delete) — v3
 - `paranoid_mode_enabled` (true/false)
 - `paranoid_mode_method` (hook/cron)
+- `windows_integration` (auto/off) — v3, WSL only
 - `install_dir` (path) — records the installation directory for stale-path detection after folder moves
 
 ## Design Decisions
@@ -295,16 +343,22 @@ All vim plugins, pathogen, and powerline fonts are bundled in `vimthings/`. If `
 A directory populated this way gets a `.olecharms-bundled` stamp file. On later runs `clone_or_pull()` sees the stamp and tries to upgrade the copy to a real clone, leaving it untouched if still offline — rather than treating it as a foreign directory, shunting it into `bundle_disabled/`, and re-copying it on every single run. `install_pathogen()` deliberately passes no fallback (pathogen is one file, copied straight out of `vimthings/autoload/`) and reclaims the oversized staging directory older versions left behind.
 
 ### Exit status
-`error()` increments `ERROR_COUNT` and `main()` exits 1 when it is non-zero, so `olecharms update && ...` and cron jobs see failures. `cmd_install()` ends by `exec`ing a login zsh only when stdin and stdout are both terminals and the run was clean; otherwise it returns normally so the exit status survives.
+`error()` increments `ERROR_COUNT` and `main()` exits non-zero when it is non-zero or when the subcommand itself returned non-zero (an `error()` inside a pipeline runs in a subshell and never reaches the counter), so `olecharms update && ...` and cron jobs see failures. `cmd_install()` hands over to a login zsh only when stdin and stdout are both terminals and the run was clean; otherwise it returns normally so the exit status survives. `doctor` exits 1 when any check fails.
 
 ### Smart package check
 On Linux, `dpkg -s` checks each package individually before invoking `sudo apt-get`. If all packages are already installed, `sudo` is never called. This avoids unnecessary password prompts.
 
 ### Self-update with re-exec
-`_self_update()` hashes `olecharms.sh` and `packages.conf` before and after `git pull`. If either changed, it `bash -n`-checks the new file and then `exec`s it so the rest of the install runs with updated code. The re-exec sets `OLECHARMS_RELAUNCHED=1`, which makes the new process skip self-update entirely — a mis-comparing hash can never loop.
+`_self_update()` hashes `olecharms.sh` and `packages.conf` before and after `git pull`. If either changed, it `bash -n`-checks the new file and then `exec bash`s it (not the file directly, which would abort the update half-way on a checkout that lost its exec bit) so the rest of the install runs with updated code. The re-exec sets `OLECHARMS_RELAUNCHED=1`, which makes the new process skip self-update entirely — a mis-comparing hash can never loop.
 
 ### Dual scheduling (hook + cron)
 Cleanup features can be scheduled via shell hooks (checked on every shell open, throttled by timestamp files) or via cron jobs. The hook approach works without a cron daemon and runs even on systems where cron isn't available.
+
+### Recoverable cleanup by default
+The downloads cleanup defaults to `auto`: on WSL, files on a Windows drive go to the Windows Recycle Bin, and on macOS to the Trash. Only where there is no trash the user actually empties (plain Linux) are they deleted. Every run is logged file by file, and the config menu shows what the first run would remove before enabling.
+
+### Windows side from WSL
+Windows' gVim cannot follow WSL symlinks and should not depend on WSL running, so it gets copies: the plugins olecharms already cloned for the terminal vim (without `.git`), pathogen and `olevimrc.vim`. Copies are stamped so updates can remove what olecharms put there and never touch anything else. Fonts are installed per user (HKCU), which needs no admin rights.
 
 ### Non-destructive plugin management
 When a plugin directory exists, isn't a git repo, and carries no `.olecharms-bundled` stamp — i.e. it is the user's own — it's moved to `~/.vim/bundle_disabled/` with a timestamp before re-cloning. Nothing is deleted.
@@ -334,4 +388,4 @@ Blocks are added with `append_block()` (one blank separator line, none when the 
 
 - **Syntax check:** `bash -n olecharms.sh`
 - **Non-destructive:** `./olecharms.sh check` and `./olecharms.sh status`
-- **Sandboxed end-to-end:** point `HOME` and `XDG_CONFIG_HOME` at a scratch directory and run `update` twice against a copy of the checkout; the second run must report no errors and leave the RC files byte-identical.
+- **Sandboxed end-to-end:** point `HOME` and `XDG_CONFIG_HOME` at a scratch directory and run `update` twice against a copy of the checkout; the second run must report no errors and leave the RC files, config and crontab byte-identical. Put a fake `crontab` first on `PATH` too — the crontab belongs to the user, not to `$HOME` — and a copy of the checkout keeps the generated `scripts/` of the real one untouched.

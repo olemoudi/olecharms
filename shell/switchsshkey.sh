@@ -1,5 +1,9 @@
 # switchsshkey — manage and switch between named SSH key pairs (alias: ssk)
 switchsshkey() {
+    # zsh aborts on a glob with no matches (~/.ssh/*.pubkey before any key has
+    # been added); make it expand to nothing, like the [ -f ] checks expect.
+    [ -n "${ZSH_VERSION:-}" ] && setopt local_options null_glob
+
     local cmd="${1:-current}"
 
     case "$cmd" in
@@ -44,6 +48,14 @@ switchsshkey() {
             fi
             local name="$2" private_key_file="$3" public_key_file="$4"
 
+            # The name becomes a file name in ~/.ssh and must not shadow a subcommand
+            case "$name" in
+                ""|*/*|.*|-*|help|list|add|current)
+                    echo "switchsshkey: invalid key name: '$name'" >&2
+                    return 1
+                    ;;
+            esac
+
             if [ ! -r "$private_key_file" ]; then
                 echo "switchsshkey: cannot read private key file: $private_key_file" >&2
                 return 1
@@ -86,6 +98,30 @@ switchsshkey() {
                 echo "switchsshkey: key pair '$name' not found" >&2
                 echo "Run 'switchsshkey list' to see available keys" >&2
                 return 1
+            fi
+
+            # Never overwrite a private key that exists nowhere else: if the
+            # active pair is not one of the named ones, keep it under a backup
+            # name first.
+            if [ -f ~/.ssh/id_ed25519 ]; then
+                local f saved=""
+                for f in ~/.ssh/*.pubkey; do
+                    [ -f "$f" ] || continue
+                    if cmp -s ~/.ssh/id_ed25519 "${f%.pubkey}.privatekey"; then
+                        saved=1
+                        break
+                    fi
+                done
+                if [ -z "$saved" ]; then
+                    local backup
+                    backup="backup-$(date +%Y%m%d-%H%M%S)"
+                    cp -p ~/.ssh/id_ed25519 "$HOME/.ssh/$backup.privatekey" || return
+                    chmod 600 "$HOME/.ssh/$backup.privatekey" || return
+                    if [ -f ~/.ssh/id_ed25519.pub ]; then
+                        cp -p ~/.ssh/id_ed25519.pub "$HOME/.ssh/$backup.pubkey" || return
+                    fi
+                    echo "switchsshkey: the active key was not saved under a name; kept it as '$backup'" >&2
+                fi
             fi
 
             cp "$priv_source" ~/.ssh/id_ed25519 || return

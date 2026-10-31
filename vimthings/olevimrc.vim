@@ -3,6 +3,15 @@
 " author: @olemoudi
 " compiled out of several online tutorial, tips, own prefs...
 
+" UTF-8 before anything else: Windows Vim starts out in the legacy code page,
+" and the airline symbols further down are UTF-8.
+set encoding=utf-8
+scriptencoding utf-8
+
+" Per-user runtime dir: ~/vimfiles on Windows, ~/.vim everywhere else. The
+" same file serves the terminal vim and Windows' gVim (olecharms copies it).
+let s:vimdir = expand(has('win32') ? '$HOME/vimfiles' : '$HOME/.vim')
+
 " Pathogen load
 filetype off
 
@@ -45,8 +54,8 @@ filetype plugin on
 filetype indent on
 set undofile " Maintain history of undos between sessions
 " Use let &opt so a $HOME containing spaces does not need escaping
-let &undodir = expand('$HOME/.vim/undodir')
-let &directory = expand('$HOME/.vim/swapfiles')
+let &undodir = s:vimdir . '/undodir'
+let &directory = s:vimdir . '/swapfiles'
  
 " Highlight search terms...
 set hlsearch
@@ -107,16 +116,19 @@ set hlsearch                " Highlight searches by default.
 set incsearch               " Incrementally search while typing a /regex
 
 """" Display
+" Patched Powerline font (https://github.com/powerline/fonts); every GUI spells
+" font names its own way. Harmless in a terminal.
+if has('win32')
+    set guifont=DejaVu_Sans_Mono_for_Powerline:h12
+elseif has('mac')
+    set guifont=DejaVu\ Sans\ Mono\ for\ Powerline:h13
+else
+    set guifont=DejaVu\ Sans\ Mono\ for\ Powerline\ 12
+endif
 if has("gui_running")
     set lines=50 columns=130
-    " windows format
-    set guifont=DejaVu_Sans_Mono_for_Powerline:h12
-    "Try patched powerline font
-    "https://github.com/powerline/fonts
-    colorscheme desert
-else
-    colorscheme desert
 endif
+colorscheme desert
 
 """"
 
@@ -261,14 +273,12 @@ nmap <leader>s :SyntasticCheck<CR>
 
 """ vim-airline
 let g:airline_powerline_fonts = 1
-set guifont=DejaVu_Sans_Mono_for_Powerline:h12
 if !exists('g:airline_symbols')
     let g:airline_symbols = {}
 endif
 " enable tabs
 let g:airline#extensions#tabline#enabled = 1
 
-set encoding=utf-8
 " unicode symbols
 let g:airline_left_sep = '»'
 let g:airline_left_sep = '▶'

@@ -55,7 +55,7 @@ olecharms/
 
 `olecharms.sh` is organized into logical sections, delimited by comment banners:
 
-### 1. Constants & Globals (lines 5-92)
+### 1. Constants & Globals (lines 5-105)
 All paths, markers, intervals, and config variables. Key globals:
 - `SCRIPT_DIR` — resolved repo root (symlink chain walked, with a loop guard)
 - `SCRIPT_PATH` — the script's own resolved path; used for the `~/.local/bin` symlink and the self-update re-exec, so a renamed checkout still works
@@ -72,10 +72,10 @@ All paths, markers, intervals, and config variables. Key globals:
 
 This section also aborts immediately if `$HOME` is unset, missing, or not writable — every path olecharms writes lives under it.
 
-### 2. Color / Output Helpers (lines 94-111)
+### 2. Color / Output Helpers (lines 107-124)
 `info()`, `warn()`, `error()` with color support. Colors auto-disable when stdout is not a terminal. `error()` increments `ERROR_COUNT`, which `main()` turns into a non-zero exit status.
 
-### 3. Utility Functions (lines 113-1237)
+### 3. Utility Functions (lines 126-1297)
 General-purpose helpers:
 - `load_config()` — sources `packages.conf`, then `packages.local.conf` when present, with `OLECHARMS_OS` / `OLECHARMS_WSL` set so the local file can branch per machine
 - `ensure_local_conf_template()` — creates a commented `packages.local.conf` on install/update (never touches an existing one)
@@ -106,7 +106,7 @@ General-purpose helpers:
 - `enable_downloads_cleanup()` / `disable_downloads_cleanup()` — manages the downloads cleaner: writes the `scripts/cleanup-downloads.sh` launcher, the cron entry or hook, and the config keys
 - `enable_paranoid_mode()` / `disable_paranoid_mode()` — manages paranoid-mode cleaner. On WSL with the Windows integration on (`paranoid_covers_windows()`), the generated script also purges the Windows gVim's `_viminfo`, `vimfiles/swapfiles` and `vimfiles/undodir`; the Windows path is resolved at generation time (PowerShell is too slow for every run) and the script is regenerated when the integration is toggled. Disabling leaves the downloads cleanup on and says so
 
-### 3b. Aliases (lines 1239-1736)
+### 3b. Aliases (lines 1299-1820)
 User-defined shell aliases, in two files with the same format:
 - per machine: `~/.config/olecharms/aliases` (next to the config, not in the gitignored `scripts/`, so they survive a fresh clone and a moved checkout)
 - global: `global-aliases.sh` in the repo, committed and pushed by olecharms itself, so every machine gets it on its next update. The loader sources it first, so a per-machine alias of the same name wins.
@@ -126,13 +126,13 @@ Storage functions take the file as an optional last argument (default: per machi
 Global aliases (`global_alias_*`):
 - `global_alias_upstream()` — the branch the checkout tracks; without one there is nowhere to publish and nothing is offered
 - `global_alias_publish()` — pull, check push access, apply the change to `global-aliases.sh` only, commit that file alone and push (one retry after a rebase if someone pushed in between). Refuses to push unrelated local commits without asking
-- `global_push_access()` — dry-run push of the remote's own commit back (a fast-forward, so only access can fail); while it fails, prints how to grant access (`global_push_help()`: this machine's SSH public keys, GitHub key / deploy-key pages, or an SSH push URL for HTTPS remotes) and waits for the user to retry or keep the alias local
+- `global_push_access()` — dry-run push of the remote's own commit back (a fast-forward, so only access can fail). If git's own credentials fail and the GitHub CLI is signed in, it borrows gh as credential helper for this run (`GLOBAL_PUSH_OPTS`; the git config is not changed). While it still fails, prints how to grant access (`global_push_help()`: this machine's SSH public keys, GitHub key / deploy-key pages, or an SSH push URL for HTTPS remotes) and waits for the user to retry or keep the alias local
 - `alias_save_global()` — publishes and drops a per-machine alias of the same name, which would shadow it here
 - `confirm_default_yes()` — `[Y/n]` prompt where Enter and EOF mean yes, but a piped answer is still honoured
 
 Both files hold `alias name='command'` lines and nothing else. The loader remembers the names it loaded (`_olecharms_loaded_aliases`) and unaliases them before re-sourcing, so a deleted alias also disappears from the running shell. Files written by older versions ended with an `_olecharms_unload_aliases()` function instead; one line naming every alias would make any two edits of `global-aliases.sh` on different machines conflict.
 
-### 3c. Downloads Cleanup Engine (lines 1738-2164)
+### 3c. Downloads Cleanup Engine (lines 1822-2392)
 One implementation behind `olecharms cleanup`, its `--dry-run`, the config-menu preview, `doctor` and the scheduled runs:
 - `cleanup_real_dir()` — resolves the folder and refuses anything that is, or leads to, `$HOME` or `/`
 - `cleanup_collect()` — NUL-separated list of files older than N days; `desktop.ini` (Windows) and `.localized` (macOS) always stay, since they give the folder its localized name ("Descargas")
@@ -141,7 +141,7 @@ One implementation behind `olecharms cleanup`, its `--dry-run`, the config-menu 
 - `cleanup_run()` — one pass: `mkdir` lock (a lock older than a day is taken over), collect, apply, remove empty dirs, log, trim the log to `CLEANUP_LOG_MAX_LINES`. Scheduled runs are silent and leave their trace in the log
 - `cleanup_print_preview()` / `cleanup_show_log()` — what the menu, `cleanup` and `--log` print
 
-### 3d. Windows (WSL) Integration (lines 2166-2659)
+### 3d. Windows (WSL) Integration (lines 2394-2887)
 Everything that reaches into Windows goes through PowerShell:
 - `win_ps_run()` — runs a PowerShell script as `-EncodedCommand` (UTF-16LE base64): nothing to quote through the interop layer, no execution-policy prompt, no temp `.ps1`. Output comes back as UTF-8; stdin is `/dev/null`, because `powershell.exe` otherwise swallows the user's pending input. The scripts (`PS_WIN_ENV`, `PS_FONTS`, `PS_RECYCLE`) are defined at top level with `read -d ''` — a heredoc inside `$(...)` is misparsed by the bash 3.2 that macOS ships
 - `win_powershell()` — finds `powershell.exe`, falling back to its standard path (cron's `PATH` has no Windows dirs)
@@ -152,7 +152,7 @@ Everything that reaches into Windows goes through PowerShell:
 - `sync_windows_side()` — the install/update step; skipped when `windows_integration=off` or Windows is unreachable
 - `win_recycle()` — the Recycle Bin backend: maps paths with one `wslpath` call for the root, then `SHFileOperation` with `ALLOWUNDO|SILENT|NOCONFIRMATION|NOERRORUI`, so no dialog ever opens from a background run
 
-### 4. Config Versioning (lines 2661-2887)
+### 4. Config Versioning (lines 2889-3129)
 XDG-based configuration persistence:
 - `config_read()` — parses key=value file into `OLECHARMS_CFG_*` variables (no `source`, safe)
 - `config_get()` / `config_set()` — read/write individual keys
@@ -163,18 +163,18 @@ XDG-based configuration persistence:
 - `restore_scheduled_features()` — reconciles config → filesystem. `scripts/` is gitignored, so a fresh clone (or a moved install) has no generated cleanup scripts even when the config says a feature is on. It regenerates them on every run — not only when missing — because that is how fixes to their templates reach existing installs; the crontab and config are only rewritten when something differs. A downloads folder that is not reachable (an unmounted `/mnt/c`, an external drive) is skipped with a warning, never disabled in the config. Ends with `sync_shell_hook()`. Called by `install`/`update` and by `fix_moved_install()`
 - `fix_moved_install()` — repairs stale absolute paths after the checkout is moved
 
-### 5. Core Operations (lines 2889-3283)
+### 5. Core Operations (lines 3131-3586)
 The installation steps called by subcommands:
 - `install_packages()` — apt/brew install with smart skip of already-installed packages
 - `create_vim_dirs()` — creates `~/.vim/{autoload,bundle,bundle_disabled,undodir,swapfiles}`
 - `install_pathogen()` — clones or falls back to bundled pathogen
-- `install_plugins()` — clones/updates each plugin from `VIM_PLUGINS` array
+- `install_plugins()` — clones/updates each plugin from `VIM_PLUGINS` array; `plugin_follow_default_branch()` switches a plugin whose upstream renamed its default branch; `plugins_retire_unlisted()` moves plugins olecharms cloned (recorded in `~/.local/state/olecharms/managed-plugins`) that packages.conf no longer lists to `bundle_disabled` — never one put there by hand, and not when most of them would go at once
 - `install_vimrc()` — adds source line to `~/.vimrc` (idempotent, updates stale paths)
 - `install_fonts()` — clones powerline fonts or uses bundled copies, rebuilds font cache
 - `install_omz()` — installs Oh My Zsh, creates custom theme with random host color. An existing `~/.zshrc` is kept (`KEEP_ZSHRC=yes`; the installer would otherwise move it aside and replace a dotfiles symlink with its template) and `omz_add_to_zshrc()` prepends the oh-my-zsh lines to it
 - `run_post_commands()` — runs user-defined post-install commands
 
-### 6. Subcommand Handlers (lines 3285-4985)
+### 6. Subcommand Handlers (lines 3588-5487)
 - `_self_update()` — pulls the olecharms repo itself, re-execs (through `bash`, so a lost exec bit cannot abort it) if the script changed. Warns when `packages.conf` has local edits, and when `--autostash` had to park them in `git stash` because they clashed with the update
 - `run_setup_steps()` — the step sequence shared by install and update
 - `cmd_install()` — full idempotent setup sequence
@@ -194,7 +194,7 @@ The installation steps called by subcommands:
 - `choose_downloads_dir()` / `choose_cleanup_action()` — prompts shared with paranoid mode; they run inside `$(...)`, so their messages go to stderr
 - `config_paranoid_mode()` — interactive enable/disable of paranoid mode. Enabling keeps downloads at most `PARANOID_MAX_AGE_DAYS` (15) old: it enables the cleanup, or lowers a longer max age, after a preview of what that removes and a confirmation
 
-### 8. Main (lines 4987-5055)
+### 8. Main (lines 5489-5558)
 Calls `detect_os`, dispatches `$1` to the appropriate `cmd_*` handler, warns when running as root (everything would be installed into root's home; `OLECHARMS_ALLOW_ROOT=1` silences it), and exits non-zero if `ERROR_COUNT > 0`.
 
 ## Subcommand Flows
@@ -220,14 +220,20 @@ Calls `detect_os`, dispatches `$1` to the appropriate `cmd_*` handler, warns whe
 17. On install only, with a terminal and a clean run: show the result in zsh without nesting shells. Through the `olecharms()` shell function the calling shell itself is replaced (`exec zsh -l`); from a zsh started any other way olecharms only prints the command; from another shell it `exec`s zsh as before. On update, it says when the shell configuration changed
 
 ### `doctor` (alias `check`)
-Checks every area olecharms touches and prints `✓` / `~` (warning) / `✗` (problem) with a `→` hint for each failure: system commands; launcher symlink, exec bit and PATH; shell loader (generator stamp), its line in each RC file (and whether `.zshrc` loads it before oh-my-zsh), EDITOR, aliases, autojump activation, login shell; vim dirs, pathogen, plugins, the `~/.vimrc` line (and an old full copy of olevimrc in it, which loads the config twice); fonts; Oh My Zsh and theme; downloads cleanup (folder, backend, schedule, cron daemon, last run, what is due); paranoid mode; config version, moved checkout, local edits to `packages.conf`; and on WSL the Windows side (fonts, Windows Terminal font, gVim, `_vimrc`, `olevimrc.vim` copy, plugins). Exits 1 when there is a problem.
+Checks every area olecharms touches and prints `✓` / `~` (warning) / `✗` (problem) with a `→` hint for each failure: system commands; the checkout (merge/rebase in progress, conflict markers, branch without upstream, commits ahead/behind as of the last fetch, stash entries, days since the last successful pull, a git credential helper that no longer exists); launcher symlink, exec bit and PATH; shell loader (generator stamp), its line in each RC file (and whether `.zshrc` loads it before oh-my-zsh), EDITOR, aliases, autojump activation, login shell; vim dirs, pathogen, plugins, the `~/.vimrc` line (and an old full copy of olevimrc in it, which loads the config twice); fonts; Oh My Zsh and theme; downloads cleanup (folder, backend, schedule, cron daemon, last run, what is due); paranoid mode; config version, moved checkout, local edits to `packages.conf`; and on WSL the Windows side (fonts, Windows Terminal font, gVim, `_vimrc`, `olevimrc.vim` copy, plugins). Exits 1 when there is a problem.
 
-`doctor --fix` first re-runs the local, offline steps — vim dirs, `~/.vimrc`, loader and RC lines, launcher, EDITOR, scheduled features, the Windows side — then checks. Packages and plugins need the network and stay with `update`.
+`doctor --fix` first re-runs the local, offline steps (`run_local_steps()`: vim dirs, `~/.vimrc`, loader and RC lines, launcher, EDITOR, scheduled features, the Windows side), then checks. Packages and plugins need the network and stay with `update`.
+
+Every run records its outcome in `~/.local/state/olecharms/doctor.problems` (removed when clean). With `daily_doctor=on` (the default; toggle in `config`) the shell hook runs `doctor --quiet` once a day in the background through `scripts/doctor-daily.sh`, and while that file exists every new shell prints one line about it — a machine you rarely use tells you when it drifted.
+
+### `sync`
+The light update: `checkout_pull()` (new global aliases, config, code), the list of new commits, then `exec`s the pulled script for `run_local_steps()`. No packages, no plugins. The wrapper reloads aliases afterwards, so a global alias added on another machine is usable at once.
 
 ### `cleanup`
 - `olecharms cleanup` — shows folder, rule, action and how many files (and how much space) match, asks, then runs on exactly those files. Without a terminal it refuses unless `--yes`. A mass removal (see [Deletion safety](#deletion-safety)) asks you to type the file count instead, and `--yes` alone refuses it: it takes `--yes --force`.
 - `olecharms cleanup --dry-run` — the full list; changes nothing.
 - `olecharms cleanup --log` — the last 20 runs from `~/.local/state/olecharms/cleanup.log` (which lists every file each run removed).
+- `olecharms cleanup --restore` — picks a quarantined cleanup (newest preselected) and puts its files back; never overwrites a name taken meanwhile.
 - `--scheduled` — what the launcher calls: does nothing unless the feature is enabled.
 
 ### `windows` (WSL)
@@ -304,8 +310,9 @@ These files are generated by `olecharms.sh` and are not committed to the repo:
 
 - **`olecharms-shell.sh`** — sources all `shell/*.sh` files; resolves its own directory at runtime to find `shell/`
 - **`olecharms-hook.sh`** — shell-hook dispatcher; resolves its own directory at runtime to find sibling scripts and `.last-run/`
-- **`cleanup-downloads.sh`** — a launcher for `olecharms cleanup --scheduled`, which reads folder, age and action from the config at run time (see [Downloads Cleanup Engine](#3c-downloads-cleanup-engine-lines-1738-2164)). The engine works on the folder's resolved path — on WSL `~/downloads` is usually a symlink into `/mnt/c`, and plain `find` does not descend into a symlinked starting point
-- **`paranoid-cleanup.sh`** — every 12 hours, permanently deletes shell history, `~/.viminfo` and vim swap/undo files; on WSL also the Windows gVim's `_viminfo` and `vimfiles` swap/undo files
+- **`cleanup-downloads.sh`** — a launcher for `olecharms cleanup --scheduled`, which reads folder, age and action from the config at run time (see [Downloads Cleanup Engine](#3c-downloads-cleanup-engine-lines-1822-2392)). The engine works on the folder's resolved path — on WSL `~/downloads` is usually a symlink into `/mnt/c`, and plain `find` does not descend into a symlinked starting point
+- **`paranoid-cleanup.sh`** — every 12 hours, permanently deletes shell history (plus the shell's own `$HISTFILE`, which the hook passes as an argument: only a history-named file inside home), other tools' histories (less, python, node, sqlite, psql, mysql, irb, redis-cli, wget HSTS), the cleanup log, `~/.viminfo` and vim swap/undo files; on WSL also the Windows gVim's `_viminfo` and `vimfiles` swap/undo files
+- **`doctor-daily.sh`** — launcher for the daily `doctor --quiet` run
 - **`.last-run/`** — directory of timestamp files used by the hook to enforce intervals
 
 Each generated script carries `# olecharms-generator: N`; `doctor` flags any older than the running script.
@@ -323,15 +330,17 @@ Simple `key=value` pairs. Parsed safely without `source` — only alphanumeric k
 - `migrate_config()` loops from the file's `CONFIG_VERSION` up to `CURRENT_CONFIG_VERSION`, calling `migrate_config_N_to_M()` functions if they exist
 - To add a new config flag: increment `CURRENT_CONFIG_VERSION`, add a `migrate_config_N_to_M()` function that calls `config_set` for the new key, and update `config_write_all()` to include it
 
-### Current config keys (v3)
+### Current config keys (v4)
 - `downloads_cleanup_enabled` (true/false)
 - `downloads_cleanup_dir` (path)
 - `downloads_cleanup_method` (hook/cron)
 - `downloads_cleanup_max_age_days` (integer)
-- `downloads_cleanup_action` (auto/trash/delete) — v3
+- `downloads_cleanup_action` (auto/trash/delete) — v3. `auto`: Windows Recycle Bin / macOS Trash when there is one, else quarantine
+- `downloads_cleanup_quarantine_days` (integer, 30) — v4
 - `paranoid_mode_enabled` (true/false)
 - `paranoid_mode_method` (hook/cron)
 - `windows_integration` (auto/off) — v3, WSL only
+- `daily_doctor` (on/off) — v4
 - `install_dir` (path) — records the installation directory for stale-path detection after folder moves
 
 ## Design Decisions
@@ -375,7 +384,7 @@ On Linux, `dpkg-query` checks each package's status (`ok installed`; a removed-b
 Cleanup features can be scheduled via shell hooks (checked on every shell open, throttled by timestamp files) or via cron jobs. The hook approach works without a cron daemon and runs even on systems where cron isn't available.
 
 ### Recoverable cleanup by default
-The downloads cleanup defaults to `auto`: on WSL, files on a Windows drive go to the Windows Recycle Bin, and on macOS to the Trash. Only where there is no trash the user actually empties (plain Linux) are they deleted. Every run is logged file by file, and the config menu shows what the first run would remove before enabling.
+The downloads cleanup defaults to `auto`: on WSL, files on a Windows drive go to the Windows Recycle Bin, and on macOS to the Trash. Where there is no such trash (plain Linux, or a Windows drive whose bin is off) they go to a quarantine instead: a timestamped batch keeping their relative paths and an `.origin` file, in `~/.local/share/olecharms/quarantine` when that is on the same filesystem (a rename), else in a hidden `.olecharms-quarantine` next to the cleaned folder. Batches older than `downloads_cleanup_quarantine_days` are deleted by later runs — only timestamp-named dirs holding `.origin`, directly in a quarantine folder. `cleanup --restore` undoes a batch. Only `action=delete` deletes outright. Every run is logged file by file, and the config menu shows what the first run would remove before enabling.
 
 The Recycle Bin is only trusted when it works: `win_bin_status()` asks Windows whether the drive's bin is on (per-volume `NukeOnDelete`, the `NoRecycleFiles` policy, fixed drive) and how big it is. When it is off, `auto` means delete and the preview says so in plain words. `SHFileOperation` under `NOCONFIRMATION` silently deletes whatever the bin cannot take, so the recycler skips (keeps) files bigger than the bin or on a drive without one, and logs them as `kept`.
 
@@ -390,6 +399,8 @@ Every destructive path has two independent guards:
 | Plugins (`rm -rf`, `rsync --delete`, `reset --hard`) | `plugin_name_valid()`: a plain folder name | `clone_or_pull()` / `mirror_dir()` refuse any destination that is not a plugin folder directly under `bundle/`; `reset --hard` only over a clean work tree; Windows copies are pruned only when stamped |
 | Self-update conflicts (`checkout_pull()`) | does nothing while a merge or rebase is in progress | resets a conflicted file only when git's autostash grew and holds that very file |
 | Crontab | entries matched by marker | `crontab -r` only when every remaining line is olecharms' own |
+| Quarantine expiry | only batches older than the configured days | `cleanup_quarantine_is_batch()`: a real dir named `YYYYMMDD-HHMMSS`, directly in a folder named `quarantine` or `.olecharms-quarantine`, holding `.origin` |
+| Retiring unlisted plugins | only names olecharms recorded as its own clones | moved to `bundle_disabled`, never deleted; refused when most managed plugins would go at once (a packages.conf that lost entries) |
 | `aliaslast` snapshot | basename `olecharms.*`, a real directory | removes only the five file names it writes, then `rmdir` |
 
 ### Windows side from WSL

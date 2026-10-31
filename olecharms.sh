@@ -29,6 +29,8 @@ SCRIPTS_DIR="$SCRIPT_DIR/scripts"
 CLEANUP_SCRIPT="$SCRIPTS_DIR/cleanup-downloads.sh"
 DOWNLOADS_MAX_AGE_DAYS=30
 PARANOID_SCRIPT="$SCRIPTS_DIR/paranoid-cleanup.sh"
+# Paranoid mode keeps downloads at most this old (enables or lowers the cleanup)
+PARANOID_MAX_AGE_DAYS=15
 HOOK_SCRIPT="$SCRIPTS_DIR/olecharms-hook.sh"
 HOOK_MARKER="# olecharms managed hook - do not remove this line"
 LASTRUN_DIR="$SCRIPTS_DIR/.last-run"
@@ -51,14 +53,23 @@ OLECHARMS_CONFIG_FILE="$OLECHARMS_CONFIG_DIR/config"
 # they survive a fresh clone and a moved checkout.
 ALIAS_FILE="$OLECHARMS_CONFIG_DIR/aliases"
 ALIAS_MARKER="# olecharms managed aliases - edit with 'olecharms alias'"
+# Global aliases live in the repo, so every machine gets them on update.
+# Loaded before the per-machine file, which therefore wins on a shared name.
+GLOBAL_ALIAS_FILE="$SCRIPT_DIR/global-aliases.sh"
 # Per-machine package/plugin additions, sourced after the tracked packages.conf
 # so local changes never collide with a self-update's git pull.
 LOCAL_CONF_FILE="$OLECHARMS_CONFIG_DIR/packages.local.conf"
 OLECHARMS_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/olecharms"
 CLEANUP_LOG="$OLECHARMS_STATE_DIR/cleanup.log"
 CLEANUP_LOG_MAX_LINES=10000
+# Mass-removal brake: a scheduled run that would take more than this is held
+# until confirmed by hand (typing the file count); `cleanup --yes` needs --force
+CLEANUP_HELD="$OLECHARMS_STATE_DIR/cleanup.held"
+CLEANUP_BATCH_FILES=300
+CLEANUP_BATCH_KB=$((10 * 1024 * 1024))
+CLEANUP_BATCH_PERCENT=50
 # Stamped into every generated script; `doctor` flags older ones.
-GENERATOR_VERSION=3
+GENERATOR_VERSION=4
 GENERATOR_STAMP="# olecharms-generator:"
 # Marks the plugin copies olecharms owns inside Windows' vimfiles\bundle
 WIN_MANAGED_STAMP=".olecharms-managed"
@@ -94,8 +105,10 @@ else
 fi
 
 info()  { echo -e "${GREEN}[+]${NC} $*"; }
-warn()  { echo -e "${YELLOW}[!]${NC} $*"; }
-error() { echo -e "${RED}[-]${NC} $*"; ERROR_COUNT=$((ERROR_COUNT + 1)); }
+# Diagnostics go to stderr: inside $(...) they would otherwise end up in the
+# captured value instead of on screen.
+warn()  { echo -e "${YELLOW}[!]${NC} $*" >&2; }
+error() { echo -e "${RED}[-]${NC} $*" >&2; ERROR_COUNT=$((ERROR_COUNT + 1)); }
 
 # ─── Utility Functions ───────────────────────────────────────────────────────
 
@@ -190,11 +203,81 @@ _git_net() {
         git "$@"
 }
 
+# `git pull --rebase --autostash` of the checkout, safe to run unattended: a
+# conflict must never stay behind in files olecharms runs or sources (every
+# shell would then fail on the markers). A rebase that stops is aborted; local
+# changes that clash with the update are reset to the updated version — git
+# keeps them in the stash. Returns 1 on a conflict with local commits (left
+# as they were), 2 when the pull itself failed (offline...) with git's message
+# in CHECKOUT_PULL_ERR.
+CHECKOUT_PULL_ERR=""
+checkout_pull() {
+    local dir="$SCRIPT_DIR" err rc gitdir unmerged f stash_before stash_after
+    CHECKOUT_PULL_ERR=""
+    gitdir=$(git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null) || return 2
+    # Someone is in the middle of a merge or rebase here: leave it alone
+    if [ -d "$gitdir/rebase-merge" ] || [ -d "$gitdir/rebase-apply" ] || [ -f "$gitdir/MERGE_HEAD" ] ||
+       [ -n "$(git -C "$dir" diff --name-only --diff-filter=U 2>/dev/null)" ]; then
+        error "$dir has a merge or rebase in progress; not updating it until that is finished"
+        return 1
+    fi
+    stash_before=$(git -C "$dir" stash list 2>/dev/null | wc -l | tr -d ' ')
+    err=$(_git_net -C "$dir" pull --rebase --autostash -q 2>&1)
+    rc=$?
+    if [ -d "$gitdir/rebase-merge" ] || [ -d "$gitdir/rebase-apply" ]; then
+        git -C "$dir" rebase --abort >/dev/null 2>&1
+        error "Local commits in $dir conflict with the update; left as they were."
+        error "Resolve by hand: git -C \"$dir\" pull --rebase"
+        return 1
+    fi
+    unmerged=$(git -C "$dir" diff --name-only --diff-filter=U 2>/dev/null)
+    stash_after=$(git -C "$dir" stash list 2>/dev/null | wc -l | tr -d ' ')
+    if [ -n "$unmerged" ]; then
+        # Only when git kept the local changes in the stash: then the conflict
+        # markers are the sole copy of nothing and can go
+        if [ "$stash_after" -le "$stash_before" ]; then
+            error "Conflict markers left in $dir: $(echo $unmerged) — fix them by hand"
+            return 1
+        fi
+        # ...and each file is really in that stash entry
+        local stashed
+        stashed=$(git -C "$dir" stash show --name-only 'stash@{0}' 2>/dev/null)
+        while IFS= read -r f; do
+            if ! printf '%s\n' "$stashed" | grep -qxF -- "$f"; then
+                error "Conflict markers left in $dir/$f and its local version is not in the stash — fix it by hand"
+                return 1
+            fi
+        done <<< "$unmerged"
+        while IFS= read -r f; do
+            git -C "$dir" checkout -q HEAD -- "$f" 2>/dev/null
+        done <<< "$unmerged"
+        git -C "$dir" reset -q 2>/dev/null
+    fi
+    if [ -n "$unmerged" ] || [ "$stash_after" -gt "$stash_before" ]; then
+        warn "Your local changes clashed with the update and were set aside in git stash."
+        [ -n "$unmerged" ] && warn "These files now match the update: $(echo $unmerged)"
+        warn "Inspect them with: git -C \"$dir\" stash show -p"
+    fi
+    if [ "$rc" -ne 0 ]; then
+        CHECKOUT_PULL_ERR=$(printf '%s\n' "$err" | grep -v '^[[:space:]]*$' | tail -n 1)
+        return 2
+    fi
+    return 0
+}
+
 clone_or_pull() {
     local url="$1"
     local dest="$2"
     local name="$3"
     local fallback="$4"  # optional bundled fallback path
+
+    # Second guard for the rm -rf / mv below: dest is a plugin folder directly
+    # under bundle/, or one of the fixed staging dirs — nothing else
+    case "$dest" in
+        "$VIM_DIR/bundle/"*/*|"$VIM_DIR/bundle/") error "Refusing to manage $dest"; return 1 ;;
+        "$VIM_DIR/bundle/"?*|"$PATHOGEN_STAGING"|"$FONTS_STAGING") ;;
+        *) error "Refusing to manage $dest"; return 1 ;;
+    esac
 
     if [ -d "$dest/.git" ]; then
         info "Updating $name..."
@@ -211,6 +294,11 @@ clone_or_pull() {
                 branch="${branch#origin/}"
             fi
             [ -z "$branch" ] && branch="master"
+            # reset --hard would silently throw away edits made to the plugin
+            if [ -n "$(git -C "$dest" status --porcelain 2>/dev/null)" ]; then
+                warn "$name has local changes; not resetting it (git -C \"$dest\" status)"
+                return 1
+            fi
             git -C "$dest" reset --hard "origin/$branch" 2>/dev/null && return 0
         fi
         warn "Could not update $name (may be offline)"
@@ -458,6 +546,11 @@ cron_replace_entry() {
     # every run).
     [ "$new_content" = "$current" ] && return 0
     if [ -z "$new_content" ]; then
+        # Second check: everything we would drop is ours
+        if [ -n "$(printf '%s\n' "$current" | grep -v '^[[:space:]]*$' | grep -vF '# olecharms:')" ]; then
+            error "Not removing the crontab: it holds lines that are not olecharms'"
+            return 1
+        fi
         crontab -r 2>/dev/null || true
         return 0
     fi
@@ -590,6 +683,10 @@ HOOK_EOF
         if is_downloads_cleanup_enabled && ! is_downloads_cron_enabled; then
             echo "_olecharms_check_and_run \"\$_olecharms_hook_dir/cleanup-downloads.sh\" \"downloads-cleanup\" $DOWNLOADS_INTERVAL"
         fi
+        if is_downloads_cleanup_enabled; then
+            # A held mass removal waits for the user: say so in every new shell
+            echo "[ -f $(printf '%q' "$CLEANUP_HELD") ] && echo \"[olecharms] Downloads cleanup on hold: \$(cat $(printf '%q' "$CLEANUP_HELD") 2>/dev/null). Review with: olecharms cleanup\""
+        fi
         if is_paranoid_mode_enabled && ! is_paranoid_cron_enabled; then
             echo "_olecharms_check_and_run \"\$_olecharms_hook_dir/paranoid-cleanup.sh\" \"paranoid-cleanup\" $PARANOID_INTERVAL"
         fi
@@ -660,6 +757,7 @@ generate_shell_loader() {
         echo "# olecharms-shell.sh — sources shell command files and user aliases"
         echo "$GENERATOR_STAMP $GENERATOR_VERSION"
         echo "_olecharms_alias_file=$(printf '%q' "$ALIAS_FILE")"
+        echo "_olecharms_global_alias_file=$(printf '%q' "$GLOBAL_ALIAS_FILE")"
         echo "_olecharms_bin=$(printf '%q' "$SCRIPT_PATH")"
         cat <<'LOADER_EOF'
 _olecharms_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
@@ -707,17 +805,69 @@ if ! command -v j >/dev/null 2>&1; then
     unset _olecharms_aj _olecharms_f
 fi
 
-# Drop the aliases loaded last time, then load the current set. Run at shell
-# start, and again by the wrapper below after an `olecharms alias` command.
+# Drop the aliases loaded last time, then load the current set: global ones
+# (in the repo, shared by every machine) first, so per-machine ones win. Run at
+# shell start, and again by the wrapper below after alias changes and updates.
 _olecharms_reload_aliases() {
-    if command -v _olecharms_unload_aliases >/dev/null 2>&1; then
-        _olecharms_unload_aliases
-        unset -f _olecharms_unload_aliases 2>/dev/null
-    fi
-    [ -f "$_olecharms_alias_file" ] && . "$_olecharms_alias_file"
+    local _olecharms_n
+    while IFS= read -r _olecharms_n; do
+        [ -n "$_olecharms_n" ] && unalias "$_olecharms_n" 2>/dev/null
+    done <<< "${_olecharms_loaded_aliases:-}"
+    _olecharms_loaded_aliases=""
+    # Alias files written by older versions defined these
+    unset -f _olecharms_unload_aliases _olecharms_unload_global_aliases 2>/dev/null
+    _olecharms_load_alias_file "$_olecharms_global_alias_file"
+    _olecharms_load_alias_file "$_olecharms_alias_file"
+    return 0
+}
+
+# Source alias file $1 and remember its names for the next reload
+_olecharms_load_alias_file() {
+    local _olecharms_l _olecharms_n
+    [ -f "$1" ] || return 0
+    . "$1"
+    while IFS= read -r _olecharms_l; do
+        case "$_olecharms_l" in
+            "alias "*=*)
+                _olecharms_n=${_olecharms_l#alias }
+                _olecharms_loaded_aliases="$_olecharms_loaded_aliases${_olecharms_n%%=*}
+"
+                ;;
+        esac
+    done < "$1"
     return 0
 }
 _olecharms_reload_aliases
+
+# What `olecharms aliaslast` needs from this shell and cannot see from a child
+# process: the in-memory history (there may be no history file at all) and the
+# names already taken here. zsh: exact entries from $history, NUL-separated,
+# since `fc -l` prints a newline and a typed \n alike. The zsh-only syntax sits
+# in eval strings so bash can still parse this file.
+_olecharms_snapshot() {
+    if [ -n "${ZSH_VERSION:-}" ]; then
+        eval 'local -a _k; _k=(${(onk)history}); (( ${#_k} > 300 )) && _k=(${_k[-300,-1]})
+              local _i; for _i in $_k; do print -rN -- "${history[$_i]}"; done' > "$1/history.nul"
+        alias -L > "$1/aliases" 2>/dev/null
+        eval 'print -rl -- ${(k)functions}' > "$1/functions" 2>/dev/null
+        eval 'print -rl -- ${(k)builtins} ${(k)reswords}' > "$1/builtins" 2>/dev/null
+    else
+        fc -l -300 > "$1/history.fc" 2>/dev/null
+        alias -p > "$1/aliases" 2>/dev/null
+        compgen -A function > "$1/functions" 2>/dev/null
+        { compgen -b; compgen -k; } > "$1/builtins" 2>/dev/null
+    fi
+    return 0
+}
+
+# True if this shell has jobs. zsh's $(jobs) runs in a subshell that sees none.
+_olecharms_has_jobs() {
+    if [ -n "${ZSH_VERSION:-}" ]; then
+        eval '(( ${#jobstates} > 0 ))'
+    else
+        [ -n "$(jobs -p 2>/dev/null)" ]
+    fi
+}
 
 # A child process cannot change its parent shell, so wrap the command and act
 # here: reload aliases after `olecharms alias`, and after a clean `install`
@@ -726,19 +876,31 @@ _olecharms_reload_aliases
 olecharms() {
     # The child bash cannot see this shell's aliases and functions (oh-my-zsh
     # defines hundreds), so tell `alias add` what the name means here.
-    local _olecharms_what="" _olecharms_rc
+    local _olecharms_what="" _olecharms_rc _olecharms_snap=""
     if [ "${1:-}" = alias ] && [ "${2:-}" = add ] && [ -n "${3:-}" ]; then
         _olecharms_what=$(type -- "$3" 2>/dev/null) || _olecharms_what=""
         _olecharms_what=${_olecharms_what%%$'\n'*}
     fi
-    OLECHARMS_SHELL_WRAPPER=1 OLECHARMS_NAME_TYPE="$_olecharms_what" "$_olecharms_bin" "$@"
+    if [ "${1:-}" = aliaslast ]; then
+        _olecharms_snap=$(mktemp -d "${TMPDIR:-/tmp}/olecharms.XXXXXX" 2>/dev/null) || _olecharms_snap=""
+        [ -n "$_olecharms_snap" ] && _olecharms_snapshot "$_olecharms_snap"
+    fi
+    OLECHARMS_SHELL_WRAPPER=1 OLECHARMS_NAME_TYPE="$_olecharms_what" \
+        OLECHARMS_SHELL_SNAPSHOT="$_olecharms_snap" "$_olecharms_bin" "$@"
     _olecharms_rc=$?
+    [ -n "$_olecharms_snap" ] && rm -rf "$_olecharms_snap"
     case "${1:-}" in
-        alias) [ $_olecharms_rc -eq 0 ] && _olecharms_reload_aliases ;;
+        alias|aliaslast|update) _olecharms_reload_aliases ;;
         install)
             if [ $_olecharms_rc -eq 0 ] && [ -t 0 ] && [ -t 1 ] && command -v zsh >/dev/null 2>&1; then
-                echo "[+] Reloading this shell as a login zsh..."
-                exec zsh -l
+                # exec would orphan stopped jobs (a suspended vim with unsaved
+                # edits) out of reach of the new shell
+                if _olecharms_has_jobs; then
+                    echo "[!] This shell has stopped or background jobs; run 'exec zsh -l' once they are done."
+                else
+                    echo "[+] Reloading this shell as a login zsh..."
+                    exec zsh -l
+                fi
             fi
             ;;
     esac
@@ -924,6 +1086,7 @@ disable_downloads_cleanup() {
 
     rm -f "$CLEANUP_SCRIPT"
     rm -f "$LASTRUN_DIR/downloads-cleanup"
+    rm -f "$CLEANUP_HELD"
 
     sync_shell_hook
     info "Downloads auto-cleanup disabled"
@@ -932,6 +1095,27 @@ disable_downloads_cleanup() {
     config_set downloads_cleanup_enabled false
     config_set downloads_cleanup_dir ""
     config_set downloads_cleanup_method hook
+}
+
+# True when paranoid mode also purges the Windows gVim's history: on WSL, with
+# the Windows integration on and Windows reachable. Sets WIN_VIM_HOME. Not
+# meant for $(...): win_env_load caches in this shell and costs ~1s.
+paranoid_covers_windows() {
+    [ -n "${IS_WSL:-}" ] || return 1
+    [ "$(config_get windows_integration auto)" = "off" ] && return 1
+    win_env_load && [ -n "${WIN_VIM_HOME:-}" ] && [ -d "$WIN_VIM_HOME" ]
+}
+
+# What each paranoid run deletes, as menu bullet lines
+paranoid_print_targets() {
+    echo "    - Shell history (~/.bash_history, ~/.zsh_history)"
+    echo "    - Vim history: commands, searches, registers, marks (~/.viminfo)"
+    echo "    - Vim undo files ($VIM_DIR/undodir/), and swap files ($VIM_DIR/swapfiles/)"
+    echo "      when no vim is running — they are an open vim's crash recovery"
+    if paranoid_covers_windows; then
+        echo "    - Windows gVim: $WIN_VIM_HOME/_viminfo, vimfiles/undodir/, vimfiles/swapfiles/"
+    fi
+    echo "    - The downloads cleanup log, which lists every file it removed"
 }
 
 enable_paranoid_mode() {
@@ -946,21 +1130,70 @@ enable_paranoid_mode() {
     local tmp="$PARANOID_SCRIPT.tmp.$$"
 
     # Paths go in through %q so a quote or $ in them cannot break the script
-    cat > "$tmp" <<PARANOID_EOF
+    {
+        cat <<PARANOID_EOF
 #!/bin/bash
 # Generated by olecharms — edit via 'olecharms config', not by hand.
 $GENERATOR_STAMP $GENERATOR_VERSION
 HOME_DIR=$(printf '%q' "$HOME")
 VIM_DIR=$(printf '%q' "$VIM_DIR")
+CLEANUP_LOG=$(printf '%q' "$CLEANUP_LOG")
+
+# Delete the files directly in dir \$1 whose names match \$2 — only when it
+# really is a folder of its own (a symlinked undodir pointing at home or /
+# must not take them along), and only vim's own file names in it
+purge_dir() {
+    local real
+    real=\$(cd -P "\$1" 2>/dev/null && pwd) || return 0
+    case "\$HOME_DIR/" in "\$real"/*) return 0 ;; esac
+    [ "\$real" = / ] && return 0
+    find "\$real" -mindepth 1 -maxdepth 1 -type f -name "\$2" -delete 2>/dev/null
+}
+# Undo files are named after the full path ('%' for '/'); swap files end in
+# .swp, .swo... (.s[a-w][a-z])
+UNDO_NAMES='*%*'
+SWAP_NAMES='*.s[a-w][a-z]'
 
 # Purge shell history
 rm -f "\$HOME_DIR/.bash_history" "\$HOME_DIR/.zsh_history" 2>/dev/null
 
-# Purge vim swap and undo files
-find -H "\$VIM_DIR/swapfiles" -type f -delete 2>/dev/null
-find -H "\$VIM_DIR/undodir" -type f -delete 2>/dev/null
-exit 0
+# The downloads cleanup log lists the path of every file it removed
+rm -f "\$CLEANUP_LOG" 2>/dev/null
+
+# Purge vim history (commands, searches, registers, marks) and undo files
+rm -f "\$HOME_DIR/.viminfo" 2>/dev/null
+purge_dir "\$VIM_DIR/undodir" "\$UNDO_NAMES"
+
+# Swap files are a running vim's crash recovery and its "already being
+# edited" guard, and vim never recreates a deleted one: leave them while any
+# vim of this user runs (and when that cannot be told).
+if command -v pgrep >/dev/null 2>&1 &&
+   ! pgrep -u "\$(id -u)" -x 'g?vim|nvim|vi|view|gview|vimdiff|mvim' >/dev/null 2>&1; then
+    purge_dir "\$VIM_DIR/swapfiles" "\$SWAP_NAMES"
+fi
 PARANOID_EOF
+        # The Windows gVim keeps the same traces on the Windows side. Its home
+        # is resolved now (PowerShell is too slow for every run) and baked in.
+        if paranoid_covers_windows; then
+            local tasklist
+            tasklist=$(command -v tasklist.exe 2>/dev/null) || tasklist=/mnt/c/Windows/System32/tasklist.exe
+            cat <<PARANOID_EOF
+
+# Same for the Windows gVim (swap files only while no Windows vim runs)
+WIN_VIM_HOME=$(printf '%q' "$WIN_VIM_HOME")
+TASKLIST=$(printf '%q' "$tasklist")
+if [ -d "\$WIN_VIM_HOME" ]; then
+    rm -f "\$WIN_VIM_HOME/_viminfo" 2>/dev/null
+    purge_dir "\$WIN_VIM_HOME/vimfiles/undodir" "\$UNDO_NAMES"
+    if [ -x "\$TASKLIST" ] && running=\$("\$TASKLIST" /NH 2>/dev/null) && [ -n "\$running" ] &&
+       ! printf '%s\\n' "\$running" | grep -qiE '^(g?vim|gvimd)\\.exe'; then
+        purge_dir "\$WIN_VIM_HOME/vimfiles/swapfiles" "\$SWAP_NAMES"
+    fi
+fi
+PARANOID_EOF
+        fi
+        echo "exit 0"
+    } > "$tmp"
     commit_generated "$tmp" "$PARANOID_SCRIPT" || return 1
 
     if [ "$mode" = "cron" ]; then
@@ -997,6 +1230,10 @@ disable_paranoid_mode() {
     # Sync to config file
     config_set paranoid_mode_enabled false
     config_set paranoid_mode_method hook
+
+    if is_downloads_cleanup_enabled; then
+        info "Downloads auto-cleanup stays on ($(config_get downloads_cleanup_max_age_days "$DOWNLOADS_MAX_AGE_DAYS") days) — change it under 'Downloads auto-cleanup'"
+    fi
 }
 
 # ─── Aliases ─────────────────────────────────────────────────────────────────
@@ -1013,10 +1250,14 @@ alias_quote() {
     printf "'%s'" "$cmd"
 }
 
+# The alias functions below take an optional file: the per-machine
+# $ALIAS_FILE by default, or $GLOBAL_ALIAS_FILE.
+
 # Emit "name<TAB>command" for every stored alias. awk rather than sed: BSD/macOS
 # sed has no \t in replacements. Plain POSIX awk, so mawk and BWK awk work too.
 alias_list_raw() {
-    [ -f "$ALIAS_FILE" ] || return 0
+    local file="${1:-$ALIAS_FILE}"
+    [ -f "$file" ] || return 0
     awk -v q="'" '
         index($0, "alias ") == 1 {
             line = substr($0, 7)
@@ -1034,64 +1275,79 @@ alias_list_raw() {
                 cmd = substr(cmd, i + length(esc))
             }
             printf "%s\t%s\n", name, out cmd
-        }' "$ALIAS_FILE"
+        }' "$file"
 }
 
 # Every stored alias except $1, compared exactly: a grep pattern would treat
 # the "." allowed in names as a wildcard and drop "gas" along with "g.s".
 alias_list_except() {
-    alias_list_raw | awk -F'\t' -v n="$1" '$1 != n'
+    alias_list_raw "${2:-}" | awk -F'\t' -v n="$1" '$1 != n'
 }
 
 alias_get() {
     local name="$1"
-    alias_list_raw | awk -F'\t' -v n="$name" '$1 == n { print substr($0, index($0, "\t") + 1); exit }'
+    alias_list_raw "${2:-}" | awk -F'\t' -v n="$name" '$1 == n { print substr($0, index($0, "\t") + 1); exit }'
 }
 
 alias_names() {
-    alias_list_raw | cut -f1
+    alias_list_raw "${1:-}" | cut -f1
 }
 
 alias_count() {
-    alias_list_raw | grep -c . || true
+    alias_list_raw "${1:-}" | grep -c . || true
 }
 
-# Rewrite the alias file from "name<TAB>command" lines on stdin.
+# Rewrite alias file $1 (default: per-machine) from "name<TAB>command" lines
+# on stdin.
 alias_write_all() {
-    local tmpfile status
-    mkdir -p "$OLECHARMS_CONFIG_DIR" || { error "Could not create $OLECHARMS_CONFIG_DIR"; return 1; }
+    local file="${1:-$ALIAS_FILE}" tmpfile status
+    local header="# Sourced by scripts/olecharms-shell.sh from your shell rc files."
+    if [ "$file" = "$GLOBAL_ALIAS_FILE" ]; then
+        header="# Global: in git, loaded on every machine with olecharms (before the per-machine ones)."
+    fi
+    mkdir -p "$(dirname "$file")" || { error "Could not create $(dirname "$file")"; return 1; }
     tmpfile=$(mktemp) || { error "mktemp failed"; return 1; }
 
     {
         echo "$ALIAS_MARKER"
-        echo "# Sourced by scripts/olecharms-shell.sh from your shell rc files."
-        local name cmd unload=""
+        echo "$header"
+        # One alias per line and nothing else: the loader reads the names back
+        # to unalias them on reload, and global-aliases.sh stays mergeable.
+        local name cmd
         while IFS=$'\t' read -r name cmd; do
             [ -n "$name" ] || continue
             echo "alias ${name}=$(alias_quote "$cmd")"
-            unload="$unload unalias ${name} 2>/dev/null;"
         done
-        # The loader calls this before re-sourcing the file, so an alias that
-        # was just deleted also disappears from the running shell. Emitted as a
-        # function rather than a name list because zsh does not word-split
-        # unquoted parameters.
-        echo "_olecharms_unload_aliases() {${unload} return 0; }"
     } > "$tmpfile"
 
-    write_file_contents "$tmpfile" "$ALIAS_FILE"
+    write_file_contents "$tmpfile" "$file"
     status=$?
     rm -f "$tmpfile"
     return $status
 }
 
 alias_set() {
-    local name="$1" cmd="$2"
-    { alias_list_except "$name"; printf '%s\t%s\n' "$name" "$cmd"; } \
-        | sort -f | alias_write_all
+    local name="$1" cmd="$2" file="${3:-}"
+    { alias_list_except "$name" "$file"; printf '%s\t%s\n' "$name" "$cmd"; } \
+        | sort -f | alias_write_all "$file"
 }
 
 alias_unset() {
-    alias_list_except "$1" | alias_write_all
+    alias_list_except "$1" "${2:-}" | alias_write_all "${2:-}"
+}
+
+# Ask before changing anything, defaulting to no (Enter and EOF decline).
+confirm_default_no() {
+    local prompt="$1" answer
+    if [ -t 0 ]; then
+        read -rp "$prompt [y/N] " answer || return 1
+    else
+        read -r answer || return 1
+    fi
+    case "$answer" in
+        [yY]|[yY][eE][sS]|[sS]|[sS][iI]|[sS]í) return 0 ;;
+        *)                                    return 1 ;;
+    esac
 }
 
 # Ask before changing anything. Enter means yes, and so does EOF — but a piped
@@ -1109,6 +1365,376 @@ confirm_default_yes() {
     esac
 }
 
+# ─── aliaslast: history, picker, name checks ─────────────────────────────────
+
+# Recent commands for `aliaslast`, oldest first, one per line: distinct
+# single-line entries (an alias holds one line), latest occurrence kept. From
+# the snapshot the shell wrapper hands over; without one (script run
+# directly), from the history file as a best effort.
+aliaslast_history() {
+    local snap="${OLECHARMS_SHELL_SNAPSHOT:-}" hist soh
+    soh=$(printf '\001')
+    {
+        if [ -n "$snap" ] && [ -f "$snap/history.nul" ]; then
+            # zsh, exact entries: a newline inside one becomes \001 (dropped below)
+            tr '\012\000' '\001\012' < "$snap/history.nul"
+        elif [ -n "$snap" ] && [ -f "$snap/history.fc" ]; then
+            # bash `fc -l`: "N<TAB> cmd"; unnumbered lines continue a multi-line entry
+            awk '
+                /^[0-9]+[*]?\t/ {
+                    if (have && !multi) print cur
+                    cur = $0; sub(/^[0-9]+[*]?\t ?/, "", cur); have = 1; multi = 0; next
+                }
+                { multi = 1 }
+                END { if (have && !multi) print cur }' "$snap/history.fc"
+        else
+            hist="${HISTFILE:-}"
+            if [ -z "$hist" ]; then
+                case "$(login_shell)" in
+                    *zsh) hist="$HOME/.zsh_history" ;;
+                    *)    hist="$HOME/.bash_history" ;;
+                esac
+            fi
+            # zsh ": <time>:<secs>;cmd" lines, bash "#<time>" lines; a trailing
+            # backslash continues a multi-line entry
+            [ -f "$hist" ] && tail -n 3000 "$hist" | awk '
+                cont { if ($0 !~ /\\$/) cont = 0; next }
+                /^#[0-9]+$/ { next }
+                { line = $0; sub(/^: [0-9]+:[0-9]+;/, "", line) }
+                line ~ /\\$/ { cont = 1; next }
+                { print line }'
+        fi
+    } | awk -v soh="$soh" '
+        index($0, soh) || index($0, "\t") { next }
+        { sub(/[ ]+$/, "") }
+        !NF { next }
+        /^[ ]*([^ ]*\/)?olecharms(\.sh)?[ ]+aliaslast([ ]|$)/ { next }
+        { line[++n] = $0 }
+        END {
+            for (i = n; i >= 1 && kept < 300; i--)
+                if (!(line[i] in seen)) { seen[line[i]] = 1; out[++kept] = line[i] }
+            for (i = kept; i >= 1; i--) print out[i]
+        }'
+}
+
+# Pick one of the PICK_ITEMS array with the arrow keys, cursor starting on the
+# last item; sets PICK_INDEX, returns 1 if cancelled. ↑↓ / j k, PgUp PgDn,
+# Home End, Enter selects, q or Esc cancels. Without a terminal it falls back
+# to a numbered prompt whose default is the last item.
+pick_item() {
+    local n=${#PICK_ITEMS[@]} sel top h rows cols i line key rest drawn=""
+    [ "$n" -gt 0 ] || return 1
+    sel=$((n - 1))
+
+    if [ ! -t 0 ] || [ ! -t 2 ]; then
+        for i in "${!PICK_ITEMS[@]}"; do
+            printf '  %3d) %s\n' $((i + 1)) "${PICK_ITEMS[$i]}" >&2
+        done
+        printf '  Select [%d]: ' "$n" >&2
+        read -r key || return 1
+        [ -z "$key" ] && key=$n
+        [[ "$key" =~ ^[0-9]+$ ]] && [ "$key" -ge 1 ] && [ "$key" -le "$n" ] || return 1
+        PICK_INDEX=$((key - 1))
+        return 0
+    fi
+
+    set -- $(stty size 2>/dev/null)
+    rows=${1:-0} cols=${2:-0}
+    # Some ptys report 0 0
+    [[ "$rows" =~ ^[0-9]+$ ]] && [ "$rows" -gt 0 ] || rows=24
+    [[ "$cols" =~ ^[0-9]+$ ]] && [ "$cols" -ge 20 ] || cols=80
+    h=$((rows - 8))
+    [ "$h" -gt 15 ] && h=15
+    [ "$h" -lt 3 ] && h=3
+    [ "$h" -gt "$n" ] && h=$n
+    top=$((n - h))
+
+    local old_traps status
+    old_traps=$(trap -p INT TERM)
+    status="· ↑↓ move · Enter select · q cancel"
+    [ "$cols" -lt 60 ] && status=""
+    printf '\033[?25l' >&2
+    trap 'printf "\033[?25h\n" >&2; exit 130' INT TERM
+    while :; do
+        [ "$sel" -lt "$top" ] && top=$sel
+        [ "$sel" -ge $((top + h)) ] && top=$((sel - h + 1))
+        [ -n "$drawn" ] && printf '\033[%dA' $((h + 1)) >&2
+        drawn=1
+        for ((i = top; i < top + h; i++)); do
+            line=${PICK_ITEMS[$i]}
+            [ ${#line} -gt $((cols - 6)) ] && line="${line:0:$((cols - 7))}…"
+            if [ "$i" -eq "$sel" ]; then
+                printf '\r\033[2K  \033[7m> %s\033[0m\n' "$line" >&2
+            else
+                printf '\r\033[2K    %s\n' "$line" >&2
+            fi
+        done
+        printf '\r\033[2K  \033[2m%d/%d %s\033[0m\n' $((sel + 1)) "$n" "$status" >&2
+
+        key=""
+        IFS= read -rsn1 key || key=q
+        case "$key" in
+            $'\033')
+                rest=""
+                IFS= read -rsn2 -t 1 rest
+                case "$rest" in
+                    '[A'|'OA') key=up ;;
+                    '[B'|'OB') key=down ;;
+                    '[H'|'OH') key=home ;;
+                    '[F'|'OF') key=end ;;
+                    '[5') IFS= read -rsn1 -t 1 rest; key=pgup ;;
+                    '[6') IFS= read -rsn1 -t 1 rest; key=pgdn ;;
+                    '')   key=q ;;
+                    *)    key="" ;;
+                esac
+                ;;
+            k) key=up ;;
+            j) key=down ;;
+            '') key=enter ;;
+        esac
+        case "$key" in
+            up)    [ "$sel" -gt 0 ] && sel=$((sel - 1)) ;;
+            down)  [ "$sel" -lt $((n - 1)) ] && sel=$((sel + 1)) ;;
+            pgup)  sel=$((sel - h)); [ "$sel" -lt 0 ] && sel=0 ;;
+            pgdn)  sel=$((sel + h)); [ "$sel" -gt $((n - 1)) ] && sel=$((n - 1)) ;;
+            home)  sel=0 ;;
+            end)   sel=$((n - 1)) ;;
+            enter|q|Q) break ;;
+        esac
+    done
+    # Wipe the list; the caller prints the choice
+    printf '\033[%dA\r\033[J\033[?25h' $((h + 1)) >&2
+    trap - INT TERM
+    eval "$old_traps"
+    case "$key" in q|Q) return 1 ;; esac
+    PICK_INDEX=$sel
+    return 0
+}
+
+# Remove the wrapper's snapshot dir $1 — only the files it writes, then the
+# (by then empty) dir: the path comes from the environment, never rm -rf it.
+snapshot_remove() {
+    local d="$1"
+    [ -d "$d" ] && [ ! -L "$d" ] || return 0
+    rm -f "$d/history.nul" "$d/history.fc" "$d/aliases" "$d/functions" "$d/builtins"
+    rmdir "$d" 2>/dev/null
+    return 0
+}
+
+# Value of alias $1 in the user's shell, from the wrapper's snapshot (zsh
+# `alias -L` / bash `alias -p` lines). Fails if it has none.
+snapshot_alias_value() {
+    local snap="${OLECHARMS_SHELL_SNAPSHOT:-}"
+    [ -n "$snap" ] && [ -f "$snap/aliases" ] || return 1
+    awk -v n="$1" -v q="'" '
+        {
+            line = $0
+            sub(/^alias +/, "", line)
+            while (line ~ /^-[a-zA-Z-]* +/) sub(/^-[a-zA-Z-]* +/, "", line)
+            eq = index(line, "=")
+            if (eq < 2 || substr(line, 1, eq - 1) != n) next
+            v = substr(line, eq + 1)
+            if (length(v) >= 2 && substr(v, 1, 1) == q && substr(v, length(v), 1) == q) {
+                v = substr(v, 2, length(v) - 2)
+                gsub(q "\\\\" q q, q, v)
+            }
+            print v; found = 1; exit
+        }
+        END { exit !found }' "$snap/aliases"
+}
+
+# Say what name $1 already means and return 0 if it is taken: an olecharms
+# alias (this machine or global); from the wrapper's snapshot of the user's
+# shell, an alias (oh-my-zsh, rc files), a function or a builtin; or a command
+# on PATH.
+alias_conflicts() {
+    local name="$1" snap="${OLECHARMS_SHELL_SNAPSHOT:-}" v taken=1 ours="" kind=""
+    if v=$(alias_get "$name") && [ -n "$v" ]; then
+        warn "  '$name' is already one of your aliases on this machine: $v"
+        taken=0 ours=1
+    fi
+    if v=$(alias_get "$name" "$GLOBAL_ALIAS_FILE") && [ -n "$v" ]; then
+        warn "  '$name' is already a global alias: $v"
+        taken=0 ours=1
+    fi
+    if [ -z "$ours" ] && v=$(snapshot_alias_value "$name"); then
+        warn "  '$name' is already an alias in your shell (oh-my-zsh or your rc files): $v"
+        taken=0
+    fi
+    if [ -n "$snap" ] && grep -qxF -- "$name" "$snap/functions" 2>/dev/null; then
+        warn "  '$name' is a shell function"
+        taken=0
+    fi
+    if [ -n "$snap" ]; then
+        grep -qxF -- "$name" "$snap/builtins" 2>/dev/null && kind=builtin
+    else
+        kind=$(type -t "$name" 2>/dev/null)
+    fi
+    case "$kind" in
+        builtin|keyword) warn "  '$name' is a shell builtin or keyword"; taken=0 ;;
+    esac
+    if v=$(type -P "$name" 2>/dev/null) && [ -n "$v" ]; then
+        warn "  '$name' is a command: $v"
+        taken=0
+    fi
+    return $taken
+}
+
+# ─── Global aliases: publish through git ────────────────────────────────────
+
+# "remote/branch" the checkout's branch tracks: where global aliases go, and
+# what every other machine pulls on update.
+global_alias_upstream() {
+    git -C "$SCRIPT_DIR" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null
+}
+
+# GitHub "owner/repo" from remote URL $1, if it is a GitHub one
+github_slug() {
+    local slug
+    case "$1" in
+        https://github.com/*)   slug=${1#https://github.com/} ;;
+        git@github.com:*)       slug=${1#git@github.com:} ;;
+        ssh://git@github.com/*) slug=${1#ssh://git@github.com/} ;;
+        *) return 1 ;;
+    esac
+    slug=${slug%/}
+    printf '%s\n' "${slug%.git}"
+}
+
+# How to let this machine push to remote URL $1 (remote name $2)
+global_push_help() {
+    local url="$1" remote="$2" slug key found="" ssh_url="<ssh url>"
+    slug=$(github_slug "$url") || slug=""
+    [ -n "$slug" ] && ssh_url="git@github.com:$slug.git"
+    case "$url" in
+        http://*|https://*)
+            echo "  Git has no credentials here that can push over HTTPS. Either:"
+            echo "    - sign in with write access, e.g.: gh auth login && gh auth setup-git"
+            echo "    - or push over SSH (pulls stay as they are):"
+            echo "        git -C \"$SCRIPT_DIR\" remote set-url --push $remote $ssh_url"
+            echo "      and give this machine's SSH key write access:"
+            ;;
+        *)
+            echo "  Give this machine's SSH key write access to the repository:"
+            ;;
+    esac
+    for key in "$HOME/.ssh/id_ed25519.pub" "$HOME/.ssh/id_ecdsa.pub" "$HOME/.ssh/id_rsa.pub"; do
+        [ -f "$key" ] || continue
+        found=1
+        echo "      $key:"
+        echo "        $(cat "$key")"
+    done
+    [ -n "$found" ] || echo "      (no SSH key yet — create one with: ssh-keygen -t ed25519)"
+    if [ -n "$slug" ]; then
+        echo "      Add it at https://github.com/settings/keys (all your repositories), or as a"
+        echo "      deploy key with \"Allow write access\" at https://github.com/$slug/settings/keys"
+    fi
+}
+
+# Wait until this machine can push to branch $2 of remote $1. The test is a
+# dry run pushing the remote's own commit back — always a fast-forward, so
+# only access can make it fail. While it fails, explain how to grant access
+# and wait for the user. Returns 1 if they give up.
+global_push_access() {
+    local remote="$1" branch="$2" url tip err answer
+    url=$(git -C "$SCRIPT_DIR" remote get-url --push "$remote" 2>/dev/null) || url="$remote"
+    tip=$(git -C "$SCRIPT_DIR" rev-parse "$remote/$branch" 2>/dev/null) || return 1
+    info "Checking that this machine can push to $url..."
+    while ! err=$(_git_net -C "$SCRIPT_DIR" push --dry-run -q "$remote" "$tip:refs/heads/$branch" 2>&1); do
+        echo ""
+        warn "This machine cannot push to $url"
+        printf '%s\n' "$err" | grep -v '^[[:space:]]*$' | tail -n 3 | sed 's/^/      /'
+        echo ""
+        global_push_help "$url" "$remote"
+        echo ""
+        if [ -t 0 ]; then
+            read -rp "  Press Enter to try again once that is done, or 'l' to keep the alias on this machine only: " answer || return 1
+        else
+            read -r answer || return 1
+        fi
+        case "$answer" in [lLqQnN]*) return 1 ;; esac
+        info "Checking again..."
+    done
+    return 0
+}
+
+# Run "$@" — an alias_set/alias_unset on $GLOBAL_ALIAS_FILE — on top of the
+# latest remote state, then commit just that file (message $1) and push it.
+# Returns 1 when nothing changed (nowhere to publish, no access, user gave
+# up), 2 when the change is here but could not be committed or pushed.
+global_alias_publish() {
+    local msg="$1"; shift
+    local upstream remote branch ahead try
+    if ! upstream=$(global_alias_upstream); then
+        error "$SCRIPT_DIR is not on a branch that tracks a remote one: nowhere to publish to"
+        return 1
+    fi
+    remote=${upstream%%/*}
+    branch=${upstream#*/}
+    if [ -z "$(git -C "$SCRIPT_DIR" config user.email 2>/dev/null)" ]; then
+        error "git has no identity on this machine; set it with:"
+        echo "    git config --global user.name \"Your Name\"; git config --global user.email you@example.com"
+        return 1
+    fi
+    info "Updating $SCRIPT_DIR from $upstream..."
+    checkout_pull
+    case $? in
+        1) return 1 ;;
+        2) error "Could not update the checkout from $upstream${CHECKOUT_PULL_ERR:+: $CHECKOUT_PULL_ERR}"; return 1 ;;
+    esac
+    global_push_access "$remote" "$branch" || return 1
+    ahead=$(git -C "$SCRIPT_DIR" rev-list --count "$upstream..HEAD" 2>/dev/null) || ahead=0
+    if [ "$ahead" -gt 0 ]; then
+        warn "$branch has $ahead local commit(s) not on $upstream yet; publishing pushes them too"
+        confirm_default_no "  Push them along with the alias?" || return 1
+    fi
+
+    "$@" || return 1
+    global_alias_commit "$msg" || return 2
+    for try in 1 2 3; do
+        _git_net -C "$SCRIPT_DIR" push -q "$remote" "HEAD:refs/heads/$branch" && return 0
+        [ "$try" -lt 3 ] || break
+        # Rejected: most likely another machine pushed meanwhile. Redo the
+        # change on top of the new remote state instead of rebasing — two
+        # edits to the alias file can conflict textually even when they touch
+        # different aliases. Only when our commit is the sole one ahead;
+        # otherwise rebase (aborted cleanly on a conflict).
+        _git_net -C "$SCRIPT_DIR" fetch -q "$remote" || break
+        if [ "$ahead" -eq 0 ] && git -C "$SCRIPT_DIR" reset -q --keep "$upstream" 2>/dev/null; then
+            "$@" && global_alias_commit "$msg" || return 2
+        else
+            checkout_pull || break
+        fi
+    done
+    error "Committed but not pushed; push later with: git -C \"$SCRIPT_DIR\" push"
+    return 2
+}
+
+# Commit just the global alias file
+global_alias_commit() {
+    if ! git -C "$SCRIPT_DIR" add -- "$GLOBAL_ALIAS_FILE" ||
+       ! git -C "$SCRIPT_DIR" commit -q -m "$1" -- "$GLOBAL_ALIAS_FILE"; then
+        error "Could not commit $GLOBAL_ALIAS_FILE; the change is only on this machine"
+        return 1
+    fi
+}
+
+# Make alias $1=$2 global. A per-machine alias of the same name is dropped,
+# as it would shadow the global one here. Returns as global_alias_publish.
+alias_save_global() {
+    local name="$1" cmd="$2" verb=Add rc
+    [ -n "$(alias_get "$name" "$GLOBAL_ALIAS_FILE")" ] && verb=Update
+    global_alias_publish "$verb global alias $name" alias_set "$name" "$cmd" "$GLOBAL_ALIAS_FILE"
+    rc=$?
+    [ "$rc" -eq 1 ] && return 1
+    [ -n "$(alias_get "$name")" ] && alias_unset "$name"
+    if [ "$rc" -eq 0 ]; then
+        info "Alias '$name' is global: every machine gets it with its next 'olecharms update'"
+    fi
+    alias_activation_note
+    return "$rc"
+}
+
 # ─── Downloads Cleanup Engine ───────────────────────────────────────────────
 # One implementation behind `olecharms cleanup`, its --dry-run, the config
 # menu preview and the scheduled runs (the generated scripts/cleanup-downloads.sh
@@ -1117,24 +1743,151 @@ confirm_default_yes() {
 # Resolve the folder to clean to its real path, refusing anything that is — or
 # leads to — $HOME or /. Prints the real path.
 cleanup_real_dir() {
-    local dir="$1" real home_real d
+    local dir="$1" real home_real p rest
     [ -n "$dir" ] && [ -d "$dir" ] || return 1
     real=$(cd -P "$dir" 2>/dev/null && pwd) || return 1
+    real=${real%/}
+    [ -n "$real" ] || return 1
     home_real=$(cd -P "$HOME" 2>/dev/null && pwd)
-    for d in "$dir" "$real"; do
-        d="${d%/}"
-        if [ -z "$d" ] || [ "$d" = "${HOME%/}" ] || [ "$d" = "${home_real%/}" ]; then
-            return 1
-        fi
+    # Never a folder that holds the home folder, the olecharms checkout or its
+    # config — the folder itself or any parent of them
+    for p in "$HOME" "$home_real" "$SCRIPT_DIR" "$OLECHARMS_CONFIG_DIR"; do
+        [ -n "$p" ] || continue
+        case "${p%/}/" in "$real"/*) return 1 ;; esac
     done
+    # ...nor anything inside the checkout or a hidden folder of home
+    # (~/.ssh, ~/.config, ~/.vim...)
+    p=$(cd -P "$SCRIPT_DIR" 2>/dev/null && pwd)
+    case "$real/" in
+        "${p:-/nonexistent}"/*|"${home_real%/}"/.*|"${HOME%/}"/.*) return 1 ;;
+    esac
+    # Nor system locations, a whole drive or volume, or a user profile: a typo
+    # in the config must not turn the cleanup loose on everything below it
+    case "$real" in
+        /bin|/bin/*|/boot|/boot/*|/dev|/dev/*|/etc|/etc/*|/lib|/lib/*|/lib32|/lib32/*|/lib64|/lib64/*|\
+        /opt|/opt/*|/proc|/proc/*|/root|/root/*|/run|/run/*|/sbin|/sbin/*|/snap|/snap/*|/srv|/srv/*|\
+        /sys|/sys/*|/usr|/usr/*|/var|/var/*|/home|/mnt|/mnt/wsl|/mnt/wsl/*|/mnt/wslg|/mnt/wslg/*|/media|/tmp|/Users|/Volumes|\
+        /System|/System/*|/Library|/Library/*|/Applications|/Applications/*|/private|/private/*|\
+        /mnt/[a-zA-Z]|/mnt/[a-zA-Z]/Users|/mnt/[a-zA-Z]/Windows|/mnt/[a-zA-Z]/Windows/*|\
+        /mnt/[a-zA-Z]/Program\ Files*|/mnt/[a-zA-Z]/ProgramData|/mnt/[a-zA-Z]/ProgramData/*)
+            return 1 ;;
+        /mnt/[a-zA-Z]/Users/*|/Users/*|/home/*|/Volumes/*|/media/*)
+            # the profile / home / volume itself, one level down
+            rest=${real#/mnt/?/Users/}
+            [ "$rest" = "$real" ] && rest=${real#/*/}
+            case "$rest" in */*) ;; *) return 1 ;; esac
+            ;;
+    esac
     printf '%s\n' "$real"
 }
 
 # Files older than $2 days under real dir $1, NUL-separated into file $3.
-# desktop.ini (Windows) and .localized (macOS) are old by nature but give the
-# folder its localized name ("Descargas"), so they always stay.
+# "Older" means both unmodified (mtime) and in the folder (ctime) for that
+# long: tar, unzip, wget, cp -p or an Explorer copy keep the original mtime,
+# so mtime alone would remove a file the moment it arrives — ctime cannot be
+# set back. Files inside a git checkout are never taken. desktop.ini
+# (Windows) and .localized (macOS) are old by nature but
+# give the folder its localized name ("Descargas"), so they always stay.
+# OLECHARMS_TEST_IGNORE_CTIME: tests cannot make a file's ctime old.
+CLEANUP_PROTECT=""
 cleanup_collect() {
-    find "$1" -type f -mtime "+$2" ! -name desktop.ini ! -name .localized -print0 2>/dev/null > "$3"
+    local root="$1" days="$2" out="$3" raw protect f p keep
+    raw=$(mktemp) || { : > "$out"; return 1; }
+    if [ -n "${OLECHARMS_TEST_IGNORE_CTIME:-}" ]; then
+        find "$root" -type f -mtime "+$days" ! -name desktop.ini ! -name .localized -print0 2>/dev/null > "$raw"
+    else
+        find "$root" -type f -mtime "+$days" -ctime "+$days" ! -name desktop.ini ! -name .localized -print0 2>/dev/null > "$raw"
+    fi
+    # Never take files out of a git checkout — a cloned project, or olecharms
+    # itself: losing old files under .git corrupts the repository
+    protect=$(find "$root" -name .git -prune -print 2>/dev/null | sed 's#/\.git$##')
+    protect=$(printf '%s\n%s' "$protect" "$(cd -P "$SCRIPT_DIR" 2>/dev/null && pwd)")
+    CLEANUP_PROTECT=$protect
+    while IFS= read -r -d '' f; do
+        keep=""
+        while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            case "$f" in "$p"/*) keep=1; break ;; esac
+        done <<< "$protect"
+        [ -n "$keep" ] || printf '%s\0' "$f"
+    done < "$raw" > "$out"
+    rm -f "$raw"
+}
+
+# Second, independent check right before anything is removed: each path must
+# be a regular file (not a symlink) strictly inside real dir $1, outside .git
+# and outside the trees cleanup_collect protects. Reads NUL list $2, writes
+# the paths that pass to $3 and logs the others to $4 as skipped.
+cleanup_verify_list() {
+    local root="$1" in="$2" out="$3" log="$4" f p bad
+    while IFS= read -r -d '' f; do
+        bad=""
+        case "$f" in
+            */../*|*/./*) bad="not a plain path" ;;
+            "$root"/*)    ;;
+            *)            bad="outside $root" ;;
+        esac
+        case "$f" in */.git/*) bad="inside .git" ;; esac
+        if [ -z "$bad" ] && { [ -L "$f" ] || [ ! -f "$f" ]; }; then
+            bad="not a regular file"
+        fi
+        if [ -z "$bad" ]; then
+            while IFS= read -r p; do
+                [ -n "$p" ] || continue
+                case "$f" in "$p"/*) bad="inside a git checkout"; break ;; esac
+            done <<< "${CLEANUP_PROTECT:-}"
+        fi
+        if [ -n "$bad" ]; then
+            printf 'skipped  %s (%s)\n' "$f" "$bad" >> "$log"
+        else
+            printf '%s\0' "$f"
+        fi
+    done < "$in" > "$out"
+}
+
+# True when removing $1 files ($2 KB) from real dir $3 is a mass removal:
+# more than CLEANUP_BATCH_FILES files, CLEANUP_BATCH_KB, or over
+# CLEANUP_BATCH_PERCENT of the folder's files. Sets CLEANUP_LARGE_WHY.
+cleanup_is_large() {
+    local count="$1" kb="$2" root="$3" total
+    CLEANUP_LARGE_WHY=""
+    if [ "$count" -gt "$CLEANUP_BATCH_FILES" ]; then
+        CLEANUP_LARGE_WHY="$count files (more than $CLEANUP_BATCH_FILES)"
+    elif [ "${kb:-0}" -gt "$CLEANUP_BATCH_KB" ]; then
+        CLEANUP_LARGE_WHY="$(human_kb "$kb") (more than $(human_kb "$CLEANUP_BATCH_KB"))"
+    elif [ "$count" -gt 20 ]; then
+        total=$(find "$root" -type f 2>/dev/null | wc -l | tr -d ' ')
+        if [ "$total" -gt 0 ] && [ $((count * 100 / total)) -gt "$CLEANUP_BATCH_PERCENT" ]; then
+            CLEANUP_LARGE_WHY="$count of the $total files in the folder"
+        fi
+    fi
+    [ -n "$CLEANUP_LARGE_WHY" ]
+}
+
+# Remove the folders this run emptied (walking up towards root $1), plus
+# empty folders that have themselves been left alone for $3 days. A folder
+# created a minute ago, or the empty dirs of a project just extracted, stay.
+cleanup_prune_dirs() {
+    local root="$1" list="$2" days="$3" f d p skip
+    while IFS= read -r -d '' f; do
+        d=${f%/*}
+        while [ "$d" != "$root" ] && [ "${d#"$root"/}" != "$d" ]; do
+            rmdir "$d" 2>/dev/null || break
+            d=${d%/*}
+        done
+    done < "$list"
+    # Long-empty folders, but nothing under .git or inside a git checkout
+    # (cleanup_collect's CLEANUP_PROTECT); rmdir only ever removes empty ones
+    find "$root" -mindepth 1 -name .git -prune -o -type d -empty -mtime "+$days" -ctime "+$days" -print0 2>/dev/null |
+        while IFS= read -r -d '' d; do
+            skip=""
+            while IFS= read -r p; do
+                [ -n "$p" ] || continue
+                case "$d/" in "$p"/*) skip=1; break ;; esac
+            done <<< "${CLEANUP_PROTECT:-}"
+            [ -n "$skip" ] || rmdir "$d" 2>/dev/null
+        done
+    return 0
 }
 
 cleanup_count() {
@@ -1164,10 +1917,13 @@ cleanup_trash_backend() {
         win=$(wslpath -w "$dir" 2>/dev/null)
         case "$win" in
             [A-Za-z]:*)
-                if win_powershell >/dev/null; then
+                # A Windows drive: its Recycle Bin or nothing (a Linux trash
+                # would park the files in a hidden folder on C:)
+                if win_powershell >/dev/null && win_bin_status "$dir"; then
                     echo recycle-bin
                     return 0
                 fi
+                return 1
                 ;;
         esac
     fi
@@ -1245,26 +2001,35 @@ cleanup_macos_trash() {
 # is still reported truthfully. Appends one line per file to log $3 and prints
 # "<done> <failed>".
 cleanup_apply() {
-    local list="$1" backend="$2" log="$3" root="$4" f verb n_done=0 n_failed=0
+    local backend="$2" log="$3" root="$4" f verb n_done=0 n_failed=0 n_kept=0 i=0 skip=" " list
+    list=$(mktemp) || { echo "0 0 0"; return 1; }
+    cleanup_verify_list "$root" "$1" "$list" "$log"
     case "$backend" in
         delete)      xargs -0 rm -f < "$list" 2>/dev/null ;;
         gio)         xargs -0 gio trash < "$list" 2>/dev/null ;;
         trash-put)   xargs -0 trash-put < "$list" 2>/dev/null ;;
         macos-trash) cleanup_macos_trash "$list" ;;
-        recycle-bin) win_recycle "$list" "$root" >/dev/null ;;
+        recycle-bin)
+            # Positions of files the bin could not take (kept, not deleted)
+            skip=" $(win_recycle "$list" "$root" | awk '$1 == "SKIP" { printf "%s ", $2 }')"
+            ;;
     esac
     verb=trashed
     [ "$backend" = delete ] && verb=deleted
     while IFS= read -r -d '' f; do
-        if [ -e "$f" ]; then
-            n_failed=$((n_failed + 1))
-            printf 'failed   %s\n' "$f"
-        else
+        if [ ! -e "$f" ]; then
             n_done=$((n_done + 1))
             printf '%-8s %s\n' "$verb" "$f"
+        else
+            case "$skip" in
+                *" $i "*) n_kept=$((n_kept + 1)); printf 'kept     %s (the Recycle Bin cannot take it)\n' "$f" ;;
+                *)        n_failed=$((n_failed + 1)); printf 'failed   %s\n' "$f" ;;
+            esac
         fi
+        i=$((i + 1))
     done < "$list" >> "$log"
-    echo "$n_done $n_failed"
+    rm -f "$list"
+    echo "$n_done $n_failed $n_kept"
 }
 
 cleanup_log_line() {
@@ -1293,7 +2058,7 @@ cleanup_show_log() {
 
 CLEANUP_LOCK=""
 cleanup_release_lock() {
-    [ -n "$CLEANUP_LOCK" ] && rm -rf "$CLEANUP_LOCK"
+    [ -n "$CLEANUP_LOCK" ] && rmdir "$CLEANUP_LOCK" 2>/dev/null
     CLEANUP_LOCK=""
 }
 
@@ -1302,10 +2067,10 @@ cleanup_release_lock() {
 # they run in the background of a new shell — and leave their trace in the log.
 cleanup_run() {
     local dir="$1" days="$2" action="$3" trigger="$4" list="${5:-}"
-    local own_list="" real backend count kb result n_done n_failed lock
+    local own_list="" real backend count kb result n_done n_failed n_kept=0 lock
     if ! real=$(cleanup_real_dir "$dir"); then
-        cleanup_log_line "$trigger: skipped — ${dir:-<no folder>} is missing or resolves to \$HOME or /"
-        [ "$trigger" = scheduled ] || error "Cannot clean ${dir:-<no folder>} (missing, or it resolves to \$HOME or /)"
+        cleanup_log_line "$trigger: skipped — ${dir:-<no folder>} is missing or a protected location"
+        [ "$trigger" = scheduled ] || error "Cannot clean ${dir:-<no folder>}: missing, or a protected location (home, system folder, whole drive, user profile)"
         return 1
     fi
     if ! backend=$(cleanup_effective_backend "$real" "$action"); then
@@ -1320,7 +2085,7 @@ cleanup_run() {
     # older than a day is left over from a killed run.
     if ! mkdir "$lock" 2>/dev/null; then
         if [ -n "$(find "$lock" -maxdepth 0 -mmin +1440 2>/dev/null)" ]; then
-            rm -rf "$lock"
+            rmdir "$lock" 2>/dev/null
             mkdir "$lock" 2>/dev/null || return 0
         else
             [ "$trigger" = scheduled ] || warn "Another cleanup is running right now; try again in a moment"
@@ -1339,13 +2104,24 @@ cleanup_run() {
     count=$(cleanup_count "$list")
     n_done=0
     n_failed=0
+    [ "$count" -gt 0 ] && kb=$(cleanup_size_kb "$list" "$count")
+    # Unattended runs never remove in bulk: hold it, and say so in new shells,
+    # until it is confirmed by hand with 'olecharms cleanup'
+    if [ "$trigger" = scheduled ] && [ "$count" -gt 0 ] && cleanup_is_large "$count" "$kb" "$real"; then
+        printf '%s files (%s) are due in %s — more than a scheduled run removes on its own\n' \
+            "$count" "$(human_kb "$kb")" "$real" > "$CLEANUP_HELD" 2>/dev/null
+        cleanup_log_line "scheduled: held — $CLEANUP_LARGE_WHY; confirm with 'olecharms cleanup'"
+        [ -n "$own_list" ] && rm -f "$list"
+        cleanup_release_lock
+        trap - EXIT INT TERM
+        return 0
+    fi
+    rm -f "$CLEANUP_HELD" 2>/dev/null
     if [ "$count" -gt 0 ]; then
-        kb=$(cleanup_size_kb "$list" "$count")
         cleanup_log_line "$trigger  $real  >${days}d  $backend  $count files, $(human_kb "$kb")"
         result=$(cleanup_apply "$list" "$backend" "$CLEANUP_LOG" "$real")
-        n_done=${result% *}
-        n_failed=${result#* }
-        find "$real" -mindepth 1 -type d -empty -delete 2>/dev/null
+        read -r n_done n_failed n_kept <<< "$result"
+        cleanup_prune_dirs "$real" "$list" "$days"
         cleanup_trim_log
     fi
     [ -n "$own_list" ] && rm -f "$list"
@@ -1358,6 +2134,7 @@ cleanup_run() {
         else
             info "Done: $n_done of $count files ($(human_kb "$kb")) — $(cleanup_backend_label "$backend")"
             [ "$n_failed" -gt 0 ] && warn "$n_failed files could not be removed (in use or no permission); see 'olecharms cleanup --log'"
+            [ "${n_kept:-0}" -gt 0 ] && warn "$n_kept files were kept: the Recycle Bin cannot take them (too big, or no bin on that drive)"
         fi
     fi
     [ "$n_failed" -eq 0 ]
@@ -1371,8 +2148,13 @@ cleanup_print_preview() {
     kb=$(cleanup_size_kb "$list" "$count")
     echo "  Folder:   $dir"
     [ "$real" != "$dir" ] && echo "            → $real"
-    echo "  Rule:     files older than $days days (desktop.ini and .localized always stay)"
+    echo "  Rule:     files untouched and in the folder for over $days days (desktop.ini and .localized stay)"
     echo "  Action:   $(cleanup_backend_label "$backend")"
+    # On a Windows drive, "delete" usually means the bin is off: say so
+    if [ "$backend" = delete ] && [ -n "${IS_WSL:-}" ] && [ "${real#/mnt/[a-zA-Z]/}" != "$real" ] &&
+       ! win_bin_status "$real"; then
+        echo "            (the Windows Recycle Bin is ${WIN_BIN_WHY:-unavailable} — files would be gone for good)"
+    fi
     echo "  Matches:  $count files, $(human_kb "$kb")"
     if [ -n "$limit" ] && [ "$count" -gt 0 ]; then
         echo ""
@@ -1397,6 +2179,8 @@ if (-not $dl) { $dl = Join-Path $env:USERPROFILE 'Downloads' }
 "USERPROFILE=$env:USERPROFILE"
 "LOCALAPPDATA=$env:LOCALAPPDATA"
 "HOME=$env:HOME"
+"HOMEDRIVE=$env:HOMEDRIVE"
+"HOMEPATH=$env:HOMEPATH"
 "DOWNLOADS=$dl"
 "PROGRAMFILES=$env:ProgramFiles"
 "PROGRAMFILES86=${env:ProgramFiles(x86)}"
@@ -1432,6 +2216,38 @@ PS_EOF
 # Send each file listed in $ListFile (UTF-8, one Windows path per line) to the
 # Recycle Bin. SHFileOperation with NOERRORUI/SILENT/NOCONFIRMATION never opens
 # a dialog — this runs in the background of a new shell.
+# Whether the Recycle Bin of the drive holding $path can take files, and how
+# much. SHFileOperation deletes outright — silently, under NOCONFIRMATION —
+# whatever the bin cannot hold: the bin is switched off for that drive
+# (NukeOnDelete, or the NoRecycleFiles policy), the drive is not a fixed one
+# (USB sticks, network shares have no bin), or the file is bigger than the
+# bin. Default size when unset: 5% of the volume, as Windows does.
+IFS= read -r -d '' PS_BIN_FUNC <<'PS_EOF' || true
+function Get-OlecharmsBin([string]$path) {
+    $r = [IO.Path]::GetPathRoot($path)
+    try { $d = New-Object IO.DriveInfo($r) } catch { return @{ On = $false; Limit = 0; Why = 'unknown drive' } }
+    if ("$($d.DriveType)" -ne 'Fixed') { return @{ On = $false; Limit = 0; Why = "$($d.DriveType) drive, no Recycle Bin" } }
+    foreach ($k in 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer', 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer') {
+        try { if ((Get-ItemProperty -LiteralPath $k -ErrorAction Stop).NoRecycleFiles -eq 1) { return @{ On = $false; Limit = 0; Why = 'turned off by policy' } } } catch {}
+    }
+    $limit = [int64]($d.TotalSize * 0.05)
+    try {
+        $v = Get-CimInstance Win32_Volume -Filter ("DriveLetter='" + $r.Substring(0, 2) + "'") -ErrorAction Stop
+        if ($v.DeviceID -match '(\{[^}]+\})') {
+            $p = Get-ItemProperty -LiteralPath ('HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket\Volume\' + $Matches[1]) -ErrorAction Stop
+            if ($p.NukeOnDelete -eq 1) { return @{ On = $false; Limit = 0; Why = "turned off for $($r.Substring(0, 2))" } }
+            if ($p.MaxCapacity) { $limit = [int64]$p.MaxCapacity * 1MB }
+        }
+    } catch {}
+    return @{ On = $true; Limit = $limit; Why = '' }
+}
+PS_EOF
+
+IFS= read -r -d '' PS_BIN_STATUS <<'PS_EOF' || true
+$b = Get-OlecharmsBin $Root
+if ($b.On) { "BIN on $($b.Limit)" } else { "BIN off $($b.Why)" }
+PS_EOF
+
 IFS= read -r -d '' PS_RECYCLE <<'PS_EOF' || true
 Add-Type -TypeDefinition @'
 using System;
@@ -1459,13 +2275,21 @@ public static class OlecharmsRecycle {
     }
 }
 '@
-$ok = 0; $fail = 0
+$ok = 0; $fail = 0; $skip = 0; $i = -1; $bins = @{}
 foreach ($p in [IO.File]::ReadAllLines($ListFile, [Text.Encoding]::UTF8)) {
+    $i++
     if ($p -eq '') { continue }
+    # Never let "recycle" turn into a silent permanent delete: keep what the
+    # bin cannot take, and report it by its position in the list
+    $r = [IO.Path]::GetPathRoot($p)
+    if (-not $bins.ContainsKey($r)) { $bins[$r] = Get-OlecharmsBin $p }
+    $len = 0
+    try { $len = (Get-Item -LiteralPath $p -Force -ErrorAction Stop).Length } catch {}
+    if (-not $bins[$r].On -or $len -gt $bins[$r].Limit) { "SKIP $i"; $skip++; continue }
     $null = [OlecharmsRecycle]::Recycle($p)
     if (Test-Path -LiteralPath $p) { $fail++ } else { $ok++ }
 }
-"RESULT $ok $fail"
+"RESULT $ok $fail $skip"
 PS_EOF
 
 # A PowerShell single-quoted literal
@@ -1527,6 +2351,7 @@ win_env_load() {
     [ -n "$out" ] || return 1
     WIN_USERPROFILE="" WIN_LOCALAPPDATA="" WIN_DOWNLOADS="" WIN_PROGRAMFILES=""
     WIN_PROGRAMFILES86="" WIN_GVIM_REG="" WIN_GVIM_PATH="" WIN_HOME_RAW="" WIN_FONT_FILES=""
+    local homedrive="" homepath=""
     while IFS= read -r line; do
         key=${line%%=*}
         val=${line#*=}
@@ -1535,6 +2360,8 @@ win_env_load() {
             USERPROFILE)    WIN_USERPROFILE=$(wslpath -u "$val" 2>/dev/null) ;;
             LOCALAPPDATA)   WIN_LOCALAPPDATA=$(wslpath -u "$val" 2>/dev/null) ;;
             HOME)           WIN_HOME_RAW=$val ;;
+            HOMEDRIVE)      homedrive=$val ;;
+            HOMEPATH)       homepath=$val ;;
             DOWNLOADS)      WIN_DOWNLOADS=$(wslpath -u "$val" 2>/dev/null) ;;
             PROGRAMFILES)   WIN_PROGRAMFILES=$(wslpath -u "$val" 2>/dev/null) ;;
             PROGRAMFILES86) WIN_PROGRAMFILES86=$(wslpath -u "$val" 2>/dev/null) ;;
@@ -1545,9 +2372,14 @@ win_env_load() {
     done <<< "$out"
     [ -n "$WIN_USERPROFILE" ] && [ -d "$WIN_USERPROFILE" ] || return 1
 
-    # Windows Vim looks for _vimrc and vimfiles in %HOME% when it is set,
-    # otherwise in %USERPROFILE%.
+    # Where Windows Vim looks for _vimrc and vimfiles (:h $HOME-windows):
+    # %HOME% if set, else %HOMEDRIVE%%HOMEPATH% (a mapped home drive on
+    # managed machines), else %USERPROFILE%.
     WIN_VIM_HOME="$WIN_USERPROFILE"
+    if [ -n "$homedrive" ] && [ -n "$homepath" ]; then
+        val=$(wslpath -u "$homedrive$homepath" 2>/dev/null)
+        [ -n "$val" ] && [ -d "$val" ] && WIN_VIM_HOME="$val"
+    fi
     if [ -n "$WIN_HOME_RAW" ]; then
         val=$(wslpath -u "$WIN_HOME_RAW" 2>/dev/null)
         [ -n "$val" ] && [ -d "$val" ] && WIN_VIM_HOME="$val"
@@ -1665,6 +2497,9 @@ copy_if_changed() {
 # it and it is most of the size), symlinks resolved, our stamp preserved.
 mirror_dir() {
     local src="$1" dest="$2"
+    # --delete / rm -rf on dest: it must be a plugin folder, never bundle/
+    case "$(basename "$dest")" in ""|.|..|bundle|vimfiles) return 1 ;; esac
+    [ -d "$src" ] || return 1
     if check_command rsync; then
         rsync -rtLq --delete --modify-window=2 --exclude .git --exclude "$WIN_MANAGED_STAMP" "$src/" "$dest/"
     else
@@ -1679,6 +2514,7 @@ win_sync_plugins() {
     local bundle="$1" entry name src dest wanted="|" synced=0
     for entry in "${VIM_PLUGINS[@]}"; do
         name="${entry%%|*}"
+        plugin_name_valid "$name" || continue
         wanted="$wanted$name|"
         src="$VIM_DIR/bundle/$name"
         dest="$bundle/$name"
@@ -1790,8 +2626,36 @@ win_recycle() {
         rel="${f#"$root"}"
         printf '%s%s\n' "$winroot" "${rel//\//\\}"
     done < "$list" > "$tmp"
-    WIN_PS_TIMEOUT=3600 win_ps_run "\$ListFile = $(ps_quote "$(wslpath -w "$tmp")")" "$PS_RECYCLE"
+    WIN_PS_TIMEOUT=3600 win_ps_run "\$ListFile = $(ps_quote "$(wslpath -w "$tmp")")" "$PS_BIN_FUNC$PS_RECYCLE"
     rm -f "$tmp"
+}
+
+# Whether the Windows Recycle Bin of the drive holding WSL path $1 is usable;
+# sets WIN_BIN_WHY when it is not. Cached per drive for this run.
+WIN_BIN_CACHE=""
+win_bin_status() {
+    local win drive out entry
+    win=$(wslpath -w "$1" 2>/dev/null) || return 1
+    drive=${win%%:*}
+    case "$WIN_BIN_CACHE" in
+        *"|$drive=on|"*) return 0 ;;
+    esac
+    entry=$(printf '%s' "$WIN_BIN_CACHE" | tr '|' '\n' | grep "^$drive=off:" | head -n 1)
+    if [ -n "$entry" ]; then
+        WIN_BIN_WHY=${entry#*=off:}
+        return 1
+    fi
+    out=$(win_ps_run "\$Root = $(ps_quote "$win")" "$PS_BIN_FUNC$PS_BIN_STATUS" | grep '^BIN ' | tail -n 1)
+    case "$out" in
+        "BIN on "*)
+            WIN_BIN_CACHE="$WIN_BIN_CACHE|$drive=on|"
+            return 0
+            ;;
+    esac
+    WIN_BIN_WHY=${out#BIN off }
+    [ -n "$out" ] || WIN_BIN_WHY="Windows could not be asked"
+    WIN_BIN_CACHE="$WIN_BIN_CACHE|$drive=off:$WIN_BIN_WHY|"
+    return 1
 }
 
 # ─── Config Versioning ──────────────────────────────────────────────────────
@@ -1976,7 +2840,8 @@ restore_scheduled_features() {
             if [ ! -x "$CLEANUP_SCRIPT" ] || { [ "$dl_method" = "cron" ] && ! is_downloads_cron_enabled; }; then
                 info "Restoring downloads auto-cleanup ($dl_method)"
             fi
-            enable_downloads_cleanup "$dl_dir" "$dl_method" "$dl_age"
+            enable_downloads_cleanup "$dl_dir" "$dl_method" "$dl_age" \
+                || error "Could not restore downloads auto-cleanup"
         fi
     fi
 
@@ -1986,7 +2851,7 @@ restore_scheduled_features() {
         if [ ! -x "$PARANOID_SCRIPT" ] || { [ "$p_method" = "cron" ] && ! is_paranoid_cron_enabled; }; then
             info "Restoring paranoid mode ($p_method)"
         fi
-        enable_paranoid_mode "$p_method"
+        enable_paranoid_mode "$p_method" || error "Could not restore paranoid mode"
     fi
 
     # Also covers a hook line lost from an RC file (the Oh My Zsh installer
@@ -2046,8 +2911,10 @@ install_packages() {
             warn "Not a Debian/Ubuntu system — install these yourself: ${packages[*]}"
             return
         fi
+        # dpkg -s also succeeds for removed-but-not-purged packages
+        # ("deinstall ok config-files"), which would then never come back
         for pkg in "${packages[@]}"; do
-            if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+            if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'ok installed'; then
                 missing+=("$pkg")
             fi
         done
@@ -2086,13 +2953,25 @@ install_packages() {
         if ! "${sudo_cmd[@]}" apt-get update -qq; then
             warn "apt-get update failed (a broken source?); trying to install anyway"
         fi
-        "${sudo_cmd[@]}" apt-get install -y -qq "${missing[@]}" \
-            || error "Some packages failed to install"
+        # apt installs nothing when one name is unknown to this release, and
+        # packages.conf is shared across distros: retry one by one then.
+        if ! "${sudo_cmd[@]}" apt-get install -y -qq "${missing[@]}"; then
+            local failed=()
+            warn "Batch install failed; installing one package at a time"
+            for pkg in "${missing[@]}"; do
+                "${sudo_cmd[@]}" apt-get install -y -qq "$pkg" >/dev/null 2>&1 || failed+=("$pkg")
+            done
+            [ ${#failed[@]} -gt 0 ] && error "Could not install: ${failed[*]} (move distro-specific ones to $LOCAL_CONF_FILE)"
+        fi
     elif [ "$OS" = "macos" ]; then
         if check_command brew; then
-            brew install "${missing[@]}" 2>/dev/null || {
-                warn "Some brew packages may have already been installed"
-            }
+            if ! brew install "${missing[@]}"; then
+                local failed=()
+                for pkg in "${missing[@]}"; do
+                    brew list "$pkg" >/dev/null 2>&1 || failed+=("$pkg")
+                done
+                [ ${#failed[@]} -gt 0 ] && error "Could not install: ${failed[*]}"
+            fi
         else
             error "Homebrew not found. Install it from https://brew.sh"
         fi
@@ -2133,6 +3012,16 @@ install_pathogen() {
     fi
 }
 
+# A plugin name becomes a folder under bundle/, where it is pulled, reset,
+# replaced, mirrored with --delete and pruned: it must be one plain folder
+# name, or those would act on bundle/ itself or outside it.
+plugin_name_valid() {
+    case "$1" in
+        ""|.|..|-*|*/*|*\\*) return 1 ;;
+    esac
+    [[ "$1" =~ ^[A-Za-z0-9._+-]+$ ]]
+}
+
 install_plugins() {
     if [ ${#VIM_PLUGINS[@]} -eq 0 ]; then
         warn "No plugins defined in packages.conf"
@@ -2145,6 +3034,10 @@ install_plugins() {
         local dest="$VIM_DIR/bundle/$name"
         local fallback="$BUNDLED_DIR/bundle/$name"
 
+        if ! plugin_name_valid "$name"; then
+            error "Invalid plugin name '$name' in packages.conf (entry: $entry); skipped"
+            continue
+        fi
         if ! clone_or_pull "$url" "$dest" "$name" "$fallback"; then
             [ -d "$dest" ] || error "Plugin $name is not installed and could not be fetched"
         fi
@@ -2231,6 +3124,30 @@ install_fonts() {
     fi
 }
 
+# Make an existing ~/.zshrc load oh-my-zsh (kept by the installer): prepend
+# the template's essentials, so the user's own lines still come after it and
+# win over oh-my-zsh's aliases and settings.
+omz_add_to_zshrc() {
+    local omz_dir="$1" zshrc="$HOME/.zshrc" tmp zsh_path
+    grep -qE '^[[:space:]]*(source|\.)[[:space:]].*oh-my-zsh\.sh' "$zshrc" 2>/dev/null && return 0
+    zsh_path="$omz_dir"
+    [ "$omz_dir" = "$HOME/.oh-my-zsh" ] && zsh_path='$HOME/.oh-my-zsh'
+    backup_file "$zshrc"
+    tmp=$(mktemp) || return 1
+    {
+        echo "# Oh My Zsh (added by olecharms; your own settings follow)"
+        echo "export ZSH=\"$zsh_path\""
+        echo 'ZSH_THEME="olecharms"'
+        echo 'plugins=(git)'
+        echo 'source $ZSH/oh-my-zsh.sh'
+        echo ""
+        cat "$zshrc"
+    } > "$tmp"
+    write_file_contents "$tmp" "$zshrc"
+    rm -f "$tmp"
+    info "Added Oh My Zsh to the top of your existing $zshrc"
+}
+
 install_omz() {
     if ! check_command zsh; then
         error "zsh is not installed. Install it manually: sudo apt-get install zsh"
@@ -2244,20 +3161,31 @@ install_omz() {
     # Install Oh My Zsh if not present
     if [ ! -d "$omz_dir" ]; then
         info "Installing Oh My Zsh into $omz_dir..."
+        local url=https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh installer="" keep=no
         if check_command curl; then
-            sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+            installer=$(curl -fsSL --connect-timeout 15 --max-time 120 "$url")
         elif check_command wget; then
-            sh -c "$(wget -qO- https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+            installer=$(wget -qO- -T 30 -t 2 "$url")
         else
             error "Neither curl nor wget available. Cannot install Oh My Zsh."
             return 1
         fi
+        if [ -z "$installer" ]; then
+            error "Could not download the Oh My Zsh installer (offline?)"
+            return 1
+        fi
+        # The installer moves an existing ~/.zshrc aside and puts its template
+        # in its place: the user's own config stops loading, and a dotfiles
+        # symlink becomes a plain file. Keep it, and add oh-my-zsh to it.
+        [ -e "$HOME/.zshrc" ] && keep=yes
+        KEEP_ZSHRC=$keep sh -c "$installer" "" --unattended
 
         # Verify the install actually worked
         if [ ! -d "$omz_dir" ]; then
             error "Oh My Zsh installation failed"
             return 1
         fi
+        [ "$keep" = yes ] && omz_add_to_zshrc "$omz_dir"
     else
         info "Oh My Zsh already installed ($omz_dir)"
     fi
@@ -2359,11 +3287,14 @@ run_post_commands() {
 _self_update() {
     # Set by the relaunch below so a bad hash comparison can't loop forever
     if [ -n "${OLECHARMS_RELAUNCHED:-}" ]; then
+        # Exported by the relaunch: keep it from reaching the login zsh that
+        # install execs, where every later update would skip this step.
+        unset OLECHARMS_RELAUNCHED
         return
     fi
     if [ -d "$SCRIPT_DIR/.git" ]; then
         info "Updating olecharms repo..."
-        local before_script before_conf stash_before stash_after
+        local before_script before_conf
         before_script=$(_file_hash "$SCRIPT_PATH")
         before_conf=$(_file_hash "$CONF_FILE")
 
@@ -2371,19 +3302,8 @@ _self_update() {
         if [ -n "$(git -C "$SCRIPT_DIR" status --porcelain -- "$(basename "$CONF_FILE")" 2>/dev/null)" ]; then
             warn "packages.conf has local changes. Move them to $LOCAL_CONF_FILE, which updates never touch."
         fi
-        stash_before=$(git -C "$SCRIPT_DIR" stash list 2>/dev/null | wc -l | tr -d ' ')
-
-        git -C "$SCRIPT_DIR" pull --rebase --autostash 2>/dev/null || {
-            warn "Could not update olecharms repo"
-        }
-
-        # --autostash parks local changes in the stash when re-applying them
-        # conflicts — silently, unless we say so.
-        stash_after=$(git -C "$SCRIPT_DIR" stash list 2>/dev/null | wc -l | tr -d ' ')
-        if [ "$stash_after" -gt "$stash_before" ]; then
-            warn "Your local changes clashed with the update and were set aside in git stash."
-            warn "Inspect them with: git -C \"$SCRIPT_DIR\" stash show -p"
-        fi
+        checkout_pull
+        [ $? -eq 2 ] && warn "Could not update olecharms repo${CHECKOUT_PULL_ERR:+: $CHECKOUT_PULL_ERR}"
 
         local after_script after_conf
         after_script=$(_file_hash "$SCRIPT_PATH")
@@ -2407,7 +3327,7 @@ _self_update() {
 # whether it is now stale.
 shell_config_snapshot() {
     local f
-    for f in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.zshrc" "$SHELL_LOADER" "$ALIAS_FILE"; do
+    for f in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.zshrc" "$SHELL_LOADER" "$ALIAS_FILE" "$GLOBAL_ALIAS_FILE"; do
         printf '%s ' "$(_file_hash "$f")"
     done
 }
@@ -2623,7 +3543,7 @@ doctor_check_shell() {
         doc_warn "EDITOR=vim is not set by olecharms"
         doc_hint "olecharms doctor --fix"
     fi
-    doc_ok "$(alias_count) aliases defined ($ALIAS_FILE)"
+    doc_ok "$(alias_count) aliases on this machine ($ALIAS_FILE), $(alias_count "$GLOBAL_ALIAS_FILE") global"
     if check_command autojump; then
         if d=$(autojump_script_dir); then
             doc_ok "autojump activated by the shell loader ($d)"
@@ -2779,10 +3699,14 @@ doctor_check_cleanup() {
     action=$(config_get downloads_cleanup_action auto)
     method=$(config_get downloads_cleanup_method hook)
     if ! real=$(cleanup_real_dir "$dir"); then
-        doc_fail "Folder ${dir:-<unset>} is missing or unsafe (resolves to \$HOME or /)"
+        doc_fail "Folder ${dir:-<unset>} is missing or a protected location (home, system folder, whole drive, user profile)"
         return
     fi
     doc_ok "Folder $dir$([ "$real" != "$dir" ] && echo " → $real")"
+    if [ -f "$CLEANUP_HELD" ]; then
+        doc_warn "On hold: $(cat "$CLEANUP_HELD" 2>/dev/null)"
+        doc_hint "olecharms cleanup (shows the files, asks you to type their count)"
+    fi
     if backend=$(cleanup_effective_backend "$real" "$action"); then
         doc_ok "Files older than $days days: $(cleanup_backend_label "$backend") (action: $action)"
     else
@@ -2823,6 +3747,28 @@ doctor_check_paranoid() {
     fi
     doctor_check_schedule "Paranoid cleanup" "$PARANOID_SCRIPT" "$(config_get paranoid_mode_method hook)" \
         is_paranoid_cron_enabled paranoid-cleanup.sh
+    if paranoid_covers_windows; then
+        if grep -q '^WIN_VIM_HOME=' "$PARANOID_SCRIPT"; then
+            doc_ok "Also purges the Windows gVim history ($WIN_VIM_HOME)"
+        else
+            doc_warn "Paranoid mode does not purge the Windows gVim history yet"
+            doc_hint "olecharms doctor --fix"
+        fi
+    fi
+    # Enabling paranoid mode sets this; warn if it was loosened afterwards
+    local days
+    if ! is_downloads_cleanup_enabled; then
+        doc_warn "Downloads auto-cleanup is off (paranoid mode keeps downloads $PARANOID_MAX_AGE_DAYS days at most)"
+        doc_hint "olecharms config → Downloads auto-cleanup"
+    else
+        days=$(config_get downloads_cleanup_max_age_days "$DOWNLOADS_MAX_AGE_DAYS")
+        if [[ "$days" =~ ^[0-9]+$ ]] && [ "$days" -le "$PARANOID_MAX_AGE_DAYS" ]; then
+            doc_ok "Downloads kept at most $days days"
+        else
+            doc_warn "Downloads auto-cleanup keeps $days days (paranoid mode sets $PARANOID_MAX_AGE_DAYS)"
+            doc_hint "olecharms config → Downloads auto-cleanup → Change max age"
+        fi
+    fi
 }
 
 doctor_check_config() {
@@ -3196,12 +4142,29 @@ config_cleanup_action() {
 }
 
 config_cleanup_age() {
-    local days
-    read -rp "  Delete files older than how many days? [$(config_get downloads_cleanup_max_age_days "$DOWNLOADS_MAX_AGE_DAYS")] " days
+    local days cur dir real backend list
+    cur=$(config_get downloads_cleanup_max_age_days "$DOWNLOADS_MAX_AGE_DAYS")
+    read -rp "  Delete files older than how many days? [$cur] " days
     [ -z "$days" ] && { info "No changes made"; return 0; }
     if ! [[ "$days" =~ ^[0-9]+$ ]] || [ "$days" -lt 1 ] || [ "$days" -gt 3650 ]; then
         error "Enter a number of days between 1 and 3650"
         return 1
+    fi
+    # A shorter age takes effect on the next shell: show what that removes
+    if ! [[ "$cur" =~ ^[0-9]+$ ]] || [ "$days" -lt "$cur" ]; then
+        dir=$(config_get downloads_cleanup_dir)
+        if real=$(cleanup_real_dir "$dir") && list=$(mktemp); then
+            backend=$(cleanup_effective_backend "$real" "$(config_get downloads_cleanup_action auto)") || backend=delete
+            echo ""
+            cleanup_collect "$real" "$days" "$list"
+            cleanup_print_preview "$dir" "$real" "$days" "$backend" "$list" 10
+            rm -f "$list"
+            echo ""
+            if ! confirm_default_yes "  Set the max age to $days days?"; then
+                info "No changes made"
+                return 0
+            fi
+        fi
     fi
     config_set downloads_cleanup_max_age_days "$days"
     info "Max age set to $days days"
@@ -3262,7 +4225,7 @@ config_downloads_cleanup() {
         return $((rc - 1))
     fi
     if ! real=$(cleanup_real_dir "$selected"); then
-        error "Refusing $selected: it resolves to \$HOME or /"
+        error "Refusing $selected: a protected location (home, system folder, whole drive, user profile)"
         return 1
     fi
     days=$(config_get downloads_cleanup_max_age_days "$DOWNLOADS_MAX_AGE_DAYS")
@@ -3329,11 +4292,8 @@ config_paranoid_mode() {
         fi
         echo -e "  Status: ${GREEN}enabled${NC} ($method_info)"
         echo ""
-        echo "  Paranoid mode clears every 12 hours:"
-        echo "    - Bash history (~/.bash_history)"
-        echo "    - Zsh history (~/.zsh_history)"
-        echo "    - Vim swap files ($VIM_DIR/swapfiles/)"
-        echo "    - Vim undo files ($VIM_DIR/undodir/)"
+        echo "  Paranoid mode deletes every 12 hours:"
+        paranoid_print_targets
         echo ""
         read -rp "  Disable paranoid mode? [y/N] " answer
         case "$answer" in
@@ -3344,76 +4304,115 @@ config_paranoid_mode() {
                 info "No changes made"
                 ;;
         esac
-    else
-        echo -e "  Status: ${RED}disabled${NC}"
-        echo ""
-        echo "  Every 12 hours, paranoid mode will delete:"
-        echo "    - Bash history (~/.bash_history)"
-        echo "    - Zsh history (~/.zsh_history)"
-        echo "    - Vim swap files ($VIM_DIR/swapfiles/)"
-        echo "    - Vim undo files ($VIM_DIR/undodir/)"
-        echo ""
+        return 0
+    fi
 
-        if ! is_downloads_cleanup_enabled; then
-            echo -e "  ${YELLOW}Note:${NC} Downloads auto-cleanup is not enabled."
-            echo "  Paranoid mode will also enable it (with $(( DOWNLOADS_MAX_AGE_DAYS / 2 ))-day max age)."
-            echo ""
+    echo -e "  Status: ${RED}disabled${NC}"
+    echo ""
+    echo "  Every 12 hours, paranoid mode will permanently delete:"
+    paranoid_print_targets
+    echo ""
+
+    # Downloads are kept at most PARANOID_MAX_AGE_DAYS old: the cleanup is
+    # enabled, or lowered when it keeps them longer.
+    local days="$PARANOID_MAX_AGE_DAYS" cur_days dl_change=""
+    if is_downloads_cleanup_enabled; then
+        cur_days=$(config_get downloads_cleanup_max_age_days "$DOWNLOADS_MAX_AGE_DAYS")
+        if [[ "$cur_days" =~ ^[0-9]+$ ]] && [ "$cur_days" -le "$days" ]; then
+            echo "  Downloads auto-cleanup already removes files older than $cur_days days — unchanged."
+        else
+            dl_change=lower
+            echo -e "  ${YELLOW}Also:${NC} downloads auto-cleanup goes from $cur_days to $days days."
         fi
+    else
+        dl_change=enable
+        echo -e "  ${YELLOW}Also:${NC} enables downloads auto-cleanup for files older than $days days."
+    fi
+    echo ""
 
-        echo "  Select scheduling method:"
-        echo ""
-        echo "    1) Shell hook — checked on shell open (recommended)"
-        echo "    2) Cron job — every 12 hours"
-        echo ""
-        echo "    0) Cancel"
-        echo ""
+    echo "  Select scheduling method:"
+    echo ""
+    echo "    1) Shell hook — checked on shell open (recommended)"
+    echo "    2) Cron job — every 12 hours"
+    echo ""
+    echo "    0) Cancel"
+    echo ""
 
-        local method_choice
-        read -rp "  Select: " method_choice
-
-        local mode
-        case "$method_choice" in
-            1)
-                mode="hook"
-                ;;
-            2)
-                if ! check_command crontab; then
-                    error "crontab is not available. Install a cron daemon or use the shell hook."
-                    return 1
-                fi
-                mode="cron"
-                ;;
-            0|"")
-                info "Cancelled"
-                return
-                ;;
-            *)
-                error "Invalid selection"
+    local method_choice mode
+    read -rp "  Select: " method_choice
+    case "$method_choice" in
+        1)
+            mode="hook"
+            ;;
+        2)
+            if ! check_command crontab; then
+                error "crontab is not available. Install a cron daemon or use the shell hook."
                 return 1
-                ;;
-        esac
+            fi
+            mode="cron"
+            ;;
+        0|"")
+            info "Cancelled"
+            return 0
+            ;;
+        *)
+            error "Invalid selection"
+            return 1
+            ;;
+    esac
 
-        # Also enable downloads cleanup if not already on
-        if ! is_downloads_cleanup_enabled; then
+    # Show what the new downloads rule removes before committing to it: it
+    # runs as soon as a new shell opens, and can be thousands of files.
+    local dir real backend list rc
+    case "$dl_change" in
+        enable)
             echo ""
-            local selected rc
-            selected=$(choose_downloads_dir)
+            dir=$(choose_downloads_dir)
             rc=$?
             if [ "$rc" -ne 0 ]; then
                 [ "$rc" -eq 1 ] && info "Cancelled"
                 return $((rc - 1))
             fi
-            enable_downloads_cleanup "$selected" "$mode" "$((DOWNLOADS_MAX_AGE_DAYS / 2))" || return 1
-            info "Downloads auto-cleanup enabled for $selected ($(( DOWNLOADS_MAX_AGE_DAYS / 2 ))-day max age, $(config_get downloads_cleanup_action auto))"
-        fi
-
-        enable_paranoid_mode "$mode"
-        info "Paranoid mode enabled"
-        if [ "$mode" = "cron" ]; then
-            info "Cron job installed (every 12 hours)."
+            if ! real=$(cleanup_real_dir "$dir"); then
+                error "Refusing $dir: a protected location (home, system folder, whole drive, user profile)"
+                return 1
+            fi
+            ;;
+        lower)
+            dir=$(config_get downloads_cleanup_dir)
+            real=$(cleanup_real_dir "$dir") || real=""
+            ;;
+    esac
+    if [ -n "$dl_change" ]; then
+        echo ""
+        if [ -n "$real" ] && list=$(mktemp); then
+            backend=$(cleanup_effective_backend "$real" "$(config_get downloads_cleanup_action auto)") || backend=delete
+            cleanup_collect "$real" "$days" "$list"
+            cleanup_print_preview "$dir" "$real" "$days" "$backend" "$list" 10
+            rm -f "$list"
         else
-            info "Changes take effect in your next shell session."
+            warn "  $dir is not reachable right now; cannot preview what would be removed"
         fi
+        echo ""
+        if ! confirm_default_yes "  Enable paranoid mode with this downloads cleanup?"; then
+            info "Cancelled"
+            return 0
+        fi
+        if [ "$dl_change" = enable ]; then
+            enable_downloads_cleanup "$dir" "$mode" "$days" || return 1
+            info "Downloads auto-cleanup enabled for $dir ($days-day max age)"
+        else
+            config_set downloads_cleanup_max_age_days "$days"
+            info "Downloads auto-cleanup lowered from $cur_days to $days days"
+        fi
+    fi
+
+    enable_paranoid_mode "$mode" || return 1
+    info "Paranoid mode enabled"
+    if [ "$mode" = "cron" ]; then
+        info "Cron job installed (every 12 hours)."
+    else
+        info "Changes take effect in your next shell session."
     fi
 }
 
@@ -3474,6 +4473,10 @@ cmd_config() {
                     config_set windows_integration off
                     info "Windows integration off — the Windows side is left as it is"
                 fi
+                # Paranoid mode purges the Windows gVim only with the integration on
+                if is_paranoid_mode_enabled; then
+                    enable_paranoid_mode "$(config_get paranoid_mode_method hook)"
+                fi
                 echo ""
                 ;;
             0|"")
@@ -3488,21 +4491,27 @@ cmd_config() {
 }
 
 cleanup_usage() {
-    echo "Usage: olecharms cleanup [--dry-run | --log] [--yes]"
+    echo "Usage: olecharms cleanup [--dry-run | --log] [--yes [--force]]"
     echo ""
     echo "  (no option)    show what would go, ask, then clean the downloads folder now"
     echo "  -n, --dry-run  list the files the next run would remove; change nothing"
     echo "      --log      show the history of past cleanups"
     echo "  -y, --yes      do not ask for confirmation"
+    echo "      --force    with --yes: allow a mass removal (over $CLEANUP_BATCH_FILES files,"
+    echo "                 $(human_kb "$CLEANUP_BATCH_KB") or half the folder). Interactively you type the count instead."
+    echo ""
+    echo "  Scheduled runs never remove that much on their own: they hold it and new"
+    echo "  shells say so until you confirm it here."
 }
 
 # olecharms cleanup — the same engine the scheduled runs use, on demand.
 cmd_cleanup() {
-    local mode=run assume_yes="" arg
+    local mode=run assume_yes="" force="" arg
     for arg in "$@"; do
         case "$arg" in
             -n|--dry-run) mode=dry ;;
             -y|--yes)     assume_yes=1 ;;
+            --force)      force=1 ;;
             --log)        mode=log ;;
             --scheduled)  mode=scheduled ;;
             -h|--help)    cleanup_usage; return 0 ;;
@@ -3534,7 +4543,7 @@ cmd_cleanup() {
         return 1
     fi
     if ! real=$(cleanup_real_dir "$dir"); then
-        error "Cannot clean $dir (missing, or it resolves to \$HOME or /)"
+        error "Cannot clean $dir: missing, or a protected location (home, system folder, whole drive, user profile)"
         return 1
     fi
     if ! backend=$(cleanup_effective_backend "$real" "$action"); then
@@ -3561,7 +4570,31 @@ cmd_cleanup() {
         return 0
     fi
     echo ""
-    if [ -z "$assume_yes" ]; then
+    local kb
+    kb=$(cleanup_size_kb "$list" "$count")
+    if cleanup_is_large "$count" "$kb" "$real"; then
+        # Mass removal: a second, deliberate confirmation
+        warn "This is a mass removal: $CLEANUP_LARGE_WHY."
+        if [ -n "$assume_yes" ]; then
+            if [ -z "$force" ]; then
+                rm -f "$list"
+                error "Refusing a mass removal with --yes alone; add --force if you really mean it"
+                return 1
+            fi
+        else
+            if [ ! -t 0 ]; then
+                rm -f "$list"
+                error "Not asking without a terminal; pass --yes --force to clean anyway"
+                return 1
+            fi
+            read -rp "  Type the number of files ($count) to confirm: " answer
+            if [ "$answer" != "$count" ]; then
+                rm -f "$list"
+                info "Cancelled"
+                return 0
+            fi
+        fi
+    elif [ -z "$assume_yes" ]; then
         if [ ! -t 0 ]; then
             rm -f "$list"
             error "Not asking without a terminal; pass --yes to clean anyway"
@@ -3621,11 +4654,30 @@ alias_activation_note() {
 }
 
 alias_add() {
-    local name="$1"; shift
+    local global="" file=""
+    case "${1:-}" in
+        --global|-g) global=1 file="$GLOBAL_ALIAS_FILE"; shift ;;
+    esac
+    local name="${1:-}"
+    [ $# -gt 0 ] && shift
     local cmd="$*"
+    # Several words: the shell already removed the user's quotes, so
+    # `alias add gc git commit -m "fix bug"` would store `-m fix bug`. Re-quote
+    # the words holding whitespace; leave the rest alone so $VARS and globs
+    # still expand when the alias runs.
+    if [ $# -gt 1 ]; then
+        local word q="'"
+        cmd=""
+        for word in "$@"; do
+            case "$word" in
+                ""|*[[:space:]]*) word="$q${word//$q/$q\\$q$q}$q" ;;
+            esac
+            cmd="${cmd:+$cmd }$word"
+        done
+    fi
 
     if [ -z "$name" ] || [ -z "$cmd" ]; then
-        error "Usage: olecharms alias add <name> <command...>"
+        error "Usage: olecharms alias add [--global] <name> <command...>"
         return 1
     fi
     if ! alias_name_valid "$name"; then
@@ -3640,17 +4692,22 @@ alias_add() {
             return 1
             ;;
     esac
+    if [ -n "$global" ] && ! global_alias_upstream >/dev/null; then
+        error "Global aliases need $SCRIPT_DIR on a branch that tracks a remote one"
+        return 1
+    fi
 
-    local existing
-    existing=$(alias_get "$name")
+    local existing scope=""
+    existing=$(alias_get "$name" "$file")
+    [ -n "$global" ] && scope="global "
 
     echo ""
     if [ -n "$existing" ]; then
-        echo -e "  ${BOLD}Replace${NC} alias ${BOLD}${name}${NC}"
+        echo -e "  ${BOLD}Replace${NC} ${scope}alias ${BOLD}${name}${NC}"
         echo "    old: $existing"
         echo "    new: $cmd"
     else
-        echo -e "  ${BOLD}Add${NC} alias ${BOLD}${name}${NC}"
+        echo -e "  ${BOLD}Add${NC} ${scope}alias ${BOLD}${name}${NC}"
         echo "    $cmd"
         # Set by the shell wrapper: sees oh-my-zsh aliases and functions
         if [ -n "${OLECHARMS_NAME_TYPE:-}" ]; then
@@ -3659,65 +4716,112 @@ alias_add() {
             warn "  Note: '$name' is also a command at $(command -v "$name") — the alias will shadow it."
         fi
     fi
+    [ -n "$global" ] && echo "    (committed and pushed: every machine with olecharms gets it)"
     echo ""
 
-    if ! confirm_default_yes "  Add this alias?"; then
+    local verb=Add
+    [ -n "$existing" ] && verb=Replace
+    if ! confirm_default_yes "  $verb this alias?"; then
         info "Cancelled"
         return 0
     fi
 
+    if [ -n "$global" ]; then
+        alias_save_global "$name" "$cmd"
+        [ $? -eq 0 ] || return 1
+        return 0
+    fi
     alias_set "$name" "$cmd" || return 1
     info "Alias '$name' saved to $ALIAS_FILE"
     alias_activation_note
 }
 
 alias_delete() {
-    local name="$1"
+    local name="${1:-}"
 
     if [ -z "$name" ]; then
         error "Usage: olecharms alias delete <name>"
         return 1
     fi
 
-    local existing
+    local existing global_cmd
     existing=$(alias_get "$name")
-    if [ -z "$existing" ]; then
+    global_cmd=$(alias_get "$name" "$GLOBAL_ALIAS_FILE")
+    if [ -z "$existing" ] && [ -z "$global_cmd" ]; then
         error "No such alias: $name"
         return 1
     fi
 
-    echo ""
-    echo -e "  ${BOLD}Delete${NC} alias ${BOLD}${name}${NC}"
-    echo "    $existing"
-    echo ""
-
-    if ! confirm_default_yes "  Delete this alias?"; then
-        info "Cancelled"
+    # The per-machine alias goes first; a global one of the same name is
+    # then what applies here, and needs a second delete.
+    if [ -n "$existing" ]; then
+        echo ""
+        echo -e "  ${BOLD}Delete${NC} alias ${BOLD}${name}${NC}"
+        echo "    $existing"
+        echo ""
+        if ! confirm_default_yes "  Delete this alias?"; then
+            info "Cancelled"
+            return 0
+        fi
+        alias_unset "$name" || return 1
+        info "Alias '$name' deleted"
+        [ -n "$global_cmd" ] && info "The global alias '$name' applies here now: $global_cmd"
+        alias_activation_note
         return 0
     fi
 
-    alias_unset "$name" || return 1
-    info "Alias '$name' deleted"
+    echo ""
+    echo -e "  ${BOLD}Delete${NC} global alias ${BOLD}${name}${NC} — from every machine with olecharms"
+    echo "    $global_cmd"
+    echo ""
+    if ! confirm_default_no "  Delete it everywhere (commit + push)?"; then
+        info "Cancelled"
+        return 0
+    fi
+    global_alias_publish "Remove global alias $name" alias_unset "$name" "$GLOBAL_ALIAS_FILE"
+    case $? in
+        0) info "Global alias '$name' deleted: other machines drop it with their next 'olecharms update'" ;;
+        1) return 1 ;;
+    esac
     alias_activation_note
 }
 
 alias_show_list() {
-    local count
-    count=$(alias_count)
-    if [ "$count" -eq 0 ]; then
-        echo "  (no aliases defined — add one with: olecharms alias add <name> <command...>)"
+    local lc gc width=0 name cmd
+    lc=$(alias_count)
+    gc=$(alias_count "$GLOBAL_ALIAS_FILE")
+    if [ "$lc" -eq 0 ] && [ "$gc" -eq 0 ]; then
+        echo "  (no aliases defined — add one with: olecharms alias add <name> <command...>,"
+        echo "   or pick a recent command with: olecharms aliaslast)"
         return 0
     fi
 
     # Pad the name column to the widest name
-    local width=0 name cmd
     while IFS=$'\t' read -r name cmd; do
         [ ${#name} -gt "$width" ] && width=${#name}
-    done < <(alias_list_raw)
+    done < <(alias_list_raw; alias_list_raw "$GLOBAL_ALIAS_FILE")
 
+    if [ "$gc" -gt 0 ]; then
+        [ "$lc" -gt 0 ] && echo -e "  ${BOLD}Global${NC} (every machine)"
+        while IFS=$'\t' read -r name cmd; do
+            if [ -n "$(alias_get "$name")" ]; then
+                printf "  ${GREEN}%-${width}s${NC}  %s  ${YELLOW}(overridden here)${NC}\n" "$name" "$cmd"
+            else
+                printf "  ${GREEN}%-${width}s${NC}  %s\n" "$name" "$cmd"
+            fi
+        done < <(alias_list_raw "$GLOBAL_ALIAS_FILE")
+        [ "$lc" -gt 0 ] && echo "" && echo -e "  ${BOLD}This machine${NC}"
+    fi
     while IFS=$'\t' read -r name cmd; do
         printf "  ${GREEN}%-${width}s${NC}  %s\n" "$name" "$cmd"
     done < <(alias_list_raw)
+}
+
+alias_usage() {
+    echo "  olecharms alias add [--global] <name> <command...>   Create or replace an alias"
+    echo "  olecharms alias list                                 Show all aliases"
+    echo "  olecharms alias delete <name>                        Remove an alias"
+    echo "  olecharms aliaslast                                  Pick a recent command and save it as an alias"
 }
 
 cmd_alias() {
@@ -3736,17 +4840,91 @@ cmd_alias() {
             echo ""
             alias_show_list
             echo ""
-            echo "  Stored in $ALIAS_FILE"
+            echo "  This machine: $ALIAS_FILE"
+            echo "  Global:       $GLOBAL_ALIAS_FILE (in git)"
             ;;
         *)
             error "Unknown alias subcommand: $sub"
             echo ""
-            echo "  olecharms alias add <name> <command...>   Create or replace an alias"
-            echo "  olecharms alias list                      Show all aliases"
-            echo "  olecharms alias delete <name>             Remove an alias"
+            alias_usage
             return 1
             ;;
     esac
+}
+
+# Pick one of the latest commands from the shell history, name it, save it as
+# an alias — on this machine, or for every machine through git.
+cmd_aliaslast() {
+    local line cmd name rc
+    # The snapshot holds recent history: remove it however this ends. The
+    # wrapper's own cleanup does not run when Ctrl-C aborts it in zsh.
+    if [ -n "${OLECHARMS_SHELL_SNAPSHOT:-}" ] && [ -d "$OLECHARMS_SHELL_SNAPSHOT" ]; then
+        case "${OLECHARMS_SHELL_SNAPSHOT##*/}" in
+            olecharms.*)
+                trap 'snapshot_remove "$OLECHARMS_SHELL_SNAPSHOT"' EXIT
+                trap 'exit 130' INT TERM
+                ;;
+        esac
+    fi
+    PICK_ITEMS=()
+    while IFS= read -r line; do
+        PICK_ITEMS+=("$line")
+    done < <(aliaslast_history)
+    if [ ${#PICK_ITEMS[@]} -eq 0 ]; then
+        error "No shell history to pick a command from"
+        if [ -z "${OLECHARMS_SHELL_SNAPSHOT:-}" ]; then
+            echo "  Run it from your shell as 'olecharms aliaslast': the olecharms shell"
+            echo "  function hands over the history, even when no history file is kept."
+        fi
+        return 1
+    fi
+
+    echo -e "${BOLD}Save a recent command as an alias${NC}"
+    echo ""
+    if ! pick_item; then
+        info "Cancelled"
+        return 0
+    fi
+    cmd=${PICK_ITEMS[$PICK_INDEX]}
+    echo -e "  Command: ${BOLD}${cmd}${NC}"
+    echo ""
+
+    while :; do
+        if [ -t 0 ]; then
+            read -rp "  Alias name: " name || { echo ""; info "Cancelled"; return 0; }
+        else
+            read -r name || { info "Cancelled"; return 0; }
+        fi
+        name="${name#"${name%%[![:space:]]*}"}"
+        name="${name%"${name##*[![:space:]]}"}"
+        if [ -z "$name" ]; then
+            info "Cancelled"
+            return 0
+        fi
+        if ! alias_name_valid "$name"; then
+            error "Invalid alias name: $name (letters, digits, _ . - ; must not start with a digit)"
+            continue
+        fi
+        if alias_conflicts "$name"; then
+            confirm_default_no "  Use '$name' anyway?" || continue
+        fi
+        break
+    done
+
+    echo ""
+    if global_alias_upstream >/dev/null; then
+        if confirm_default_no "  Make '$name' global, for every machine with olecharms (commit + push)?"; then
+            alias_save_global "$name" "$cmd"
+            rc=$?
+            [ "$rc" -eq 0 ] && return 0
+            [ "$rc" -eq 2 ] && return 1
+            warn "Saving '$name' on this machine only"
+        fi
+    fi
+    alias_set "$name" "$cmd" || return 1
+    info "Alias '$name' saved: $name → $cmd"
+    [ -n "$(alias_get "$name" "$GLOBAL_ALIAS_FILE")" ] && info "On this machine it overrides the global alias '$name'"
+    alias_activation_note
 }
 
 cmd_help() {
@@ -3763,14 +4941,14 @@ cmd_help() {
     echo "  config    Interactive menu: downloads cleanup, paranoid mode, Windows sync (WSL)"
     echo "  cleanup   Clean the downloads folder now; --dry-run lists what would go,"
     echo "            --log shows past runs"
-    echo "  alias     Manage shell aliases (add / list / delete)"
+    echo "  alias     Manage shell aliases (add / list / delete); --global shares one"
+    echo "            with every machine through git"
+    echo "  aliaslast Pick one of your latest commands and save it as an alias"
     [ -n "${IS_WSL:-}" ] && echo "  windows   Sync Windows' gVim (config, plugins) and fonts now; 'status' to check"
     echo "  help      Show this help message"
     echo ""
     echo -e "${BLUE}Aliases:${NC}"
-    echo "  olecharms alias add <name> <command...>   Create or replace an alias"
-    echo "  olecharms alias list                      Show all aliases"
-    echo "  olecharms alias delete <name>             Remove an alias"
+    alias_usage
 
     # Dynamically list shell commands from shell/*.sh
     local shell_files=("$SHELL_DIR"/*.sh)
@@ -3828,7 +5006,7 @@ main() {
             config_ensure
             fix_moved_install fix
             ;;
-        alias|cleanup|windows)
+        alias|aliaslast|cleanup|windows)
             config_ensure
             ;;
         doctor|check)
@@ -3855,6 +5033,7 @@ main() {
         cleanup) shift; cmd_cleanup "$@" || cmd_rc=$? ;;
         windows) shift; cmd_windows "$@" || cmd_rc=$? ;;
         alias)   shift; cmd_alias "$@" || cmd_rc=$? ;;
+        aliaslast) shift; cmd_aliaslast "$@" || cmd_rc=$? ;;
         help|--help|-h) cmd_help ;;
         "")
             cmd_help

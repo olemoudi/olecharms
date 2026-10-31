@@ -10,6 +10,8 @@ each() {
     local line escaped
     while IFS= read -r line; do
         escaped=$(printf '%q' "$line")
-        eval "${template//\{\}/$escaped}"
+        # stdin is the list being read: a command that reads it (ssh, read,
+        # ffmpeg...) would swallow the remaining lines
+        eval "${template//\{\}/$escaped}" </dev/null
     done
 }

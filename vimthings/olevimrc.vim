@@ -55,7 +55,9 @@ filetype indent on
 set undofile " Maintain history of undos between sessions
 " Use let &opt so a $HOME containing spaces does not need escaping
 let &undodir = s:vimdir . '/undodir'
-let &directory = s:vimdir . '/swapfiles'
+" Trailing // names swap files after the full path: two README.md from
+" different projects would otherwise share one swap file
+let &directory = s:vimdir . '/swapfiles//'
  
 " Highlight search terms...
 set hlsearch
@@ -176,7 +178,7 @@ cmap W! w !sudo tee % >/dev/null
 inoremap jj <Esc>
 inoremap kk <Esc>
 " control+s to save
-imap <c-s> <c-o><c-s>        
+imap <c-s> <c-o><c-s>
 if has('win32') || has('gui_running')
     source $VIMRUNTIME/mswin.vim
     behave mswin
@@ -198,13 +200,15 @@ map <c-h> <c-w>h
 "  happen as if in command mode )
 imap <C-W> <C-O><C-W>
 
-map <c-b> :bn<CR> " next buffer
-map <c-B> :bp<CR> " previous buffer
+" Previous buffer (Ctrl-N is next). A comment after a mapping becomes part
+" of it, and <c-B> is the same key as <c-b>, so the old next/previous pair
+" ended up as previous plus stray keystrokes.
+map <c-b> :bp<CR>
 " Cycle through buffers
-nnoremap <c-n>  :bnext<CR> 
+nnoremap <c-n> :bnext<CR>
 
 " Scroll the viewport faster
-nnoremap <C-e> 3<C-e>       
+nnoremap <C-e> 3<C-e>
 nnoremap <C-y> 3<C-y>
 
 " Move by 'display lines' rather than 'logical lines'
@@ -215,7 +219,7 @@ nnoremap <silent> gj j
 nnoremap <silent> gk k
 
 " pag forward/backward easier
-nnoremap J <c-f>            
+nnoremap J <c-f>
 nnoremap K <c-b>
 
 " ffs move to the right

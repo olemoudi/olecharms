@@ -177,11 +177,157 @@ cmap W! w !sudo tee % >/dev/null
 """ being sane
 inoremap jj <Esc>
 inoremap kk <Esc>
-" control+s to save
-imap <c-s> <c-o><c-s>
+" control+s to save (mswin.vim maps it too, but terminal Vim skips mswin.vim)
+nnoremap <silent> <c-s> :update<CR>
+inoremap <silent> <c-s> <c-o>:update<CR>
 if has('win32') || has('gui_running')
     source $VIMRUNTIME/mswin.vim
     behave mswin
+endif
+
+""" System clipboard in terminal Vim
+" 'clipboard=unnamed' above needs a Vim built with a working clipboard; the
+" terminal Vim of WSL, Debian/Ubuntu and macOS (/usr/bin/vim) usually is not,
+" and there "+ is not even a valid register. There, olecharms' bin/olecharms-clip
+" stands in (clip.exe on WSL, pbcopy, wl-copy/xclip, OSC 52 over SSH):
+"   y (any yank) also lands on the system clipboard, as with 'unnamed'
+"   "+ / "* before y, d, c, x... copy the text too
+"   "+p "+P "+gp "+gP paste the system clipboard (also ,p);  <C-r>+ in insert
+"   and command-line mode
+" Deletes stay inside Vim, so x or dd never wipe what you copied elsewhere.
+" Ctrl-C copies a visual selection, as in Windows.
+if !has('gui_running') && !has('win32')
+    xmap <c-c> "+y
+endif
+let s:clip = fnamemodify(resolve(expand('<sfile>:p')), ':h:h') . '/bin/olecharms-clip'
+" A native clipboard that works makes all this unnecessary. Vims before
+" 8.1.1837 cannot tell whether theirs works: trust +clipboard there.
+let s:clip_native = has('patch-8.1.1837') ? has('clipboard_working') : has('clipboard')
+if !has('gui_running') && !has('win32') && !s:clip_native && exists('##TextYankPost') && filereadable(s:clip)
+    let s:clip_text = ''
+    let s:clip_warned = 0
+    let s:clip_timer = -1
+    let s:clip_backend = ''
+
+    function! s:ClipBackend() abort
+        if s:clip_backend ==# ''
+            let s:clip_backend = substitute(system('sh ' . shellescape(s:clip) . ' backend'), '\n', '', 'g')
+        endif
+        return s:clip_backend
+    endfunction
+
+    function! s:ClipWarn(msg) abort
+        echohl WarningMsg | echomsg 'clipboard: ' . substitute(a:msg, '\n\+$', '', '') | echohl None
+    endfunction
+
+    " Over SSH the copy is an escape sequence for the local terminal: Vim
+    " sends it itself, a background job has no terminal to write to
+    function! s:ClipOsc52(text) abort
+        if exists('*base64_encode') && exists('*str2blob')
+            let b64 = base64_encode(str2blob(split(a:text, "\n", 1)))
+        else
+            let b64 = substitute(system('base64', a:text), '\n', '', 'g')
+        endif
+        let seq = "\e]52;c;" . b64 . "\x07"
+        if !empty($TMUX)
+            let seq = "\ePtmux;\e" . seq . "\e\\"
+        endif
+        if exists('*echoraw')
+            call echoraw(seq)
+        else
+            call writefile([seq], '/dev/tty', 'b')
+        endif
+    endfunction
+
+    function! s:ClipSend(sync) abort
+        let s:clip_timer = -1
+        let text = s:clip_text
+        if s:ClipBackend() ==# 'none'
+            " No clipboard here (a console, sudo -i...): say so once, not per yank
+            if !s:clip_warned
+                let s:clip_warned = 1
+                call s:ClipWarn('no system clipboard here; yanks stay inside Vim')
+            endif
+        elseif s:ClipBackend() ==# 'ssh'
+            call s:ClipOsc52(text)
+        elseif has('job') && !a:sync
+            " In the background, so a yank never waits for clip.exe & co.
+            let job = job_start(['sh', s:clip, 'copy'], {'in_io': 'pipe', 'out_io': 'null',
+                        \ 'err_cb': {ch, msg -> s:ClipWarn(msg)}, 'stoponexit': ''})
+            call ch_sendraw(job, text)
+            call ch_close_in(job)
+        else
+            let out = system('sh ' . shellescape(s:clip) . ' copy', text)
+            if v:shell_error | call s:ClipWarn(out) | endif
+        endif
+    endfunction
+
+    " Copied: any yank to the default register, and anything done with "+ / "*
+    " (which arrive as an explicit "", reported as regname '"'). Wait a moment
+    " before copying: a macro doing many yanks copies once.
+    function! s:ClipYanked() abort
+        if !(v:event.regname ==# '"' || (v:event.regname ==# '' && v:event.operator ==# 'y'))
+            return
+        endif
+        let s:clip_text = join(v:event.regcontents, "\n") . (v:event.regtype ==# 'V' ? "\n" : '')
+        if has('timers')
+            call timer_stop(s:clip_timer)
+            let s:clip_timer = timer_start(150, {_ -> s:ClipSend(0)})
+        else
+            call s:ClipSend(0)
+        endif
+    endfunction
+
+    function! s:ClipFlush() abort
+        if s:clip_timer != -1
+            call timer_stop(s:clip_timer)
+            call s:ClipSend(1)
+        endif
+    endfunction
+
+    " "+ and "* become an explicit "" (Vim without a clipboard rejects them),
+    " which TextYankPost reports as regname '"'
+    function! s:ClipArm() abort
+        return '""'
+    endfunction
+
+    function! s:ClipGet() abort
+        let text = system('sh ' . shellescape(s:clip) . ' paste')
+        if v:shell_error
+            call s:ClipWarn(text)
+            return ''
+        endif
+        return substitute(text, "\r", '', 'g')
+    endfunction
+
+    function! s:ClipPaste(cmd, count, visual) abort
+        let text = s:ClipGet()
+        if text ==# ''
+            if !v:shell_error | echo 'clipboard: empty' | endif
+            return
+        endif
+        call setreg('"', text)
+        " No explicit "" here: the text a visual paste replaces must not be
+        " copied back over the clipboard
+        execute 'normal! ' . (a:visual ? 'gv' : a:count) . a:cmd
+    endfunction
+
+    augroup olecharms_clipboard
+        autocmd!
+        autocmd TextYankPost * call s:ClipYanked()
+        autocmd VimLeavePre * call s:ClipFlush()
+    augroup END
+    for s:r in ['+', '*']
+        execute 'nnoremap <expr> "' . s:r . ' <SID>ClipArm()'
+        execute 'xnoremap <expr> "' . s:r . ' <SID>ClipArm()'
+        for s:p in ['p', 'P', 'gp', 'gP']
+            execute 'nnoremap <silent> "' . s:r . s:p . ' :<C-u>call <SID>ClipPaste(' . string(s:p) . ', v:count1, 0)<CR>'
+            execute 'xnoremap <silent> "' . s:r . s:p . ' :<C-u>call <SID>ClipPaste(' . string(s:p) . ', 1, 1)<CR>'
+        endfor
+        execute 'inoremap <silent> <C-r>' . s:r . ' <C-r><C-r>=<SID>ClipGet()<CR>'
+        execute 'cnoremap <C-r>' . s:r . ' <C-r>=substitute(<SID>ClipGet(), "\n", " ", "g")<CR>'
+    endfor
+    unlet s:r s:p
 endif
 
 

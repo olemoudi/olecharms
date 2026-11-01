@@ -1,0 +1,126 @@
+#!/bin/sh
+# olecharms-clip — the system clipboard from a terminal, the same everywhere.
+#
+#   olecharms-clip copy     < text     put stdin on the clipboard
+#   olecharms-clip paste    > text     print the clipboard
+#   olecharms-clip backend             say which mechanism this machine uses
+#
+# Used by the `copy` / `paste` shell commands and by terminal Vim (whose
+# "+ register often has no clipboard behind it: WSL, Debian's vim, macOS'
+# /usr/bin/vim). Picks the first that fits:
+#   ssh    an SSH session without X forwarding: OSC 52, an escape sequence
+#          the local terminal (Windows Terminal, iTerm2, kitty, ...) turns
+#          into a copy on the machine you sit at. Paste is not possible
+#          that way: use the terminal's own paste.
+#   mac    pbcopy / pbpaste
+#   wsl    win32yank.exe when installed, otherwise clip.exe (fed UTF-16 so
+#          accents survive) and PowerShell's Get-Clipboard
+#   wayland  wl-copy / wl-paste       x11  xclip or xsel
+# A copy of a single line drops its trailing newline, so `pwd | copy` pastes
+# as the bare path.
+# OLECHARMS_CLIP_FILE=<path> swaps the clipboard for a file (tests);
+# OLECHARMS_CLIP_BACKEND=<name> forces one of the above (or none).
+# Plain POSIX sh: runs under dash, bash 3.2 and macOS /bin/sh.
+
+die() { echo "olecharms-clip: $*" >&2; exit 1; }
+
+is_wsl() {
+    [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+backend() {
+    if [ -n "${OLECHARMS_CLIP_FILE:-}" ]; then echo file; return; fi
+    # Forced (tests, or a machine where the guess is wrong)
+    if [ -n "${OLECHARMS_CLIP_BACKEND:-}" ]; then echo "$OLECHARMS_CLIP_BACKEND"; return; fi
+    # Over SSH the clipboard that matters is the local one, not the server's
+    if [ -n "${SSH_CONNECTION:-}${SSH_TTY:-}" ] && [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+        echo ssh; return
+    fi
+    if [ "$(uname -s 2>/dev/null)" = Darwin ] && have pbcopy; then echo mac; return; fi
+    if is_wsl && { have win32yank.exe || have clip.exe; }; then echo wsl; return; fi
+    if [ -n "${WAYLAND_DISPLAY:-}" ] && have wl-copy; then echo wayland; return; fi
+    if [ -n "${DISPLAY:-}" ] && have xclip; then echo x11; return; fi
+    if [ -n "${DISPLAY:-}" ] && have xsel; then echo x11; return; fi
+    # tmux without SSH (e.g. a local console): still a terminal that may honour OSC 52
+    if [ -n "${TMUX:-}" ]; then echo ssh; return; fi
+    echo none
+}
+
+# OSC 52 to the controlling terminal; tmux needs it wrapped (and
+# allow-passthrough on, tmux >= 3.3), GNU screen likewise.
+osc52_copy() {
+    b64=$(base64 < "$1" | tr -d '\n') || die "base64 failed"
+    [ "${#b64}" -le 100000 ] || echo "olecharms-clip: large copy (${#b64} bytes encoded); some terminals cut it short" >&2
+    if [ -n "${TMUX:-}" ]; then
+        seq=$(printf '\033Ptmux;\033\033]52;c;%s\007\033\\' "$b64")
+    elif [ "${TERM#screen}" != "$TERM" ]; then
+        seq=$(printf '\033P\033]52;c;%s\007\033\\' "$b64")
+    else
+        seq=$(printf '\033]52;c;%s\007' "$b64")
+    fi
+    { printf '%s' "$seq" > /dev/tty; } 2>/dev/null || die "no terminal to send the copy to (/dev/tty)"
+}
+
+do_copy() {
+    tmp=$(mktemp "${TMPDIR:-/tmp}/olecharms-clip.XXXXXX") || die "mktemp failed"
+    trap 'rm -f "$tmp"' EXIT
+    cat > "$tmp" || die "could not read the text to copy"
+    # One line with its newline: drop the newline
+    if [ "$(wc -l < "$tmp" | tr -d ' ')" = 1 ] && [ "$(tail -c 1 "$tmp" | od -An -c | tr -d ' ')" = '\n' ]; then
+        line=$(cat "$tmp")
+        printf '%s' "$line" > "$tmp"
+    fi
+    case "$(backend)" in
+        file)    cp "$tmp" "$OLECHARMS_CLIP_FILE" ;;
+        ssh)     osc52_copy "$tmp" ;;
+        mac)     LC_CTYPE=UTF-8 pbcopy < "$tmp" ;;
+        wsl)
+            if have win32yank.exe; then
+                win32yank.exe -i --crlf < "$tmp"
+            else
+                # clip.exe reads the console code page unless given UTF-16
+                iconv -f UTF-8 -t UTF-16LE < "$tmp" | clip.exe
+            fi ;;
+        wayland) wl-copy < "$tmp" ;;
+        x11)
+            if have xclip; then xclip -selection clipboard -in < "$tmp" >/dev/null 2>&1
+            else xsel --clipboard --input < "$tmp"; fi ;;
+        *)       die "no clipboard here: install xclip or wl-clipboard (desktop Linux), or connect over SSH from a terminal with OSC 52" ;;
+    esac || die "copy failed ($(backend))"
+}
+
+do_paste() {
+    case "$(backend)" in
+        file)    cat "$OLECHARMS_CLIP_FILE" 2>/dev/null ;;
+        ssh)     die "cannot read your local clipboard over SSH: paste with the terminal (Ctrl+Shift+V or right-click)" ;;
+        mac)     LC_CTYPE=UTF-8 pbpaste ;;
+        wsl)
+            if have win32yank.exe; then
+                win32yank.exe -o --lf
+            else
+                have powershell.exe || die "powershell.exe not found"
+                tmp=$(mktemp "${TMPDIR:-/tmp}/olecharms-clip.XXXXXX") || die "mktemp failed"
+                trap 'rm -f "$tmp"' EXIT
+                powershell.exe -NoProfile -NonInteractive -Command \
+                    '[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-Clipboard -Raw' > "$tmp" 2>/dev/null ||
+                    die "could not read the Windows clipboard"
+                # PowerShell ends its output with a CRLF of its own: drop the
+                # CRs, then the last newline
+                tr -d '\r' < "$tmp" | awk 'NR > 1 { print prev } { prev = $0 } END { if (NR) printf "%s", prev }'
+            fi ;;
+        wayland) wl-paste --no-newline ;;
+        x11)
+            if have xclip; then xclip -selection clipboard -out
+            else xsel --clipboard --output; fi ;;
+        *)       die "no clipboard here: install xclip or wl-clipboard (desktop Linux)" ;;
+    esac
+}
+
+case "${1:-}" in
+    copy)    do_copy ;;
+    paste)   do_paste ;;
+    backend) backend ;;
+    *)       echo "usage: olecharms-clip copy|paste|backend" >&2; exit 2 ;;
+esac

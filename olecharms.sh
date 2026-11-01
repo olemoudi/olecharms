@@ -56,6 +56,17 @@ ALIAS_MARKER="# olecharms managed aliases - edit with 'olecharms alias'"
 # Global aliases live in the repo, so every machine gets them on update.
 # Loaded before the per-machine file, which therefore wins on a shared name.
 GLOBAL_ALIAS_FILE="$SCRIPT_DIR/global-aliases.sh"
+# Settings shared by every machine (olecharms config → Shared settings)
+SHARED_CONFIG_FILE="$SCRIPT_DIR/shared-config"
+# API keys and tokens kept out of the RC files (olecharms secret)
+SECRETS_FILE="$OLECHARMS_CONFIG_DIR/secrets"
+# zsh plugins olecharms keeps (olecharms config → Zsh extras); fzf comes
+# from the package lists
+ZSH_EXTRAS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/olecharms/zsh-plugins"
+ZSH_EXTRA_PLUGINS=(
+    "zsh-autosuggestions|https://github.com/zsh-users/zsh-autosuggestions.git"
+    "zsh-syntax-highlighting|https://github.com/zsh-users/zsh-syntax-highlighting.git"
+)
 # Per-machine package/plugin additions, sourced after the tracked packages.conf
 # so local changes never collide with a self-update's git pull.
 LOCAL_CONF_FILE="$OLECHARMS_CONFIG_DIR/packages.local.conf"
@@ -79,10 +90,12 @@ DOCTOR_PROBLEMS="$OLECHARMS_STATE_DIR/doctor.problems"
 DOCTOR_INTERVAL=86400
 # Time and commit of the last successful pull of the checkout
 LAST_PULL_FILE="$OLECHARMS_STATE_DIR/last-pull"
+# Fingerprint of shared-config when this machine last went through it
+SHARED_SEEN_FILE="$OLECHARMS_STATE_DIR/shared-seen"
 # Plugins olecharms cloned, so dropping one from packages.conf retires it
 MANAGED_PLUGINS_FILE="$OLECHARMS_STATE_DIR/managed-plugins"
 # Stamped into every generated script; `doctor` flags older ones.
-GENERATOR_VERSION=4
+GENERATOR_VERSION=5
 GENERATOR_STAMP="# olecharms-generator:"
 # Marks the plugin copies olecharms owns inside Windows' vimfiles\bundle
 WIN_MANAGED_STAMP=".olecharms-managed"
@@ -805,6 +818,9 @@ generate_shell_loader() {
         echo "_olecharms_alias_file=$(printf '%q' "$ALIAS_FILE")"
         echo "_olecharms_global_alias_file=$(printf '%q' "$GLOBAL_ALIAS_FILE")"
         echo "_olecharms_bin=$(printf '%q' "$SCRIPT_PATH")"
+        echo "_olecharms_secrets=$(printf '%q' "$SECRETS_FILE")"
+        echo "_olecharms_zsh_extras=$(printf '%q' "$(config_get zsh_extras on)")"
+        echo "_olecharms_zsh_plugins=$(printf '%q' "$ZSH_EXTRAS_DIR")"
         cat <<'LOADER_EOF'
 _olecharms_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
@@ -850,6 +866,55 @@ if ! command -v j >/dev/null 2>&1; then
     fi
     unset _olecharms_aj _olecharms_f
 fi
+
+# Secrets (olecharms secret): API keys and tokens kept out of the RC files,
+# in a file only you can read. Not loaded if someone else owns it.
+if [ -f "$_olecharms_secrets" ] && [ -O "$_olecharms_secrets" ]; then
+    . "$_olecharms_secrets"
+fi
+
+# Zsh extras (olecharms config → Zsh extras), interactive shells only: fzf's
+# keys in bash and zsh (Ctrl-R history, Ctrl-T file paths, Alt-C folders),
+# and in zsh, suggestions as you type plus syntax colours — that one last,
+# as zsh-syntax-highlighting asks. Each is skipped if already loaded (e.g.
+# by an oh-my-zsh plugin).
+case $- in *i*) _olecharms_i=1 ;; *) _olecharms_i="" ;; esac
+if [ "$_olecharms_zsh_extras" = on ] && [ -n "$_olecharms_i" ]; then
+    _olecharms_sh=""
+    if [ -n "${ZSH_VERSION:-}" ]; then _olecharms_sh=zsh
+    elif [ -n "${BASH_VERSION:-}" ]; then _olecharms_sh=bash
+    fi
+    if [ -n "$_olecharms_sh" ] && command -v fzf >/dev/null 2>&1 &&
+       ! type fzf-history-widget >/dev/null 2>&1 && ! type __fzf_history__ >/dev/null 2>&1; then
+        # fzf >= 0.48 prints its own setup; older ones ship the scripts
+        if _olecharms_f=$(fzf --$_olecharms_sh 2>/dev/null) && [ -n "$_olecharms_f" ]; then
+            eval "$_olecharms_f"
+        else
+            for _olecharms_f in /usr/share/doc/fzf/examples /usr/share/fzf /usr/share/fzf/shell \
+                                /opt/homebrew/opt/fzf/shell /usr/local/opt/fzf/shell "$HOME/.fzf/shell"; do
+                if [ -f "$_olecharms_f/key-bindings.$_olecharms_sh" ]; then
+                    . "$_olecharms_f/key-bindings.$_olecharms_sh"
+                    [ -f "$_olecharms_f/completion.$_olecharms_sh" ] && . "$_olecharms_f/completion.$_olecharms_sh"
+                    break
+                fi
+            done
+        fi
+    fi
+    if [ "$_olecharms_sh" = zsh ]; then
+        _olecharms_f="$_olecharms_zsh_plugins/zsh-autosuggestions/zsh-autosuggestions.zsh"
+        if [ -f "$_olecharms_f" ] && ! type _zsh_autosuggest_start >/dev/null 2>&1; then
+            # History alone is thin when history is not saved: completions too
+            ZSH_AUTOSUGGEST_STRATEGY=(history completion)
+            . "$_olecharms_f"
+        fi
+        _olecharms_f="$_olecharms_zsh_plugins/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh"
+        if [ -f "$_olecharms_f" ] && [ -z "${ZSH_HIGHLIGHT_VERSION:-}" ]; then
+            . "$_olecharms_f"
+        fi
+    fi
+    unset _olecharms_sh _olecharms_f
+fi
+unset _olecharms_i
 
 # Drop the aliases loaded last time, then load the current set: global ones
 # (in the repo, shared by every machine) first, so per-machine ones win. Run at
@@ -936,7 +1001,16 @@ olecharms() {
     _olecharms_rc=$?
     [ -n "$_olecharms_snap" ] && rm -rf "$_olecharms_snap"
     case "${1:-}" in
-        alias|aliaslast|update|sync) _olecharms_reload_aliases ;;
+        alias|aliaslast|update|sync|doctor) _olecharms_reload_aliases ;;
+        secret)
+            # Make the change visible in this shell too
+            if [ $_olecharms_rc -eq 0 ]; then
+                case "${2:-}" in
+                    rm|remove|delete) [ -n "${3:-}" ] && unset "$3" 2>/dev/null ;;
+                esac
+                [ -f "$_olecharms_secrets" ] && [ -O "$_olecharms_secrets" ] && . "$_olecharms_secrets"
+            fi
+            ;;
         install)
             if [ $_olecharms_rc -eq 0 ] && [ -t 0 ] && [ -t 1 ] && command -v zsh >/dev/null 2>&1; then
                 # exec would orphan stopped jobs (a suspended vim with unsaved
@@ -1486,6 +1560,19 @@ pick_item() {
     [ "$n" -gt 0 ] || return 1
     sel=$((n - 1))
 
+    # fzf, when installed: the same list, newest at the cursor, and typing
+    # filters it
+    if [ -t 0 ] && [ -t 2 ] && [ -z "${OLECHARMS_NO_FZF:-}" ] && check_command fzf; then
+        local picked
+        picked=$(for ((i = n - 1; i >= 0; i--)); do printf '%d\t%s\0' "$i" "${PICK_ITEMS[$i]}"; done |
+            fzf --read0 --delimiter="$(printf '\t')" --with-nth=2.. --no-sort --height=40% \
+                --prompt='> ' --header='type to filter · ↑↓ move · Enter select · Esc cancel') || return 1
+        picked=${picked%%$'\t'*}
+        [[ "$picked" =~ ^[0-9]+$ ]] && [ "$picked" -lt "$n" ] || return 1
+        PICK_INDEX=$picked
+        return 0
+    fi
+
     if [ ! -t 0 ] || [ ! -t 2 ]; then
         for i in "${!PICK_ITEMS[@]}"; do
             printf '  %3d) %s\n' $((i + 1)) "${PICK_ITEMS[$i]}" >&2
@@ -1794,11 +1881,18 @@ global_alias_publish() {
     return 2
 }
 
-# Commit just the global alias file
+# Commit just the published file: the global alias file, or the one a
+# caller names in GLOBAL_PUBLISH_FILE (shared settings)
 global_alias_commit() {
-    if ! git -C "$SCRIPT_DIR" add -- "$GLOBAL_ALIAS_FILE" ||
-       ! git -C "$SCRIPT_DIR" commit -q -m "$1" -- "$GLOBAL_ALIAS_FILE"; then
-        error "Could not commit $GLOBAL_ALIAS_FILE; the change is only on this machine"
+    local file="${GLOBAL_PUBLISH_FILE:-$GLOBAL_ALIAS_FILE}"
+    if ! git -C "$SCRIPT_DIR" add -- "$file"; then
+        error "Could not commit $file; the change is only on this machine"
+        return 1
+    fi
+    # Same content as already committed (e.g. sharing unchanged settings)
+    git -C "$SCRIPT_DIR" diff --cached --quiet HEAD -- "$file" 2>/dev/null && return 0
+    if ! git -C "$SCRIPT_DIR" commit -q -m "$1" -- "$file"; then
+        error "Could not commit $file; the change is only on this machine"
         return 1
     fi
 }
@@ -1817,6 +1911,266 @@ alias_save_global() {
     fi
     alias_activation_note
     return "$rc"
+}
+
+# ─── Shared settings: the same preferences on every machine ─────────────────
+# shared-config in the checkout holds the settings you chose to share; it
+# travels like global-aliases.sh (committed, pushed, pulled by every machine).
+# A machine never applies them on its own: settings that delete things show
+# their preview and ask, exactly as in `olecharms config`. New machines are
+# offered them at install; others after a sync/update brings a change, and
+# `olecharms doctor` lists differences. A setting can be kept different on
+# one machine (shared_keep_local), and is then left out of the comparison.
+
+# Shareable keys, in the order they are applied (age and action before
+# enabling the cleanup, whose preview uses them). Folders, scheduling method
+# and Windows integration stay per machine.
+SHARED_KEYS="downloads_cleanup_max_age_days downloads_cleanup_action downloads_cleanup_quarantine_days downloads_cleanup_enabled paranoid_mode_enabled daily_doctor zsh_extras"
+
+# Value of key $1 in the shared file ("" when unset or no file)
+shared_get() {
+    [ -f "$SHARED_CONFIG_FILE" ] || return 0
+    sed -n "s/^$1=//p" "$SHARED_CONFIG_FILE" | tail -n 1
+}
+
+# This machine's value for shareable key $1, defaults filled in
+shared_local_value() {
+    case "$1" in
+        downloads_cleanup_enabled)         config_get downloads_cleanup_enabled false ;;
+        downloads_cleanup_max_age_days)    config_get downloads_cleanup_max_age_days "$DOWNLOADS_MAX_AGE_DAYS" ;;
+        downloads_cleanup_action)          config_get downloads_cleanup_action auto ;;
+        downloads_cleanup_quarantine_days) config_get downloads_cleanup_quarantine_days "$CLEANUP_QUARANTINE_DAYS" ;;
+        paranoid_mode_enabled)             config_get paranoid_mode_enabled false ;;
+        daily_doctor)                      config_get daily_doctor on ;;
+        zsh_extras)                        config_get zsh_extras on ;;
+    esac
+}
+
+# Human wording of key $1 with value $2
+shared_describe() {
+    case "$1=$2" in
+        downloads_cleanup_enabled=true)  echo "downloads auto-cleanup on" ;;
+        downloads_cleanup_enabled=*)     echo "downloads auto-cleanup off" ;;
+        downloads_cleanup_max_age_days=*) echo "downloads kept $2 days" ;;
+        downloads_cleanup_action=*)      echo "cleanup action $2" ;;
+        downloads_cleanup_quarantine_days=*) echo "quarantine kept $2 days" ;;
+        paranoid_mode_enabled=true)      echo "paranoid mode on" ;;
+        paranoid_mode_enabled=*)         echo "paranoid mode off" ;;
+        daily_doctor=on)                 echo "daily health check on" ;;
+        daily_doctor=*)                  echo "daily health check off" ;;
+        zsh_extras=on)                   echo "zsh extras on" ;;
+        zsh_extras=*)                    echo "zsh extras off" ;;
+        *)                               echo "$1=$2" ;;
+    esac
+}
+
+shared_kept_local() {
+    case " $(config_get shared_keep_local "") " in
+        *" $1 "*) return 0 ;;
+    esac
+    return 1
+}
+
+# Shareable keys where this machine differs from the shared file (and has
+# not chosen to differ), one per line. The age and action of a cleanup that
+# is off on both sides make no difference and are not listed.
+shared_differences() {
+    local key want have
+    [ -f "$SHARED_CONFIG_FILE" ] || return 0
+    for key in $SHARED_KEYS; do
+        want=$(shared_get "$key")
+        [ -n "$want" ] || continue
+        shared_kept_local "$key" && continue
+        have=$(shared_local_value "$key")
+        [ "$want" = "$have" ] && continue
+        case "$key" in
+            downloads_cleanup_max_age_days|downloads_cleanup_action|downloads_cleanup_quarantine_days)
+                [ "$(shared_get downloads_cleanup_enabled)" != true ] &&
+                    [ "$(shared_local_value downloads_cleanup_enabled)" != true ] && continue ;;
+        esac
+        echo "$key"
+    done
+}
+
+# One line: "here X → shared Y; ..." for the doctor and notices
+shared_differences_summary() {
+    local key out=""
+    while IFS= read -r key; do
+        [ -n "$key" ] || continue
+        out="$out${out:+; }$(shared_describe "$key" "$(shared_local_value "$key")") here, $(shared_describe "$key" "$(shared_get "$key")") shared"
+    done <<< "$(shared_differences)"
+    printf '%s\n' "$out"
+}
+
+# The shared file from this machine's values
+shared_write() {
+    local key tmp
+    tmp=$(mktemp) || return 1
+    {
+        echo "# olecharms shared settings — written by 'olecharms config' → Shared settings."
+        echo "# Every machine is offered these (it asks before anything that deletes files)."
+        for key in $SHARED_KEYS; do
+            printf '%s=%s\n' "$key" "$(shared_local_value "$key")"
+        done
+    } > "$tmp"
+    mv "$tmp" "$SHARED_CONFIG_FILE"
+}
+
+# Publish this machine's settings for every machine
+shared_publish() {
+    local GLOBAL_PUBLISH_FILE="$SHARED_CONFIG_FILE" key rc
+    echo "  These settings of this machine will be shared:"
+    for key in $SHARED_KEYS; do
+        echo "    - $(shared_describe "$key" "$(shared_local_value "$key")")"
+    done
+    echo "  (folders, scheduling and Windows integration stay per machine)"
+    echo ""
+    confirm_default_yes "  Share them with all your machines?" || { info "Not shared"; return 0; }
+    global_alias_publish "Update shared settings" shared_write
+    rc=$?
+    case "$rc" in
+        0) info "Shared: your other machines are offered these settings after their next update"
+           shared_mark_seen ;;
+        2) warn "Saved in $SHARED_CONFIG_FILE but not published yet" ;;
+    esac
+    return "$rc"
+}
+
+shared_fingerprint() {
+    [ -f "$SHARED_CONFIG_FILE" ] && cksum < "$SHARED_CONFIG_FILE" | cut -d' ' -f1
+}
+
+shared_mark_seen() {
+    mkdir -p "$OLECHARMS_STATE_DIR" 2>/dev/null
+    shared_fingerprint > "$SHARED_SEEN_FILE" 2>/dev/null
+}
+
+# Go through the differences and ask about each one, applying it the way
+# `olecharms config` does (with previews for anything that deletes files)
+shared_apply() {
+    local key want have answer changed=""
+    if [ -z "$(shared_differences)" ]; then
+        info "This machine already follows your shared settings"
+        shared_mark_seen
+        return 0
+    fi
+    if [ ! -t 0 ]; then
+        echo "  Your shared settings differ here: $(shared_differences_summary)"
+        echo "  Apply them in a terminal: olecharms config → Shared settings"
+        return 0
+    fi
+    # A plain list, not a loop reading a pipe: the steps below ask on stdin
+    for key in $(shared_differences); do
+        want=$(shared_get "$key")
+        have=$(shared_local_value "$key")
+        echo ""
+        echo -e "  ${BOLD}$(shared_describe "$key" "$want")${NC} (shared)  —  here: $(shared_describe "$key" "$have")"
+        read -rp "  Apply here? [y]es / [n]ot now / [k]eep this machine different: " answer || answer=n
+        case "$answer" in
+            [yYsS]*) ;;
+            [kK]*)
+                config_set shared_keep_local "$(config_get shared_keep_local "") $key"
+                info "Kept as it is on this machine (olecharms config → Shared settings to follow them again)"
+                continue ;;
+            *) info "Left as it is for now"; continue ;;
+        esac
+        case "$key" in
+            downloads_cleanup_max_age_days)
+                if is_downloads_cleanup_enabled; then
+                    config_cleanup_age "$want"
+                else
+                    config_set "$key" "$want"
+                fi ;;
+            downloads_cleanup_action)
+                if [ "$want" = trash ] && ! cleanup_trash_backend "$(cleanup_real_dir "$(config_get downloads_cleanup_dir)" 2>/dev/null)" >/dev/null 2>&1 &&
+                   is_downloads_cleanup_enabled; then
+                    warn "No trash for the downloads folder here; keeping '$have'"
+                    continue
+                fi
+                config_set "$key" "$want"
+                info "Cleanup action: $want" ;;
+            downloads_cleanup_quarantine_days)
+                config_set "$key" "$want"
+                info "Quarantine kept $want days" ;;
+            downloads_cleanup_enabled)
+                if [ "$want" = true ]; then
+                    config_downloads_cleanup
+                else
+                    disable_downloads_cleanup
+                fi ;;
+            paranoid_mode_enabled)
+                if [ "$want" = true ]; then
+                    config_paranoid_mode
+                else
+                    disable_paranoid_mode
+                fi ;;
+            daily_doctor)
+                config_set daily_doctor "$want"
+                generate_doctor_launcher
+                sync_shell_hook
+                info "Daily health check $want" ;;
+            zsh_extras)
+                config_set zsh_extras "$want"
+                [ "$want" = on ] && install_zsh_extras
+                install_shell_commands >/dev/null
+                info "Zsh extras $want (new shells)" ;;
+        esac
+        changed=1
+    done
+    shared_mark_seen
+    [ -n "$changed" ] && info "Done. 'olecharms doctor' shows how this machine stands."
+    return 0
+}
+
+# After a sync or update: offer the shared settings when they changed since
+# this machine last looked (a terminal is needed to ask)
+shared_offer_after_pull() {
+    [ -f "$SHARED_CONFIG_FILE" ] || return 0
+    [ "$(cat "$SHARED_SEEN_FILE" 2>/dev/null)" = "$(shared_fingerprint)" ] && return 0
+    if [ -z "$(shared_differences)" ]; then
+        shared_mark_seen
+        return 0
+    fi
+    echo ""
+    info "Your shared settings (from your other machines) differ here: $(shared_differences_summary)"
+    if [ -t 0 ] && [ -t 1 ]; then
+        shared_apply
+    else
+        echo "  Apply them with: olecharms config → Shared settings"
+    fi
+}
+
+config_shared_settings() {
+    local diffs choice key kept
+    diffs=$(shared_differences)
+    kept=$(config_get shared_keep_local "")
+    if [ ! -f "$SHARED_CONFIG_FILE" ]; then
+        echo "  Nothing shared yet: your machines each keep their own settings."
+    elif [ -z "$diffs" ]; then
+        echo -e "  This machine ${GREEN}follows${NC} your shared settings."
+    else
+        echo -e "  This machine ${YELLOW}differs${NC}: $(shared_differences_summary)"
+    fi
+    [ -n "${kept// /}" ] && echo "  Kept different here on purpose: $(for key in $kept; do shared_describe "$key" "$(shared_local_value "$key")"; done | paste -sd, - | sed 's/,/, /g')"
+    echo ""
+    echo "    1) Share this machine's settings with all machines"
+    [ -n "$diffs" ] && echo "    2) Apply the shared settings here"
+    [ -n "${kept// /}" ] && echo "    3) Follow the shared settings again for the ones kept different"
+    echo ""
+    echo "    0) Back"
+    echo ""
+    read -rp "  Select: " choice
+    case "$choice" in
+        1) echo ""; shared_publish ;;
+        2) [ -n "$diffs" ] && shared_apply ;;
+        3)
+            if [ -n "${kept// /}" ]; then
+                config_set shared_keep_local ""
+                info "Following all shared settings again"
+                shared_apply
+            fi ;;
+        *) info "No changes made" ;;
+    esac
 }
 
 # ─── Downloads Cleanup Engine ───────────────────────────────────────────────
@@ -3644,6 +3998,61 @@ parent_is_zsh() {
 }
 
 # The steps shared by install and update, in order
+# ─── Zsh extras ─────────────────────────────────────────────────────────────
+
+# Clone or fast-forward one zsh plugin into ZSH_EXTRAS_DIR. Never deletes:
+# a folder there that is not a git checkout is left alone.
+zsh_extra_fetch() {
+    local name="$1" url="$2" dest="$ZSH_EXTRAS_DIR/$1"
+    case "$name" in ""|*/*|.*) error "Bad plugin name: $name"; return 1 ;; esac
+    if [ -d "$dest/.git" ]; then
+        _git_net -C "$dest" pull -q --ff-only 2>/dev/null || warn "Could not update $name (offline?)"
+        return 0
+    fi
+    if [ -e "$dest" ]; then
+        warn "$dest exists but is not a git checkout; leaving it as it is"
+        return 1
+    fi
+    info "Installing $name..."
+    _git_net clone -q --depth 1 "$url" "$dest" 2>/dev/null || {
+        rm -rf -- "${dest:?}" 2>/dev/null
+        warn "Could not install $name (offline?); the next update tries again"
+        return 1
+    }
+}
+
+install_zsh_extras() {
+    [ "$(config_get zsh_extras on)" = off ] && return 0
+    mkdir -p "$ZSH_EXTRAS_DIR" || { error "Could not create $ZSH_EXTRAS_DIR"; return 1; }
+    local entry
+    for entry in "${ZSH_EXTRA_PLUGINS[@]}"; do
+        zsh_extra_fetch "${entry%%|*}" "${entry#*|}"
+    done
+    check_command fzf || warn "fzf is not installed yet: it comes from the package lists (packages.conf)"
+    return 0
+}
+
+config_zsh_extras() {
+    echo "  Zsh extras, for new shells:"
+    echo "    - fzf (bash and zsh): Ctrl-R searches your history, Ctrl-T inserts a file path,"
+    echo "      Alt-C jumps into a folder; in aliaslast you can type to filter"
+    echo "    - zsh: grey suggestions as you type (→ accepts one) and colours: a command"
+    echo "      that does not exist turns red before you press Enter"
+    echo ""
+    if [ "$(config_get zsh_extras on)" = on ]; then
+        confirm_default_no "  They are on. Turn them off?" || { info "No changes made"; return 0; }
+        config_set zsh_extras off
+        install_shell_commands >/dev/null
+        info "Zsh extras off from the next shell"
+    else
+        confirm_default_yes "  They are off. Turn them on?" || { info "No changes made"; return 0; }
+        config_set zsh_extras on
+        install_zsh_extras
+        install_shell_commands >/dev/null
+        info "Zsh extras on from the next shell$(check_command fzf || echo "; fzf arrives with the next 'olecharms update'")"
+    fi
+}
+
 run_setup_steps() {
     ensure_local_conf_template
     install_packages
@@ -3653,6 +4062,7 @@ run_setup_steps() {
     install_vimrc
     install_fonts
     install_omz
+    install_zsh_extras
     run_post_commands
     install_shell_commands
     install_binary
@@ -3678,6 +4088,8 @@ cmd_install() {
     else
         warn "Install complete with $ERROR_COUNT error(s). Review output above."
     fi
+    # A new machine: offer the settings shared from the others
+    shared_offer_after_pull
 
     # Show the result in a zsh — only with a terminal, otherwise this hangs
     # scripted/CI runs and hides the exit status. Never nest one shell inside
@@ -3719,6 +4131,7 @@ cmd_update() {
     if [ "$(shell_config_snapshot)" != "$before" ]; then
         info "Shell configuration changed — run 'exec zsh' (or open a new terminal) to load it."
     fi
+    shared_offer_after_pull
 }
 
 # ─── Doctor ─────────────────────────────────────────────────────────────────
@@ -3729,8 +4142,69 @@ DOC_FAIL=0
 doc_ok()      { echo -e "  ${GREEN}✓${NC} $*"; DOC_OK=$((DOC_OK + 1)); }
 doc_warn()    { echo -e "  ${YELLOW}~${NC} $*"; DOC_WARN=$((DOC_WARN + 1)); }
 doc_fail()    { echo -e "  ${RED}✗${NC} $*"; DOC_FAIL=$((DOC_FAIL + 1)); [ -n "$DOC_FIRST_FAIL" ] || DOC_FIRST_FAIL="$*"; }
-doc_hint()    { echo -e "      ${BLUE}→${NC} $*"; }
+doc_hint() {
+    echo -e "      ${BLUE}→${NC} $*"
+    # Network steps that `doctor --fix` can run at the end, after asking
+    case "$*" in
+        "olecharms update"*) DOC_WANTS_UPDATE=1 ;;
+        "olecharms sync"*)   DOC_WANTS_SYNC=1 ;;
+    esac
+}
 doc_section() { echo ""; echo -e "${BLUE}$*:${NC}"; }
+# Why a warning matters, in plain words, between the warning and its hint
+doc_why()     { echo "      $*"; }
+
+# A repair that changes something outside olecharms' own files, so
+# `doctor --fix` asks first: $1 question, $2... the command to run
+DOC_OFFER_Q=()
+DOC_OFFER_CMD=()
+doc_offer() {
+    local q="$1" cmd
+    shift
+    cmd=$(printf '%s\037' "$@")
+    DOC_OFFER_Q+=("$q")
+    DOC_OFFER_CMD+=("${cmd%$'\037'}")
+}
+
+# Ask about each offered repair and run the accepted ones; then offer the
+# network steps (update / sync) that some checks asked for
+doctor_apply_offers() {
+    local i n=${#DOC_OFFER_Q[@]} parts done_any=""
+    if [ ! -t 0 ]; then
+        [ "$n" -gt 0 ] && echo "Some repairs need your OK; run 'olecharms doctor --fix' in a terminal."
+        return 0
+    fi
+    if [ "$n" -gt 0 ] || [ -n "$DOC_WANTS_UPDATE$DOC_WANTS_SYNC" ]; then
+        echo ""
+        echo -e "${BOLD}Repairs that need your OK${NC}"
+    fi
+    for ((i = 0; i < n; i++)); do
+        echo ""
+        if confirm_default_no "${DOC_OFFER_Q[$i]}"; then
+            IFS=$'\037' read -r -a parts <<< "${DOC_OFFER_CMD[$i]}"
+            if "${parts[@]}"; then
+                info "Done"
+                done_any=1
+            else
+                warn "That repair did not complete"
+            fi
+        else
+            echo "  Left as it is."
+        fi
+    done
+    if [ -n "$DOC_WANTS_UPDATE" ]; then
+        echo ""
+        if confirm_default_no "Run 'olecharms update' now (installs the missing packages, plugins and fonts; needs the network)?"; then
+            bash "$SCRIPT_PATH" update && done_any=1
+        fi
+    elif [ -n "$DOC_WANTS_SYNC" ]; then
+        echo ""
+        if confirm_default_no "Run 'olecharms sync' now (fetches the latest olecharms and your global aliases)?"; then
+            bash "$SCRIPT_PATH" sync && done_any=1
+        fi
+    fi
+    [ -n "$done_any" ]
+}
 
 # True if generated file $1 carries the current generator stamp
 generated_current() {
@@ -3819,7 +4293,8 @@ doctor_check_shell() {
     elif generated_current "$SHELL_LOADER"; then
         doc_ok "Shell loader up to date"
     else
-        doc_warn "Shell loader was generated by an older olecharms"
+        doc_warn "The file that loads olecharms into your shell is from an older olecharms version"
+        doc_why "New commands and fixes in it are missing until it is regenerated."
         doc_hint "olecharms doctor --fix"
     fi
     while IFS= read -r rc; do
@@ -3854,14 +4329,115 @@ doctor_check_shell() {
             doc_warn "autojump is installed but no autojump.zsh/autojump.bash was found to activate it"
         fi
     fi
+    doctor_check_clipboard
+    doctor_check_secrets
     sh=$(login_shell)
     case "$sh" in
         *zsh) doc_ok "Login shell is $sh" ;;
         *)
+            local zsh_path
+            zsh_path=$(command -v zsh 2>/dev/null || echo /bin/zsh)
             doc_warn "Login shell is ${sh:-unknown}, not zsh"
-            doc_hint "chsh -s \"$(command -v zsh 2>/dev/null || echo /bin/zsh)\""
+            doc_why "New terminals and SSH logins start ${sh##*/} without the olecharms prompt; you have to type zsh each time."
+            doc_hint "chsh -s \"$zsh_path\"  (olecharms doctor --fix runs it; it asks for your password)"
+            if [ -x "$zsh_path" ] && grep -qxF "$zsh_path" /etc/shells 2>/dev/null && check_command chsh; then
+                doc_offer "Make zsh your login shell (runs: chsh -s $zsh_path, asks for your password)?" chsh -s "$zsh_path"
+            fi
             ;;
     esac
+}
+
+# Lines of ~/.vimrc that are neither olecharms' two lines nor part of any
+# version of olevimrc.vim (old installs pasted a whole copy): the user's own
+vimrc_own_lines() {
+    local known
+    known=$(mktemp) || return 1
+    {
+        cat "$BUNDLED_DIR/olevimrc.vim"
+        if [ -d "$SCRIPT_DIR/.git" ]; then
+            local h
+            for h in $(git -C "$SCRIPT_DIR" log --format=%H -- vimthings/olevimrc.vim 2>/dev/null); do
+                git -C "$SCRIPT_DIR" show "$h:vimthings/olevimrc.vim" 2>/dev/null
+            done
+        fi
+        # The copy older installs (configure.sh) pasted predates this repo
+        cat <<'LEGACY_EOF'
+set undodir=$HOME/vimfiles/undodir
+set directory=$HOME/vimfiles/swapfiles
+map <leader>v :sp $VIMRUNTIME/olevimrc.vim<CR><C-W>_
+map <silent> <leader>V :source $VIMRUNTIME/olevimrc.vim<CR>:filetype detect<CR>:exe ":echo 'vimrc reloaded'"<CR>
+LEGACY_EOF
+    } > "$known"
+    awk -v marker="$SOURCE_MARKER" '
+        function trim(s) { gsub(/^[ \t]+|[ \t\r]+$/, "", s); return s }
+        NR == FNR { known[trim($0)] = 1; next }
+        { line = trim($0) }
+        line == "" || line == marker || line ~ /^source .*\/vimthings\/olevimrc\.vim$/ { next }
+        !(line in known) { print }
+    ' "$known" "$VIMRC"
+    rm -f "$known"
+}
+
+# ~/.vimrc down to olecharms' two lines (the doctor showed any other line)
+vimrc_remove_old_copy() {
+    backup_file "$VIMRC" || return 1
+    # Rewrite in place: keeps the file's permissions
+    printf '%s\n%s\n' "$SOURCE_MARKER" "$SOURCE_LINE" > "$VIMRC" || return 1
+    info "$VIMRC now only loads the olecharms config"
+}
+
+# The clipboard behind `copy` / `paste` and terminal Vim's "+ register
+doctor_check_clipboard() {
+    local clip="$SCRIPT_DIR/bin/olecharms-clip"
+    if [ ! -f "$clip" ]; then
+        doc_fail "Clipboard helper missing ($clip)"
+        doc_hint "olecharms sync"
+        return
+    fi
+    case "$(sh "$clip" backend 2>/dev/null)" in
+        mac)     doc_ok "Clipboard: pbcopy / pbpaste (copy, paste, terminal Vim)" ;;
+        wsl)
+            if check_command win32yank.exe; then
+                doc_ok "Clipboard: Windows clipboard via win32yank.exe (copy, paste, terminal Vim)"
+            else
+                doc_ok "Clipboard: Windows clipboard via clip.exe / PowerShell (paste takes a second or two; win32yank.exe on PATH makes it instant)"
+            fi ;;
+        wayland) doc_ok "Clipboard: wl-copy / wl-paste (copy, paste, terminal Vim)" ;;
+        x11)     doc_ok "Clipboard: X11 via $(check_command xclip && echo xclip || echo xsel) (copy, paste, terminal Vim)" ;;
+        ssh)     doc_ok "Clipboard: over SSH, copies go to your local terminal (OSC 52); paste with the terminal" ;;
+        *)
+            if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+                doc_warn "No clipboard tool: copy, paste and Vim's \"+ register cannot reach the desktop clipboard"
+                doc_hint "Install one: wl-clipboard (Wayland) or xclip (X11), e.g. via $LOCAL_CONF_FILE"
+            else
+                doc_ok "Clipboard: none on this machine (no desktop); over SSH, copy reaches your local terminal"
+            fi ;;
+    esac
+}
+
+# fzf and the zsh plugins (printed under the zsh section)
+doctor_check_zsh_extras() {
+    if [ "$(config_get zsh_extras on)" = off ]; then
+        doc_ok "Zsh extras off (olecharms config → Zsh extras)"
+        return
+    fi
+    if check_command fzf; then
+        doc_ok "fzf $(fzf --version 2>/dev/null | cut -d' ' -f1): Ctrl-R history, Ctrl-T files, Alt-C folders"
+    else
+        doc_warn "fzf is not installed: no Ctrl-R / Ctrl-T / Alt-C search, no type-to-filter in aliaslast"
+        doc_hint "olecharms update"
+    fi
+    local entry name missing=""
+    for entry in "${ZSH_EXTRA_PLUGINS[@]}"; do
+        name=${entry%%|*}
+        [ -f "$ZSH_EXTRAS_DIR/$name/$name.zsh" ] || missing="$missing $name"
+    done
+    if [ -z "$missing" ]; then
+        doc_ok "Suggestions as you type and syntax colours (zsh)"
+    else
+        doc_warn "Not installed:$missing (suggestions / syntax colours in zsh)"
+        doc_hint "olecharms update"
+    fi
 }
 
 doctor_check_vim() {
@@ -3906,8 +4482,22 @@ doctor_check_vim() {
     fi
     # Old installs appended a whole copy of olevimrc.vim to ~/.vimrc
     if [ -f "$VIMRC" ] && grep -qF '" author: @olemoudi' "$VIMRC"; then
-        doc_warn "$VIMRC also holds an old full copy of olevimrc.vim, so the config loads twice"
-        doc_hint "Keep only the two olecharms lines unless you rely on that copy (it enables mswin.vim everywhere)"
+        local own
+        own=$(vimrc_own_lines | grep -c .)
+        doc_warn "$VIMRC still holds an old pasted copy of the olecharms Vim config, so Vim reads it twice"
+        doc_why "The current config is read last and wins, but the copy brings old settings back, e.g. Windows-style"
+        doc_why "keys in terminal Vim (Ctrl-V pastes, Ctrl-A selects all, Ctrl-Z undoes). Without the copy, terminal"
+        doc_why "Vim keeps Vim's own keys; Ctrl-C still copies to the system clipboard and Ctrl-S saves."
+        if [ "$own" -gt 0 ] && [ "$own" -le 10 ]; then
+            doc_why "These $own line(s) are not from any olecharms version; removing the copy removes them too:"
+            vimrc_own_lines | sed 's/^/          /'
+        fi
+        if [ "$own" -le 10 ] && [ ! -L "$VIMRC" ]; then
+            doc_hint "olecharms doctor --fix (removes the copy, keeping a backup)"
+            doc_offer "Remove the old copy from $VIMRC, keeping only the two olecharms lines (a backup is kept)?" vimrc_remove_old_copy
+        else
+            doc_hint "Edit $VIMRC by hand: keep your own lines ($own not from olecharms) and the two olecharms lines at the end"
+        fi
     fi
     # Font files are named with spaces ("DejaVu Sans Mono for Powerline.ttf"),
     # families without ("DejaVuSansMono"): compare with spaces removed.
@@ -3979,7 +4569,7 @@ doctor_check_schedule() {
         fi
     fi
     if [ -f "$script" ] && ! generated_current "$script"; then
-        doc_warn "$(basename "$script") was generated by an older olecharms"
+        doc_warn "$(basename "$script") is from an older olecharms version (it still runs, without the latest fixes)"
         doc_hint "olecharms doctor --fix"
     fi
 }
@@ -4105,6 +4695,84 @@ doctor_check_config() {
     else
         doc_ok "No per-machine overrides (a template is created on the next update)"
     fi
+    if [ ! -f "$SHARED_CONFIG_FILE" ]; then
+        doc_ok "Shared settings: none yet (olecharms config → Shared settings shares this machine's)"
+    elif [ -z "$(shared_differences)" ]; then
+        doc_ok "Follows your shared settings$([ -n "$(config_get shared_keep_local "" | tr -d ' ')" ] && echo " (some kept different here on purpose)")"
+    else
+        doc_warn "This machine differs from your shared settings: $(shared_differences_summary)"
+        doc_why "You chose them on another machine and shared them; this one has not applied them yet."
+        doc_hint "olecharms doctor --fix, or olecharms config → Shared settings"
+        doc_offer "Go through the shared settings now (one question each, with previews before anything is deleted)?" shared_apply
+    fi
+}
+
+# Windows Terminal settings.json, read and written with python3 (it is JSON,
+# and Windows Terminal rewrites it freely). The font matters for the WSL
+# profiles: the defaults, unless a WSL profile sets its own.
+WT_FONT_FACE="DejaVu Sans Mono for Powerline"
+WT_FONT_PY='
+import json, os, sys
+path, mode, face = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(path, encoding="utf-8-sig") as fh:
+        data = json.load(fh)
+except Exception:
+    print("unknown"); sys.exit(0)
+profiles = data.get("profiles")
+if not isinstance(profiles, dict):
+    print("unknown"); sys.exit(0)
+defaults = profiles.get("defaults")
+if not isinstance(defaults, dict):
+    defaults = {}
+def face_of(p, inherited):
+    font = p.get("font")
+    if isinstance(font, dict) and isinstance(font.get("face"), str):
+        return font["face"]
+    if isinstance(p.get("fontFace"), str):
+        return p["fontFace"]
+    return inherited
+distro = os.environ.get("WSL_DISTRO_NAME", "")
+def is_wsl(p):
+    src = str(p.get("source", ""))
+    return src in ("Windows.Terminal.Wsl", "Microsoft.WSL") or \
+        src.startswith("CanonicalGroupLimited.") or \
+        (distro != "" and p.get("name") == distro) or \
+        "wsl" in str(p.get("commandline", "")).lower()
+base = face_of(defaults, "")
+wsl = [p for p in profiles.get("list", []) if isinstance(p, dict) and is_wsl(p)]
+faces = [face_of(p, base) for p in wsl] or [base]
+if mode == "check":
+    print("ok" if all("Powerline" in f for f in faces) else "bad")
+    sys.exit(0)
+defaults.setdefault("font", {})["face"] = face
+defaults.pop("fontFace", None)
+profiles["defaults"] = defaults
+for p in wsl:
+    if "Powerline" not in face_of(p, face):
+        if isinstance(p.get("font"), dict):
+            p["font"]["face"] = face
+        p.pop("fontFace", None)
+tmp = path + ".olecharms-tmp"
+with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+    json.dump(data, fh, indent=4, ensure_ascii=False)
+    fh.write("\n")
+os.replace(tmp, path)
+print("ok")
+'
+
+# ok / bad / unknown (no python3, or a file it cannot read)
+wt_font_state() {
+    check_command python3 || { echo unknown; return; }
+    python3 -c "$WT_FONT_PY" "$1" check "$WT_FONT_FACE" 2>/dev/null || echo unknown
+}
+
+wt_set_font() {
+    local wt="$1"
+    check_command python3 || { error "python3 is needed to edit $wt"; return 1; }
+    backup_file "$wt" || return 1
+    [ "$(python3 -c "$WT_FONT_PY" "$wt" set "$WT_FONT_FACE")" = ok ] || return 1
+    info "Windows Terminal picks the new font up straight away (no restart needed)"
 }
 
 doctor_check_windows() {
@@ -4132,12 +4800,25 @@ doctor_check_windows() {
     fi
     for wt in "$WIN_LOCALAPPDATA"/Packages/Microsoft.WindowsTerminal*/LocalState/settings.json; do
         [ -f "$wt" ] || continue
-        if grep -q '"face"[^,}]*Powerline' "$wt"; then
-            doc_ok "Windows Terminal uses a Powerline font"
-        else
-            doc_warn "Windows Terminal does not use a Powerline font (vim-airline symbols may not render)"
-            doc_hint "Windows Terminal → Settings → Profiles → Defaults → Appearance → Font face: DejaVu Sans Mono for Powerline"
-        fi
+        case "$(wt_font_state "$wt")" in
+            ok)  doc_ok "Windows Terminal uses a Powerline font for WSL" ;;
+            bad)
+                doc_warn "Windows Terminal does not use a Powerline font for WSL"
+                doc_why "Vim's status bar (vim-airline) then shows boxes or question marks instead of its arrow symbols."
+                if [ -z "$missing" ]; then
+                    doc_hint "olecharms doctor --fix (sets \"$WT_FONT_FACE\" in its settings, keeping a backup)"
+                    doc_offer "Set Windows Terminal's font to \"$WT_FONT_FACE\" (default for all profiles; a backup is kept)?" wt_set_font "$wt"
+                else
+                    doc_hint "olecharms windows (installs the font), then olecharms doctor --fix"
+                fi ;;
+            *)
+                if grep -q '"face"[^,}]*Powerline' "$wt"; then
+                    doc_ok "Windows Terminal uses a Powerline font"
+                else
+                    doc_warn "Windows Terminal does not use a Powerline font (vim-airline symbols may not render)"
+                    doc_hint "Windows Terminal → Settings → Profiles → Defaults → Appearance → Font face: $WT_FONT_FACE"
+                fi ;;
+        esac
         break
     done
 
@@ -4216,39 +4897,127 @@ doctor_check_checkout() {
     fi
     stashes=$(git -C "$SCRIPT_DIR" stash list 2>/dev/null | wc -l | tr -d ' ')
     if [ "$stashes" -gt 0 ]; then
-        doc_warn "git stash holds $stashes entr$([ "$stashes" -gt 1 ] && echo ies || echo y) — local changes an update set aside?"
-        doc_hint "git -C \"$SCRIPT_DIR\" stash list"
+        doc_warn "git stash holds $stashes entr$([ "$stashes" -gt 1 ] && echo ies || echo y) in the olecharms checkout"
+        doc_why "Usually edits to olecharms' own files that an update set aside to be able to pull. They are not lost."
+        doc_hint "See them: git -C \"$SCRIPT_DIR\" stash show -p   Throw them away: git -C \"$SCRIPT_DIR\" stash drop"
     fi
     if [ -f "$LAST_PULL_FILE" ] && last=$(cut -d' ' -f1 "$LAST_PULL_FILE") && [[ "$last" =~ ^[0-9]+$ ]]; then
         age=$(( ($(date +%s) - last) / 86400 ))
         if [ "$age" -gt 30 ]; then
             doc_warn "Last successful update $age days ago"
+            doc_why "olecharms updates itself when you open a shell; here it has not managed to for a while (offline? the checks above say why)."
             doc_hint "olecharms sync"
         else
             doc_ok "Last successful update $age day(s) ago"
         fi
     else
         doc_warn "No successful update recorded yet"
+        doc_why "olecharms updates itself from GitHub when you open a shell; none has completed on this machine so far."
         doc_hint "olecharms sync"
     fi
-    # A credential helper that no longer exists makes every push fail
-    while IFS= read -r helper; do
-        [ -n "$helper" ] || continue
-        case "$helper" in
-            /*)  p=${helper//\\ /$'\001'}; p=${p%% *}; p=${p//$'\001'/ } ;;
-            !*)  p=${helper#!}; p=${p%% *}; p=$(command -v "$p" 2>/dev/null) || p="${helper#!}" ;;
-            *)   name=${helper%% *}; p=$(command -v "git-credential-$name" 2>/dev/null) ||
-                     p="$(git --exec-path 2>/dev/null)/git-credential-$name" ;;
+    doctor_check_git_helpers "$branch"
+}
+
+# Executable a git credential helper value runs ("" when it is a shell
+# snippet or otherwise cannot be told)
+git_helper_path() {
+    local helper="$1" p name
+    case "$helper" in
+        /*) p=${helper//\\ /$'\001'}; p=${p%% *}; p=${p//$'\001'/ } ;;
+        !/*) p=${helper#!}; p=${p%% *} ;;
+        !\"/*) p=${helper#!\"}; p=${p%%\"*} ;;
+        !*)
+            name=${helper#!}; name=${name%% *}
+            case "$name" in
+                *[!A-Za-z0-9._-]*) p="" ;;   # f() { ...; }; f and the like
+                *) p=$(command -v "$name" 2>/dev/null) || p="(command not found) $name" ;;
+            esac ;;
+        *)  name=${helper%% *}
+            p=$(command -v "git-credential-$name" 2>/dev/null) ||
+                p="$(git --exec-path 2>/dev/null)/git-credential-$name" ;;
+    esac
+    printf '%s\n' "$p"
+}
+
+# The credential helpers git runs for URL $1 from the checkout, as git picks
+# them: every credential.helper and matching credential.<url>.helper in
+# config order, an empty value dropping the ones collected so far
+git_effective_helpers() {
+    local url="$1" line key value pat out=""
+    url=$(printf '%s' "$url" | sed -E 's#^([a-z]+://)[^@/]*@#\1#')
+    while IFS= read -r line; do
+        key=${line%% *}
+        value=""
+        [ "$key" != "$line" ] && value=${line#* }
+        case "$key" in
+            credential.helper) ;;
+            credential.*.helper)
+                pat=${key#credential.}
+                pat=${pat%.helper}
+                pat=${pat%/}
+                case "$url" in "$pat"|"$pat"/*) ;; *) continue ;; esac ;;
+            *) continue ;;
         esac
-        if [ ! -e "$p" ]; then
-            doc_warn "git credential helper not found: $p — pushes (global aliases) will fail"
-            if gh_logged_in; then
-                doc_hint "gh auth setup-git (gh is signed in), or remove it: git config --global --unset-all credential.helper"
+        if [ -z "$value" ]; then out=""; else out="$out$value"$'\n'; fi
+    done < <(git -C "$SCRIPT_DIR" config --get-regexp '^credential\..*helper$' 2>/dev/null)
+    printf '%s' "$out"
+}
+
+# Remove one credential helper entry: $1 config file, $2 key, $3 value
+git_helper_remove() {
+    local file="$1" key="$2" value="$3" re
+    if [ ! -w "$file" ]; then
+        error "$file is not writable (try: sudo git config --file \"$file\" --unset-all $key)"
+        return 1
+    fi
+    backup_file "$file" || return 1
+    re=$(printf '%s' "$value" | sed 's/[][\\.*^$+?(){}|]/\\&/g')
+    git config --file "$file" --unset-all "$key" "^$re\$"
+}
+
+# A password helper that is no longer installed (Git for Windows' manager
+# after an uninstall, typically) makes git's HTTPS logins fail. What matters
+# most is the remote olecharms pushes global aliases to.
+doctor_check_git_helpers() {
+    local branch="$1" remote url effective line origin file rest key value p
+    remote=$(git -C "$SCRIPT_DIR" config "branch.$branch.remote" 2>/dev/null) || remote=origin
+    url=$(git -C "$SCRIPT_DIR" remote get-url --push "$remote" 2>/dev/null)
+    case "$url" in
+        http://*|https://*) effective=$(git_effective_helpers "$url") ;;
+        *) effective="" ;;
+    esac
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        origin=${line%%$'\t'*}
+        rest=${line#*$'\t'}
+        key=${rest%% *}
+        value=""
+        [ "$key" != "$rest" ] && value=${rest#* }
+        [ -n "$value" ] || continue
+        p=$(git_helper_path "$value")
+        [ -n "$p" ] && [ ! -e "$p" ] || continue
+        file=${origin#file:}
+        if printf '%s\n' "$effective" | grep -qxF -- "$value"; then
+            doc_warn "Git cannot log in to push olecharms changes: its password helper is not installed anymore"
+            doc_why "Missing program: $p (set in $file). Publishing global aliases fails until this is fixed."
+            if [[ "$url" == https://github.com/* ]] && gh_logged_in; then
+                doc_hint "olecharms doctor --fix (lets git use your GitHub CLI login)"
+                doc_offer "Let git log in to GitHub with your GitHub CLI account (runs: gh auth setup-git)?" gh auth setup-git
             else
-                doc_hint "git config --global --unset-all credential.helper, then set up a working one"
+                doc_hint "Remove it (olecharms doctor --fix), then set up a working helper or switch the remote to SSH"
             fi
+        else
+            doc_warn "Git's password helper points to a program that no longer exists: $p"
+            if [ -n "$effective" ]; then
+                doc_why "Pushing olecharms works (another helper covers $url), but HTTPS logins to other git servers on this machine would fail."
+            else
+                doc_why "HTTPS logins to git servers on this machine fail. olecharms itself does not use it (remote: ${url:-none})."
+            fi
+            doc_hint "olecharms doctor --fix (removes that entry from $file, keeping a backup)"
         fi
-    done <<< "$(git -C "$SCRIPT_DIR" config --get-all credential.helper 2>/dev/null)"
+        [ -n "$file" ] && [ -f "$file" ] &&
+            doc_offer "Remove the broken password helper from $file (a backup is kept)?" git_helper_remove "$file" "$key" "$value"
+    done < <(git -C "$SCRIPT_DIR" config --show-origin --get-regexp '^credential\..*helper$' 2>/dev/null)
 }
 
 doctor_run_checks() {
@@ -4256,12 +5025,17 @@ doctor_run_checks() {
     DOC_WARN=0
     DOC_FAIL=0
     DOC_FIRST_FAIL=""
+    DOC_OFFER_Q=()
+    DOC_OFFER_CMD=()
+    DOC_WANTS_UPDATE=""
+    DOC_WANTS_SYNC=""
     doctor_check_commands
     doctor_check_checkout
     doctor_check_launcher
     doctor_check_shell
     doctor_check_vim
     doctor_check_zsh
+    doctor_check_zsh_extras
     doctor_check_cleanup
     doctor_check_paranoid
     doctor_check_config
@@ -4338,11 +5112,25 @@ cmd_doctor() {
     echo -e "${BOLD}olecharms doctor${NC}"
     doctor_run_checks
     doctor_record
-    if [ "$DOC_FAIL" -gt 0 ]; then
-        [ -z "$fix" ] && echo "Run 'olecharms doctor --fix' for local repairs, or 'olecharms update' for packages and plugins."
-        return 1
+    if [ -n "$fix" ]; then
+        if doctor_apply_offers; then
+            # Check again, showing only the outcome
+            out=$(mktemp) || return 1
+            doctor_run_checks > "$out" 2>&1
+            rm -f "$out"
+            doctor_record
+            echo ""
+            echo -e "${BOLD}After the repairs:${NC} $DOC_OK ok, $DOC_WARN warnings, $DOC_FAIL problems  (olecharms doctor shows the details)"
+        fi
+    elif [ "$DOC_FAIL" -gt 0 ] || [ "$DOC_WARN" -gt 0 ]; then
+        echo ""
+        if [ "${#DOC_OFFER_Q[@]}" -gt 0 ] || [ -n "$DOC_WANTS_UPDATE$DOC_WANTS_SYNC" ]; then
+            echo "Run 'olecharms doctor --fix' to repair what it can; it asks before anything outside olecharms' own files."
+        elif [ "$DOC_FAIL" -gt 0 ]; then
+            echo "Run 'olecharms doctor --fix' for local repairs, or 'olecharms update' for packages and plugins."
+        fi
     fi
-    return 0
+    [ "$DOC_FAIL" -eq 0 ]
 }
 
 cmd_status() {
@@ -4565,10 +5353,11 @@ config_cleanup_action() {
     info "Action set to $(config_get downloads_cleanup_action auto)"
 }
 
+# Change the max age, asking for it unless given as $1
 config_cleanup_age() {
-    local days cur dir real backend list
+    local days="${1:-}" cur dir real backend list
     cur=$(config_get downloads_cleanup_max_age_days "$DOWNLOADS_MAX_AGE_DAYS")
-    read -rp "  Delete files older than how many days? [$cur] " days
+    [ -n "$days" ] || read -rp "  Delete files older than how many days? [$cur] " days
     [ -z "$days" ] && { info "No changes made"; return 0; }
     if ! [[ "$days" =~ ^[0-9]+$ ]] || [ "$days" -lt 1 ] || [ "$days" -gt 3650 ]; then
         error "Enter a number of days between 1 and 3650"
@@ -4871,6 +5660,18 @@ cmd_config() {
         local doc_status="${GREEN}on${NC}"
         daily_doctor_enabled || doc_status="${RED}off${NC}"
         echo -e "    4) Daily health check      [$doc_status]"
+        local shared_status="${BLUE}not shared${NC}"
+        if [ -f "$SHARED_CONFIG_FILE" ]; then
+            if [ -n "$(shared_differences)" ]; then
+                shared_status="${YELLOW}differs here${NC}"
+            else
+                shared_status="${GREEN}followed${NC}"
+            fi
+        fi
+        echo -e "    5) Shared settings         [$shared_status]"
+        local zx_status="${GREEN}on${NC}"
+        [ "$(config_get zsh_extras on)" = off ] && zx_status="${RED}off${NC}"
+        echo -e "    6) Zsh extras              [$zx_status]  fzf keys, suggestions, syntax colours"
         echo ""
         echo "    0) Exit"
         echo ""
@@ -4920,6 +5721,16 @@ cmd_config() {
                 fi
                 generate_doctor_launcher
                 sync_shell_hook
+                echo ""
+                ;;
+            5)
+                echo ""
+                config_shared_settings
+                echo ""
+                ;;
+            6)
+                echo ""
+                config_zsh_extras
                 echo ""
                 ;;
             0|"")
@@ -5349,6 +6160,7 @@ cmd_sync() {
         info "Shell configuration changed — open a new shell (or run 'exec zsh') to pick it all up"
     fi
     info "Synced. Packages and vim plugins are updated by 'olecharms update'."
+    shared_offer_after_pull
 }
 
 # Pick one of the latest commands from the shell history, name it, save it as
@@ -5440,12 +6252,14 @@ cmd_help() {
     echo "            (also runs once a day in the background; new shells mention problems)"
     echo "            offline (alias: check)"
     echo "  status    Show what's installed with version info"
-    echo "  config    Interactive menu: downloads cleanup, paranoid mode, Windows sync (WSL)"
+    echo "  config    Interactive menu: downloads cleanup, paranoid mode, Windows sync (WSL),"
+    echo "            settings shared by all your machines, zsh extras (fzf...)"
     echo "  cleanup   Clean the downloads folder now; --dry-run lists what would go,"
     echo "            --log shows past runs"
     echo "  alias     Manage shell aliases (add / list / delete); --global shares one"
     echo "            with every machine through git"
     echo "  aliaslast Pick one of your latest commands and save it as an alias"
+    echo "  secret    Keep API keys and tokens out of your RC files (set / list / rm / import)"
     [ -n "${IS_WSL:-}" ] && echo "  windows   Sync Windows' gVim (config, plugins) and fonts now; 'status' to check"
     echo "  help      Show this help message"
     echo ""
@@ -5486,6 +6300,310 @@ cmd_help() {
     echo "  olecharms alias add claude \"claude --update && claude\""
 }
 
+# ─── Secrets: API keys and tokens out of the RC files ───────────────────────
+# One file, readable only by you, loaded by the shell loader:
+#   export NAME='value'
+# RC files get copied around (backups, dotfiles repos, screen shares); the
+# secrets file is never in git and never backed up by olecharms.
+
+# Path $1 with the home directory shown as ~
+home_tilde() {
+    case "$1" in
+        "$HOME"/*) printf '~/%s\n' "${1#"$HOME"/}" ;;
+        *)         printf '%s\n' "$1" ;;
+    esac
+}
+
+# True unless $2 (an edited copy of RC file $1) fails to parse where $1 did
+rc_parses_like() {
+    local sh=bash
+    case "$1" in */.z*) sh=zsh ;; esac
+    check_command "$sh" || return 0
+    "$sh" -n "$1" >/dev/null 2>&1 || return 0
+    "$sh" -n "$2" >/dev/null 2>&1
+}
+
+# Line numbers of file $1 that are outside any if/case/loop/function/{ }
+# block. Rough (quotes and comments are stripped first; here-documents are
+# not understood), but enough not to lift a line out of a block — zsh -n
+# accepts an emptied block, so the parse check alone would not catch it.
+rc_toplevel_lines() {
+    awk '
+        {
+            line = $0
+            gsub(/\047[^\047]*\047/, "", line)
+            gsub(/"[^"]*"/, "", line)
+            sub(/(^|[ \t])#.*/, "", line)
+            if (depth == 0) print NR
+            n = split(line, w, /[ \t;&|()]+/)
+            for (i = 1; i <= n; i++) {
+                if (w[i] == "if" || w[i] == "case" || w[i] == "do" || w[i] == "{") depth++
+                else if (w[i] == "fi" || w[i] == "esac" || w[i] == "done" || w[i] == "}") depth--
+            }
+            if (depth < 0) depth = 0
+        }
+    ' "$1"
+}
+
+# A variable name that looks like it holds a secret
+secret_name_like() {
+    local up
+    up=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')
+    [[ "$up" =~ (^|_)(API_?KEY|APIKEY|KEYS?|TOKENS?|SECRETS?|PASS|PASSWORD|PASSWD|PAT|CREDENTIALS?)($|_) ]]
+}
+
+# NAME=value assignments in the shell startup files that look like secrets
+# with a literal value: "file<TAB>line<TAB>NAME" per match. Values built
+# from other variables or commands ($VAR, $(pass show x)) are not secrets in
+# the file and are skipped, as are lines olecharms cannot move safely.
+SECRET_RC_FILES=".zshrc .bashrc .bash_profile .profile .zprofile .zshenv .zlogin"
+SECRETS_MARKER="# olecharms secrets"
+secret_scan() {
+    local rel f n line name rest re_assign re_value
+    # Unindented lines only: an indented one is likely inside an if/fi or a
+    # function, and taking it out could leave that block empty and broken
+    re_assign='^(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$'
+    re_value="^('[^']+'|\"[^\"\$\`\\\\]+\"|[^[:space:]'\"\$\`;|&()<>\\\\]+)[[:space:]]*(#.*)?$"
+    local top
+    for rel in $SECRET_RC_FILES; do
+        f="$HOME/$rel"
+        [ -f "$f" ] || continue
+        top=" $(rc_toplevel_lines "$f" | tr '\n' ' ') "
+        n=0
+        while IFS= read -r line || [ -n "$line" ]; do
+            n=$((n + 1))
+            case "$top" in *" $n "*) ;; *) continue ;; esac
+            [[ "$line" =~ $re_assign ]] || continue
+            name=${BASH_REMATCH[2]}
+            rest=${BASH_REMATCH[3]}
+            secret_name_like "$name" || continue
+            [[ "$rest" =~ $re_value ]] || continue
+            printf '%s\t%s\t%s\n' "$f" "$n" "$name"
+        done < "$f"
+    done
+}
+
+# Stored names, one per line
+secret_names() {
+    [ -f "$SECRETS_FILE" ] || return 0
+    sed -n 's/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}\([A-Za-z_][A-Za-z0-9_]*\)=.*/\2/p' "$SECRETS_FILE"
+}
+
+# Rewrite the secrets file through filter command "$@" (stdin → stdout),
+# private from the first byte
+secret_rewrite() {
+    local tmp
+    mkdir -p "$OLECHARMS_CONFIG_DIR" || return 1
+    tmp=$( umask 077; mktemp "$OLECHARMS_CONFIG_DIR/.secrets.XXXXXX" ) || return 1
+    if { [ -f "$SECRETS_FILE" ] && cat "$SECRETS_FILE"; } | "$@" > "$tmp" && chmod 600 "$tmp" && mv "$tmp" "$SECRETS_FILE"; then
+        return 0
+    fi
+    rm -f "$tmp"
+    error "Could not write $SECRETS_FILE"
+    return 1
+}
+
+# Filters for secret_rewrite
+_secret_drop() { grep -v -E "^[[:space:]]*(export[[:space:]]+)?$1=" || true; }
+_secret_put()  { _secret_drop "$1"; printf '%s\n' "$2"; }
+
+secret_valid_name() {
+    [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { error "Not a valid variable name: $1"; return 1; }
+    case "$1" in
+        PATH|HOME|SHELL|USER|LOGNAME|TERM|PWD|OLDPWD|IFS|PS1|PS2|ZDOTDIR|LANG|LC_*)
+            error "$1 is a shell variable, not a secret"; return 1 ;;
+    esac
+}
+
+secret_set() {
+    local name="$1" value value2 q
+    secret_valid_name "$name" || return 1
+    if [ -t 0 ]; then
+        read -rsp "  Value for $name (not shown): " value; echo ""
+        read -rsp "  Once more: " value2; echo ""
+        [ "$value" = "$value2" ] || { error "The two values differ; nothing stored"; return 1; }
+    else
+        IFS= read -r value || [ -n "$value" ] || true
+    fi
+    [ -n "$value" ] || { info "Empty value; nothing stored"; return 1; }
+    q=$(printf '%s' "$value" | sed "s/'/'\\\\''/g")
+    secret_rewrite _secret_put "$name" "export $name='$q'" || return 1
+    info "$name stored in $SECRETS_FILE (only you can read it); new shells and this one have it"
+}
+
+secret_rm() {
+    local name="$1"
+    secret_valid_name "$name" || return 1
+    if ! secret_names | grep -qxF -- "$name"; then
+        error "No secret named $name"
+        return 1
+    fi
+    secret_rewrite _secret_drop "$name" || return 1
+    info "$name removed"
+}
+
+secret_list() {
+    local names
+    names=$(secret_names)
+    if [ -z "$names" ]; then
+        echo "  No secrets stored. Add one with: olecharms secret set NAME"
+        return 0
+    fi
+    echo "  Stored in $SECRETS_FILE (values are never shown):"
+    printf '%s\n' "$names" | sed 's/^/    /'
+}
+
+# Move the lines secret_scan finds into the secrets file. The lines leave the
+# RC file without a backup copy of it: a backup would keep the secret in
+# plain text, and the lines themselves are what goes to the secrets file.
+# $1: "yes" to skip the question (the doctor already asked).
+secret_import() {
+    local found f n name line file lines moved=0 tmp
+    found=$(secret_scan)
+    if [ -z "$found" ]; then
+        info "No secrets in plain text in your shell startup files"
+        return 0
+    fi
+    echo "  Found in plain text (values not shown):"
+    printf '%s\n' "$found" | while IFS=$'\t' read -r f n name; do
+        echo "    $name   ($(home_tilde "$f"), line $n)"
+    done
+    if [ "${1:-}" != yes ]; then
+        echo ""
+        confirm_default_yes "  Move them to $SECRETS_FILE, readable only by you?" || { info "Nothing moved"; return 0; }
+    fi
+    for file in $(printf '%s\n' "$found" | cut -f1 | sort -u); do
+        lines=$(printf '%s\n' "$found" | awk -F'\t' -v f="$file" '$1 == f { print $2 }')
+        for n in $lines; do
+            line=$(sed -n "${n}p" "$file")
+            line=${line#"${line%%[![:space:]]*}"}
+            name=$(printf '%s\n' "$found" | awk -F'\t' -v f="$file" -v n="$n" '$1 == f && $2 == n { print $3 }')
+            secret_rewrite _secret_put "$name" "$line" || return 1
+            moved=$((moved + 1))
+        done
+        # The first of those lines becomes one that loads the secrets file,
+        # so later lines of this file that use them (and shells that read
+        # only this file: .zshenv, .profile...) still see them; the others
+        # go. Not if the result no longer parses, and written in place
+        # (keeping the file's mode) with a private copy until it succeeded.
+        local first repl keep expect
+        first=$(echo $lines | cut -d' ' -f1)
+        repl="[ -f \"\$HOME/${SECRETS_FILE#"$HOME"/}\" ] && . \"\$HOME/${SECRETS_FILE#"$HOME"/}\"  $SECRETS_MARKER"
+        case "$SECRETS_FILE" in "$HOME"/*) ;; *) repl="[ -f \"$SECRETS_FILE\" ] && . \"$SECRETS_FILE\"  $SECRETS_MARKER" ;; esac
+        grep -qF -- "$SECRETS_MARKER" "$file" && repl=""
+        tmp=$(mktemp) || return 1
+        awk -v del=" $(echo $lines) " -v first="$first" -v repl="$repl" '
+            FNR == first && repl != "" { print repl; next }
+            index(del, " " FNR " ") == 0' "$file" > "$tmp"
+        expect=$(( $(wc -l < "$file") - $(echo $lines | wc -w) + $([ -n "$repl" ] && echo 1 || echo 0) ))
+        if [ "$(wc -l < "$tmp")" -ne "$expect" ]; then
+            error "Unexpected result editing $file; left as it was"
+        elif ! rc_parses_like "$file" "$tmp"; then
+            error "$file would not parse without those lines; left as it was (remove them by hand)"
+        elif ! keep=$( umask 077; mktemp "$OLECHARMS_CONFIG_DIR/.rc-original.XXXXXX" ) || ! cp "$file" "$keep"; then
+            rm -f "$keep"
+            error "Could not keep a private copy of $file; left as it was"
+        elif cat "$tmp" > "$file"; then
+            rm -f "$keep"
+        elif cat "$keep" > "$file" 2>/dev/null; then
+            rm -f "$keep"
+            error "Could not write $file (disk full?); it is back as it was"
+        else
+            error "Could not write $file; its original is in $keep (readable only by you)"
+        fi
+        rm -f "$tmp"
+    done
+    info "Moved $moved secret(s) to $SECRETS_FILE; the shell loader loads them in every new shell"
+    secret_backup_note
+}
+
+# Old backups of the RC files (olecharms' *.backup.<date>) holding the same
+# names in plain text: print them, one per line
+secret_backups() {
+    local names f
+    names=$( { secret_names; secret_scan | cut -f3; } | sort -u )
+    [ -n "$names" ] || return 0
+    for f in "$HOME"/.zshrc.backup.* "$HOME"/.bashrc.backup.* "$HOME"/.bash_profile.backup.*; do
+        [ -f "$f" ] || continue
+        if grep -qE "^[[:space:]]*(export[[:space:]]+)?($(printf '%s\n' "$names" | paste -sd'|' -))=[^\$]" "$f"; then
+            printf '%s\n' "$f"
+        fi
+    done
+}
+
+secret_backup_note() {
+    local b
+    b=$(secret_backups)
+    [ -n "$b" ] || return 0
+    warn "$(printf '%s\n' "$b" | grep -c .) older backup(s) of your RC files still hold them in plain text:"
+    printf '%s\n' "$b" | sed 's/^/      /'
+    echo "      Delete them once you no longer need them (olecharms doctor --fix can make them private)."
+}
+
+# Backups listed by secret_backups, readable only by you
+secret_backups_private() {
+    local f
+    while IFS= read -r f; do
+        [ -n "$f" ] && chmod 600 "$f"
+    done <<< "$(secret_backups)"
+}
+
+doctor_check_secrets() {
+    local found names b mode
+    if [ -f "$SECRETS_FILE" ]; then
+        mode=$(ls -ln "$SECRETS_FILE" 2>/dev/null | cut -c1-10)
+        if [ "$mode" = "-rw-------" ]; then
+            doc_ok "Secrets: $(secret_names | grep -c .) stored, readable only by you"
+        else
+            doc_warn "The secrets file can be read by others ($mode)"
+            doc_offer "Make $SECRETS_FILE readable only by you (chmod 600)?" chmod 600 "$SECRETS_FILE"
+            doc_hint "olecharms doctor --fix, or: chmod 600 \"$SECRETS_FILE\""
+        fi
+    fi
+    found=$(secret_scan)
+    if [ -n "$found" ]; then
+        names=$(printf '%s\n' "$found" | while IFS=$'\t' read -r f n name; do printf '%s (%s), ' "$name" "$(home_tilde "$f")"; done)
+        names=${names%, }
+        doc_warn "Secrets in plain text in your shell startup files: $names"
+        doc_why "Anything that reads or copies those files (backups, dotfiles repos, screen shares) takes them along."
+        doc_hint "olecharms secret import  (moves them to a file only you can read; doctor --fix offers it)"
+        doc_offer "Move them to $SECRETS_FILE, readable only by you (values are never printed)?" secret_import yes
+    fi
+    b=$(secret_backups)
+    if [ -n "$b" ]; then
+        if [ -z "$(printf '%s\n' "$b" | while IFS= read -r f; do [ "$(ls -ln "$f" | cut -c5-10)" != "------" ] && echo x; done)" ]; then
+            doc_ok "$(printf '%s\n' "$b" | grep -c .) old RC backup(s) with secrets are private to you (delete them when no longer needed)"
+        else
+            doc_warn "$(printf '%s\n' "$b" | grep -c .) old backup(s) of your RC files hold secrets in plain text, readable by others"
+            doc_why "$(printf '%s\n' "$b" | while IFS= read -r f; do home_tilde "$f"; done | paste -sd' ' -)"
+            doc_hint "Delete them if you do not need them; olecharms doctor --fix makes them private"
+            doc_offer "Make those backups readable only by you (chmod 600)?" secret_backups_private
+        fi
+    fi
+}
+
+secret_usage() {
+    echo "Usage: olecharms secret <command>"
+    echo ""
+    echo "  set NAME     store a secret (asks for it without showing it); every shell gets \$NAME"
+    echo "  list         the names stored (values are never shown)"
+    echo "  rm NAME      forget one"
+    echo "  import       move NAME=value lines that look like secrets out of your RC files"
+    echo ""
+    echo "  Kept in $SECRETS_FILE: on this machine only, readable only by you, never in git."
+}
+
+cmd_secret() {
+    case "${1:-}" in
+        set|add)            [ -n "${2:-}" ] || { secret_usage; return 1; }; secret_set "$2" ;;
+        rm|remove|delete)   [ -n "${2:-}" ] || { secret_usage; return 1; }; secret_rm "$2" ;;
+        list|ls|"")         secret_list ;;
+        import)             secret_import ;;
+        -h|--help|help)     secret_usage ;;
+        *)                  error "Unknown secret command: $1"; secret_usage; return 1 ;;
+    esac
+}
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 main() {
@@ -5508,7 +6626,7 @@ main() {
             config_ensure
             fix_moved_install fix
             ;;
-        alias|aliaslast|cleanup|windows)
+        alias|aliaslast|cleanup|windows|secret)
             config_ensure
             ;;
         doctor|check)
@@ -5537,6 +6655,7 @@ main() {
         windows) shift; cmd_windows "$@" || cmd_rc=$? ;;
         alias)   shift; cmd_alias "$@" || cmd_rc=$? ;;
         aliaslast) shift; cmd_aliaslast "$@" || cmd_rc=$? ;;
+        secret)  shift; cmd_secret "$@" || cmd_rc=$? ;;
         help|--help|-h) cmd_help ;;
         "")
             cmd_help

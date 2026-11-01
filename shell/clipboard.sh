@@ -1,5 +1,6 @@
-# copy / paste — the system clipboard, the same on Linux, macOS and WSL
-# (over SSH, copies reach the clipboard of the machine you sit at).
+# copy — put text on the system clipboard; `paste` prints it back
+# The same on Linux, macOS and WSL (over SSH, copies reach the clipboard of
+# the machine you sit at).
 #   pwd | copy          copy a command's output
 #   copy notes.txt      copy a file's contents
 #   paste               print the clipboard (paste > file, paste | grep x)

@@ -15,6 +15,7 @@
 ```
 olecharms/
 ├── olecharms.sh              # The single main script (all logic lives here)
+├── README.md                  # Install command and everyday use
 ├── bootstrap.sh               # One-command setup of a new machine (git, clone, install)
 ├── packages.conf              # Shared config: packages, plugins, fonts, post-install commands
 ├── global-aliases.sh          # Global aliases (created by `alias add --global` / `aliaslast`), loaded on every machine
@@ -52,6 +53,11 @@ olecharms/
 │   ├── cleanup-downloads.sh   #   Launcher for `olecharms cleanup --scheduled`
 │   ├── paranoid-cleanup.sh    #   Generated paranoid-mode cleanup script
 │   └── .last-run/             #   Timestamps for hook-based scheduling
+├── tests/                     # Test suites, all in a sandbox (run: tests/run.sh)
+│   ├── run.sh                 #   Runs them and sums up; --full adds 09-full-update
+│   ├── lib/sandbox.sh         #   Copy of the checkout + fake HOME, crontab, sudo
+│   ├── fixtures/              #   Sample files (an old pasted ~/.vimrc copy)
+│   └── NN-*.sh                #   One suite per area (cleanup, paranoid, deletion safety, ...)
 ├── .gitattributes             # Forces LF for *.sh/*.conf/*.vim (CRLF breaks bash and vim)
 └── ARCHITECTURE.md            # This file
 ```
@@ -475,7 +481,24 @@ Blocks are added with `append_block()` (one blank separator line, none when the 
 
 ## Testing
 
-- **Syntax check:** `bash -n olecharms.sh`
-- **Non-destructive:** `./olecharms.sh check` and `./olecharms.sh status`
-- **Cleanup in tests:** a file's mtime can be back-dated but not its ctime, so tests set `OLECHARMS_TEST_IGNORE_CTIME=1`.
-- **Sandboxed end-to-end:** point `HOME` and `XDG_CONFIG_HOME` at a scratch directory and run `update` twice against a copy of the checkout; the second run must report no errors and leave the RC files, config and crontab byte-identical. Put a fake `crontab` first on `PATH` too — the crontab belongs to the user, not to `$HOME` — and a copy of the checkout keeps the generated `scripts/` of the real one untouched.
+`tests/run.sh` runs every suite (about 410 checks, 2–3 minutes, offline); `tests/run.sh --full` adds `09-full-update` (48 more), which runs a real `olecharms update` twice and the Windows `vim.exe` on the result, so it needs WSL with Windows Vim and the network. `tests/run.sh 05 07` runs only the suites whose names start that way; `--keep` keeps the sandbox and logs (they are always kept when something fails). A suite can also run alone: `bash tests/05-deletion-safety.sh`.
+
+| Suite | Covers |
+|-------|--------|
+| `01-reliability` | Cleanup through a symlinked folder, hook/cron scheduling, generated scripts, aliases (gawk and mawk), CRLF config, switchsshkey, loader in zsh and bash |
+| `02-oh-my-zsh` | Loader order with oh-my-zsh, alias precedence (needs `~/.oh-my-zsh`, or `OLECHARMS_TEST_OMZ`; skipped otherwise) |
+| `03-paranoid` | Paranoid mode: cleanup age, previews, Linux and Windows gVim traces, doctor |
+| `04-aliases` | aliaslast, history parsing, global aliases through a bare git remote, interactive picker |
+| `05-deletion-safety` | Every destructive path: refused folders, ctime, checkouts, symlinks, mass-removal brake, per-file checks |
+| `06-sync-doctor-quarantine` | sync, doctor checkout checks, daily doctor, quarantine and restore, plugin retirement |
+| `07-clipboard-doctor-fix` | olecharms-clip, copy/paste, terminal Vim, doctor repairs (git helpers, old ~/.vimrc copy, Windows Terminal font), `--fix` prompts |
+| `08-shared-secrets-extras` | Shared settings, secrets, zsh extras, bootstrap (incl. socket stdin) |
+| `09-full-update` | `--full` only: full update twice, Windows gVim sync and real `vim.exe`, doctor, local conf, config migration, self-update stash |
+
+**How they stay harmless** (`tests/lib/sandbox.sh`): each suite works on a copy of the checkout (without `.git` and `scripts/`) inside a temporary folder marked `.olecharms-test` — nothing is deleted outside a marked folder. `HOME`, `XDG_CONFIG_HOME` and the crontab (a fake one backed by a file, first on `PATH`) are the sandbox's; a fake `sudo` refuses, so no package is installed; `OLECHARMS_*` and `GIT_*` variables are cleared and the system git config ignored; Windows' gVim home is redirected into the sandbox (`OLECHARMS_WIN_VIM_HOME`), and `09-full-update` uses its own folder in the Windows temp dir, removed at the end. Like a real update, `09` installs the Powerline fonts for the Windows user if they are missing.
+
+Notes for writing tests:
+- A file's mtime can be back-dated but not its ctime, so cleanup tests set `OLECHARMS_TEST_IGNORE_CTIME=1`.
+- `$SB/repo/lib.sh` is the script without its final `main` call: `bash -c "source '$SB/repo/lib.sh'; some_function"` tests one function.
+- Generated scripts that delete things are checked for paths outside the sandbox before they are run.
+- They need Linux or WSL (GNU coreutils, util-linux `script`) plus bash, zsh, vim, git, python3 and rsync; `run.sh` says what is missing.

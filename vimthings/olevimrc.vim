@@ -398,6 +398,19 @@ nmap <leader>F :NERDTreeFind<CR>
 nmap <leader>b :CtrlPBuffer<CR>
 nmap <leader>t :CtrlP<CR>
 nmap <leader>T :CtrlPClearCache<CR>:CtrlP<CR>
+" Search with ripgrep, or ag, when installed: :grep (results in the quickfix
+" list) and CtrlP's file list — fast, and they skip what .gitignore hides
+if executable('rg')
+    set grepprg=rg\ --vimgrep\ --smart-case
+    set grepformat=%f:%l:%c:%m
+    let g:ctrlp_user_command = 'rg %s --files --hidden --glob "!.git"'
+    let g:ctrlp_use_caching = 0
+elseif executable('ag')
+    set grepprg=ag\ --vimgrep\ --smart-case
+    set grepformat=%f:%l:%c:%m
+    let g:ctrlp_user_command = 'ag %s -l --nocolor --hidden --ignore .git -g ""'
+    let g:ctrlp_use_caching = 0
+endif
 
 """ python-mode
 " let g:pymode_options_max_line_length = 119

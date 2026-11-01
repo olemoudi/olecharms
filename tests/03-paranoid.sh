@@ -52,7 +52,8 @@ echo "== B. generated paranoid script purges Linux + Windows traces, nothing els
 safe_paranoid
 chk "script has viminfo line"            grep -q 'HOME_DIR/.viminfo' "$P"
 chk "script has sandbox WIN_VIM_HOME"    grep -qx "WIN_VIM_HOME=$W" "$P"
-chk "script stamped generator 5"         grep -qx '# olecharms-generator: 5' "$P"
+GV=$(sed -n 's/^GENERATOR_VERSION=//p' "$SB/repo/olecharms.sh")
+chk "script stamped generator $GV"       grep -qx "# olecharms-generator: $GV" "$P"
 reset_traces; bash "$P"; echo "  exit=$?"
 chk "~/.bash_history gone"               test ! -e "$H/.bash_history"
 chk "~/.viminfo gone"                    test ! -e "$H/.viminfo"

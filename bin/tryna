@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# tryna — run a command until it succeeds (-n tries, -d delay)
+# Usage: tryna [-n MAX] [-d SECONDS] command [args...]
+max=0 delay=1
+while [ $# -gt 0 ]; do
+    case "$1" in
+        # shift 2 with one argument left fails and shifts nothing: check first
+        -n|-d) [ $# -ge 2 ] || { echo "tryna: $1 needs a value" >&2; exit 2; }
+               if [ "$1" = -n ]; then max=$2; else delay=$2; fi
+               shift 2 ;;
+        --) shift; break ;;
+        -h|--help) echo "Usage: tryna [-n MAX] [-d SECONDS] command [args...]"; exit 0 ;;
+        *) break ;;
+    esac
+done
+[[ "$max" =~ ^[0-9]+$ ]] || { echo "tryna: -n wants a number" >&2; exit 2; }
+[[ "$delay" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "tryna: -d wants seconds" >&2; exit 2; }
+[ $# -gt 0 ] || { echo "Usage: tryna [-n MAX] [-d SECONDS] command [args...]" >&2; exit 2; }
+n=0
+while :; do
+    n=$((n + 1))
+    "$@" && exit 0
+    rc=$?
+    if [ "$max" -gt 0 ] && [ "$n" -ge "$max" ]; then
+        echo "tryna: gave up after $n tries (exit $rc)" >&2
+        exit "$rc"
+    fi
+    echo "tryna: try $n failed (exit $rc); again in ${delay}s (Ctrl-C to stop)" >&2
+    sleep "$delay"
+done

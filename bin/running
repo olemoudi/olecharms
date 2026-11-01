@@ -1,0 +1,14 @@
+#!/bin/sh
+# running — list the processes matching a text (no text: yours)
+# Usage: running [text]     (case-insensitive; never lists itself)
+pat=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
+me=$$
+list=$(ps -A -o pid= -o user= -o args= 2>/dev/null) || { echo "running: ps failed" >&2; exit 1; }
+user=$(id -un)
+printf '%s\n' "$list" | awk -v pat="$pat" -v me="$me" -v user="$user" '
+    { pid = $1; u = $2; cmd = $0; sub(/^ *[0-9]+ +[^ ]+ +/, "", cmd) }
+    pid == me || cmd ~ /^ps -A -o pid= -o user= -o args=/ { next }
+    pat == "" && u != user { next }
+    pat != "" && index(tolower(cmd), pat) == 0 { next }
+    { printf "%7s  %-10s %s\n", pid, u, cmd; n++ }
+    END { exit (n ? 0 : 1) }'

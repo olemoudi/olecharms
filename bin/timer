@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# timer — count down (90, 25m, 1h30m), then ring and notify
+# Usage: timer DURATION [message]
+# OLECHARMS_NOTIFY=none skips the notification (the bell still rings)
+usage() { echo "Usage: timer DURATION [message]   e.g. timer 25m tea, timer 1h30m, timer 90" >&2; exit 2; }
+[ $# -ge 1 ] || usage
+spec=$1; shift
+msg=${*:-Time is up}
+secs=0 rest=$spec
+[[ "$rest" =~ ^([0-9]+h)?([0-9]+m)?([0-9]+s?)?$ ]] && [ -n "$rest" ] || usage
+while [ -n "$rest" ]; do
+    [[ "$rest" =~ ^([0-9]+)([hms]?)(.*)$ ]] || usage
+    num=$((10#${BASH_REMATCH[1]})) unit=${BASH_REMATCH[2]} rest=${BASH_REMATCH[3]}
+    case "$unit" in h) secs=$((secs + num * 3600)) ;; m) secs=$((secs + num * 60)) ;; *) secs=$((secs + num)) ;; esac
+done
+[ "$secs" -gt 0 ] || usage
+
+notify() {
+    [ "${OLECHARMS_NOTIFY:-}" = none ] && return 0
+    local t="timer" m="$1"
+    if [ "$(uname -s)" = Darwin ] && command -v osascript >/dev/null 2>&1; then
+        osascript -e 'on run argv' -e 'display notification (item 2 of argv) with title (item 1 of argv) sound name "Glass"' -e 'end run' "$t" "$m" >/dev/null 2>&1 && return 0
+    fi
+    if command -v powershell.exe >/dev/null 2>&1 && grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then
+        local q=${m//\'/\'\'}
+        (cd /mnt/c 2>/dev/null; powershell.exe -NoProfile -NonInteractive -Command "
+            [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > \$null
+            \$x = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+            \$t = \$x.GetElementsByTagName('text'); \$t.Item(0).AppendChild(\$x.CreateTextNode('$t')) > \$null; \$t.Item(1).AppendChild(\$x.CreateTextNode('$q')) > \$null
+            [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe').Show([Windows.UI.Notifications.ToastNotification]::new(\$x))
+        " >/dev/null 2>&1) && return 0
+    fi
+    if command -v notify-send >/dev/null 2>&1 && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+        notify-send "$t" "$m" >/dev/null 2>&1 && return 0
+    fi
+    return 1
+}
+
+end=$(( $(date +%s) + secs ))
+while :; do
+    left=$(( end - $(date +%s) ))
+    [ "$left" -gt 0 ] || break
+    [ -t 1 ] && printf '\r%s  %02d:%02d:%02d ' "$msg" $((left / 3600)) $((left % 3600 / 60)) $((left % 60))
+    sleep 1
+done
+[ -t 1 ] && printf '\r\033[K'
+printf '\a%s\n' "$msg"
+notify "$msg" || true

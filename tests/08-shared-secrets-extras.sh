@@ -26,7 +26,8 @@ chk "no shared file: no differences"       test -z "$(lib 'shared_differences')"
 lib 'config_set downloads_cleanup_max_age_days 365; config_set daily_doctor on; config_set downloads_cleanup_quarantine_days 45' >/dev/null
 out=$(printf 'y\n' | lib 'shared_publish')
 chk "publish asks and reports"             grep -q 'Shared: your other machines' <<< "$out"
-chk "shared-config committed and pushed"   test "$(git --git-dir="$SB/remote.git" show master:shared-config | grep -c '=')" -eq 7
+NK=$(sed -n 's/^SHARED_KEYS="\(.*\)"/\1/p' "$SB/repo/olecharms.sh" | wc -w)
+chk "shared-config committed and pushed ($NK keys)" test "$(git --git-dir="$SB/remote.git" show master:shared-config | grep -c '=')" -eq "$NK"
 chk "values written"                       bash -c 'grep -qx "daily_doctor=on" "$1/repo/shared-config" && grep -qx "downloads_cleanup_quarantine_days=45" "$1/repo/shared-config"' _ "$SB"
 chk "only that file in the commit"         test "$(git -C "$SB/repo" show --name-only --format= HEAD)" = shared-config
 chk "follows right after publishing"       test -z "$(lib 'shared_differences')"
@@ -148,13 +149,17 @@ case "$1" in
 esac
 EOF
 chmod +x "$SB/bin/fzf"
-z=$(cd "$H" && ZDOTDIR=$H zsh -ic 'echo "$fzf_loaded|$zas_loaded|$zsh_hl_after_zas"' 2>/dev/null </dev/null)
+# The extras load only at a terminal: run the shells in one
+echo 'echo "$fzf_loaded|$zas_loaded|$zsh_hl_after_zas"' > "$SB/show-extras.sh"
+echo "source '$L'" > "$SB/rc.bash"
+tz() { (cd "$H" && ZDOTDIR=$H script -qc "$1" /dev/null 2>/dev/null </dev/null) | tr -d '\r' | grep '|' | tail -n 1; }
+z=$(tz "zsh -ic 'source $SB/show-extras.sh'")
 chk "zsh: fzf, suggestions, colours ($z)"  test "$z" = 'zsh|history completion|yes'
-b=$(cd "$H" && bash --rcfile <(echo "source '$L'") -ic 'echo "$fzf_loaded|$zas_loaded"' 2>/dev/null </dev/null | tail -n 1)
-chk "bash: fzf only ($b)"                  test "$b" = 'bash|'
+b=$(tz "bash --rcfile $SB/rc.bash -ic 'source $SB/show-extras.sh'")
+chk "bash: fzf only ($b)"                  test "$b" = 'bash||'
 lib 'config_set zsh_extras off; install_shell_commands' >/dev/null
-z=$(cd "$H" && ZDOTDIR=$H zsh -ic 'echo "$fzf_loaded|$zas_loaded"' 2>/dev/null </dev/null)
-chk "extras off: nothing loaded ($z)"      test "$z" = '|'
+z=$(tz "zsh -ic 'source $SB/show-extras.sh'")
+chk "extras off: nothing loaded ($z)"      test "$z" = '||'
 lib 'config_set zsh_extras on; install_shell_commands' >/dev/null
 d=$($O doctor 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
 chk "doctor: fzf ok"                       grep -q 'fzf 0.99: Ctrl-R history' <<< "$d"
@@ -213,6 +218,22 @@ printf 'CLIP' > "$CF"; OLECHARMS_CLIP_FILE=$CF vrun +'normal ggviw"+p' +'sleep 3
 chk "visual \"+p does not copy the replaced text back" test "$(cat "$CF")" = CLIP
 (cd "$SB" && OLECHARMS_CLIP_BACKEND=none TERM=xterm vim -Nu "$SB/repo/vimthings/olevimrc.vim" -i NONE -n -es v9.txt +'normal yy' +'normal jyy' +'redir! > none.txt | silent messages | redir END' +'qa!' >/dev/null 2>&1)
 chk "no clipboard: one warning, not per yank" test "$(grep -c 'no system clipboard here' "$SB/none.txt")" -le 1
+
+echo "== 6. zsh extras only with a line editor (zsh -ic from scripts and editors stays quiet)"
+lib 'config_set zsh_extras on; install_shell_commands' >/dev/null
+mkdir -p "$SB/fakefzf" "$SB/zx"
+printf '#!/bin/sh\ncase "$1" in --zsh|--bash) echo "echo FZF_SETUP_RAN" ;; esac\n' > "$SB/fakefzf/fzf"; chmod +x "$SB/fakefzf/fzf"
+printf 'source %q\n' "$SB/repo/scripts/olecharms-shell.sh" > "$SB/zx/.zshrc"
+cp "$SB/zx/.zshrc" "$SB/zx/.bashrc"
+zx() { (cd "$SB/zx" && HOME=$SB/zx ZDOTDIR=$SB/zx PATH="$SB/fakefzf:$PATH" "$@" 2>&1) | tr -d '\r'; }
+out=$(zx zsh -ic 'echo READY' </dev/null)
+chk "zsh -ic without a terminal: fzf setup skipped, no output" test "$out" = READY
+out=$(zx script -qc "zsh -ic 'echo READY'" /dev/null </dev/null)
+chk "zsh at a terminal: fzf setup runs"      grep -q FZF_SETUP_RAN <<< "$out"
+out=$(zx bash -ic 'echo READY' </dev/null)
+chk "bash -ic without a terminal: skipped"   bash -c '! grep -q FZF_SETUP_RAN <<< "$1"' _ "$out"
+out=$(zx script -qc "bash -ic 'echo READY'" /dev/null </dev/null)
+chk "bash at a terminal: fzf setup runs"     grep -q FZF_SETUP_RAN <<< "$out"
 
 echo; echo "RESULT: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

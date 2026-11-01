@@ -21,15 +21,23 @@ olecharms/
 ├── global-aliases.sh          # Global aliases (created by `alias add --global` / `aliaslast`), loaded on every machine
 │                              #   (per-machine additions: ~/.config/olecharms/packages.local.conf)
 ├── shared-config              # Settings shared by every machine (created by `config` → Shared settings)
-├── bin/
-│   └── olecharms-clip         # System clipboard from a terminal (POSIX sh): copy / paste / backend
+├── bin/                       # Commands, linked into ~/.local/bin (also for scripts and coding agents)
+│   ├── olecharms-clip         #   System clipboard from a terminal (POSIX sh): copy / paste / backend
+│   ├── ssk                    #   SSH keys and git identities: run, bind, which, test, list, the old switch
+│   ├── trash                  #   Recoverable deletion (→ `olecharms trash`)
+│   ├── running / murder       #   Find processes; stop them politely, KILL last
+│   ├── tryna / timer          #   Retry until success; countdown with a notification
+│   └── jsonformat / url / line / scratch
 ├── shell/                     # Shell commands auto-sourced into bash/zsh sessions
 │   ├── clipboard.sh           #   copy / paste on top of bin/olecharms-clip
 │   ├── mkcd.sh                #   mkdir + cd in one step
 │   ├── mksh.sh                #   create a new shell script with boilerplate
 │   ├── serveit.sh             #   start a static file server (python/npx/ruby/php)
 │   ├── each.sh                #   run a command for each line of stdin
-│   └── switchsshkey.sh        #   manage and switch between named SSH key pairs
+│   ├── switchsshkey.sh        #   switchsshkey / ssk functions → bin/ssk
+│   ├── tempe.sh               #   cd into a new temp folder
+│   ├── wt.sh                  #   git worktrees, one per task or agent
+│   └── lib/history.zsh, lib/history.bash  # shell history with the secret filter (sourced by the loader, not as commands)
 ├── vimthings/                 # Bundled vim configuration and fallback copies
 │   ├── olevimrc.vim           #   Main vimrc (sourced from ~/.vimrc, and from Windows' _vimrc on WSL)
 │   ├── configure.sh           #   Legacy standalone vim configurator (unused by olecharms.sh)
@@ -66,7 +74,7 @@ olecharms/
 
 `olecharms.sh` is organized into logical sections, delimited by comment banners:
 
-### 1. Constants & Globals (lines 5-118)
+### 1. Constants & Globals (lines 5-120)
 All paths, markers, intervals, and config variables. Key globals:
 - `SCRIPT_DIR` — resolved repo root (symlink chain walked, with a loop guard)
 - `SCRIPT_PATH` — the script's own resolved path; used for the `~/.local/bin` symlink and the self-update re-exec, so a renamed checkout still works
@@ -83,10 +91,10 @@ All paths, markers, intervals, and config variables. Key globals:
 
 This section also aborts immediately if `$HOME` is unset, missing, or not writable — every path olecharms writes lives under it.
 
-### 2. Color / Output Helpers (lines 120-137)
+### 2. Color / Output Helpers (lines 122-139)
 `info()`, `warn()`, `error()` with color support. Colors auto-disable when stdout is not a terminal. `error()` increments `ERROR_COUNT`, which `main()` turns into a non-zero exit status.
 
-### 3. Utility Functions (lines 139-1371)
+### 3. Utility Functions (lines 141-1493)
 General-purpose helpers:
 - `load_config()` — sources `packages.conf`, then `packages.local.conf` when present, with `OLECHARMS_OS` / `OLECHARMS_WSL` set so the local file can branch per machine
 - `ensure_local_conf_template()` — creates a commented `packages.local.conf` on install/update (never touches an existing one)
@@ -106,7 +114,7 @@ General-purpose helpers:
 - `ensure_scripts_dir()` — fails loudly if the checkout is read-only rather than generating half-written scripts
 - `_file_hash()` — portable file hashing (md5sum → md5 → cksum)
 - `find_downloads_dirs()` — locates `~/Downloads` (case-insensitive) and, on WSL, the Windows user's real Downloads folder (asked from Windows, so redirected or OneDrive folders are found); folders reaching the same place are listed once
-- `commit_generated()` — moves a generated script into place with an atomic same-directory rename, so a shell starting mid-update never sources half a file
+- `commit_generated()` — moves a generated script into place with an atomic same-directory rename, so a shell starting mid-update never sources half a file; an unchanged script is left as it is, keeping its date for the reload check below
 - `generate_hook_script()` — writes the shell-hook dispatcher
 - `install_shell_hook()` / `remove_shell_hook()` — manages hook lines in RC files
 - `sync_shell_hook()` / `hook_needed()` — the single place that reconciles the hook with the enabled features: regenerates it and ensures the RC lines when any feature is hook-scheduled, removes both otherwise. Every enable/disable path ends here, so switching a feature between hook and cron cannot leave it running from both
@@ -117,7 +125,7 @@ General-purpose helpers:
 - `enable_downloads_cleanup()` / `disable_downloads_cleanup()` — manages the downloads cleaner: writes the `scripts/cleanup-downloads.sh` launcher, the cron entry or hook, and the config keys
 - `enable_paranoid_mode()` / `disable_paranoid_mode()` — manages paranoid-mode cleaner. On WSL with the Windows integration on (`paranoid_covers_windows()`), the generated script also purges the Windows gVim's `_viminfo`, `vimfiles/swapfiles` and `vimfiles/undodir`; the Windows path is resolved at generation time (PowerShell is too slow for every run) and the script is regenerated when the integration is toggled. Disabling leaves the downloads cleanup on and says so
 
-### 3b. Aliases (lines 1373-1914)
+### 3b. Aliases (lines 1495-2036)
 User-defined shell aliases, in two files with the same format:
 - per machine: `~/.config/olecharms/aliases` (next to the config, not in the gitignored `scripts/`, so they survive a fresh clone and a moved checkout)
 - global: `global-aliases.sh` in the repo, committed and pushed by olecharms itself, so every machine gets it on its next update. The loader sources it first, so a per-machine alias of the same name wins.
@@ -143,10 +151,10 @@ Global aliases (`global_alias_*`):
 
 Both files hold `alias name='command'` lines and nothing else. The loader remembers the names it loaded (`_olecharms_loaded_aliases`) and unaliases them before re-sourcing, so a deleted alias also disappears from the running shell. Files written by older versions ended with an `_olecharms_unload_aliases()` function instead; one line naming every alias would make any two edits of `global-aliases.sh` on different machines conflict.
 
-### 3b2. Shared settings (lines 1916-2174)
+### 3b2. Shared settings (lines 2038-2305)
 `SHARED_KEYS`, `shared_differences()`, `shared_publish()`, `shared_apply()`, `shared_offer_after_pull()`, `config_shared_settings()` — see [Shared settings](#shared-settings).
 
-### 3c. Downloads Cleanup Engine (lines 2176-2746)
+### 3c. Downloads Cleanup Engine (lines 2307-2894)
 One implementation behind `olecharms cleanup`, its `--dry-run`, the config-menu preview, `doctor` and the scheduled runs:
 - `cleanup_real_dir()` — resolves the folder and refuses anything that is, or leads to, `$HOME` or `/`
 - `cleanup_collect()` — NUL-separated list of files older than N days; `desktop.ini` (Windows) and `.localized` (macOS) always stay, since they give the folder its localized name ("Descargas")
@@ -155,7 +163,7 @@ One implementation behind `olecharms cleanup`, its `--dry-run`, the config-menu 
 - `cleanup_run()` — one pass: `mkdir` lock (a lock older than a day is taken over), collect, apply, remove empty dirs, log, trim the log to `CLEANUP_LOG_MAX_LINES`. Scheduled runs are silent and leave their trace in the log
 - `cleanup_print_preview()` / `cleanup_show_log()` — what the menu, `cleanup` and `--log` print
 
-### 3d. Windows (WSL) Integration (lines 2748-3241)
+### 3d. Windows (WSL) Integration (lines 2896-3389)
 Everything that reaches into Windows goes through PowerShell:
 - `win_ps_run()` — runs a PowerShell script as `-EncodedCommand` (UTF-16LE base64): nothing to quote through the interop layer, no execution-policy prompt, no temp `.ps1`. Output comes back as UTF-8; stdin is `/dev/null`, because `powershell.exe` otherwise swallows the user's pending input. The scripts (`PS_WIN_ENV`, `PS_FONTS`, `PS_RECYCLE`) are defined at top level with `read -d ''` — a heredoc inside `$(...)` is misparsed by the bash 3.2 that macOS ships
 - `win_powershell()` — finds `powershell.exe`, falling back to its standard path (cron's `PATH` has no Windows dirs)
@@ -166,7 +174,7 @@ Everything that reaches into Windows goes through PowerShell:
 - `sync_windows_side()` — the install/update step; skipped when `windows_integration=off` or Windows is unreachable
 - `win_recycle()` — the Recycle Bin backend: maps paths with one `wslpath` call for the root, then `SHFileOperation` with `ALLOWUNDO|SILENT|NOCONFIRMATION|NOERRORUI`, so no dialog ever opens from a background run
 
-### 4. Config Versioning (lines 3243-3483)
+### 4. Config Versioning (lines 3391-3647)
 XDG-based configuration persistence:
 - `config_read()` — parses key=value file into `OLECHARMS_CFG_*` variables (no `source`, safe)
 - `config_get()` / `config_set()` — read/write individual keys
@@ -177,7 +185,7 @@ XDG-based configuration persistence:
 - `restore_scheduled_features()` — reconciles config → filesystem. `scripts/` is gitignored, so a fresh clone (or a moved install) has no generated cleanup scripts even when the config says a feature is on. It regenerates them on every run — not only when missing — because that is how fixes to their templates reach existing installs; the crontab and config are only rewritten when something differs. A downloads folder that is not reachable (an unmounted `/mnt/c`, an external drive) is skipped with a warning, never disabled in the config. Ends with `sync_shell_hook()`. Called by `install`/`update` and by `fix_moved_install()`
 - `fix_moved_install()` — repairs stale absolute paths after the checkout is moved
 
-### 5. Core Operations (lines 3485-3940)
+### 5. Core Operations (lines 3649-4104)
 The installation steps called by subcommands:
 - `install_packages()` — apt/brew install with smart skip of already-installed packages
 - `create_vim_dirs()` — creates `~/.vim/{autoload,bundle,bundle_disabled,undodir,swapfiles}`
@@ -189,12 +197,15 @@ The installation steps called by subcommands:
 - `install_zsh_extras()` — with `zsh_extras=on` (default), clones or fast-forwards zsh-autosuggestions and zsh-syntax-highlighting into `~/.local/share/olecharms/zsh-plugins/` (`zsh_extra_fetch()` never deletes a folder it did not create); fzf itself comes from the package lists
 - `run_post_commands()` — runs user-defined post-install commands
 
-### 6. Subcommand Handlers (lines 3942-6301)
+### 5b. Commands on PATH, tools, trash, coding agents, startup (lines 4106-4874)
+`install_bin_links()` / `bin_link_ours()` / `doctor_check_bin_links()`, `zoxide_import_autojump()`, `tldr_cache_update()`, `install_mise()`, `doctor_check_tools()`; `cmd_trash()` with `trash_refusal()` and `trash_backend_for()`; `agents_text()`, `agents_refresh()`, `agents_put_block()`, `agents_protect()`, `cmd_agents()`, `doctor_check_agents()`; `zsh_startup_ms()`, `doctor_check_startup()`, `doctor_profile()`; `doctor_check_history()`, `doctor_check_identities()`.
+
+### 6. Subcommand Handlers (lines 4876-7401)
 Includes the zsh extras (`zsh_extra_fetch()`, `install_zsh_extras()`, `config_zsh_extras()`, lines 4001-4135) and the doctor (from line 4137).
 - `_self_update()` — pulls the olecharms repo itself, re-execs (through `bash`, so a lost exec bit cannot abort it) if the script changed. Warns when `packages.conf` has local edits, and when `--autostash` had to park them in `git stash` because they clashed with the update
 - `run_setup_steps()` — the step sequence shared by install and update
 - `cmd_install()` — full idempotent setup sequence
-- `cmd_update()` — same steps; tells the user to `exec zsh` when RC files, the loader or aliases changed (`shell_config_snapshot()`)
+- `cmd_update()` — same steps; its last words say when the terminal needs reloading (`shell_reload_notice()`, below)
 - `cmd_doctor()` — see [Doctor](#doctor); `check` is an alias
 - `cmd_cleanup()` — `olecharms cleanup [--dry-run|--log|--yes]`, and `--scheduled` for the launcher
 - `cmd_windows()` — WSL only: `sync` (default) or `status`
@@ -210,10 +221,10 @@ Includes the zsh extras (`zsh_extra_fetch()`, `install_zsh_extras()`, `config_zs
 - `choose_downloads_dir()` / `choose_cleanup_action()` — prompts shared with paranoid mode; they run inside `$(...)`, so their messages go to stderr
 - `config_paranoid_mode()` — interactive enable/disable of paranoid mode. Enabling keeps downloads at most `PARANOID_MAX_AGE_DAYS` (15) old: it enables the cleanup, or lowers a longer max age, after a preview of what that removes and a confirmation
 
-### 7b. Secrets (lines 6303-6605)
+### 7b. Secrets (lines 7403-7705)
 `secret_scan()`, `rc_toplevel_lines()`, `secret_import()`, `secret_set()` / `secret_rm()` / `secret_list()`, `doctor_check_secrets()`, `cmd_secret()` — see [Secrets](#secrets).
 
-### 8. Main (lines 6607-6679)
+### 8. Main (lines 7707-7781)
 Calls `detect_os`, dispatches `$1` to the appropriate `cmd_*` handler, warns when running as root (everything would be installed into root's home; `OLECHARMS_ALLOW_ROOT=1` silences it), and exits non-zero if `ERROR_COUNT > 0`.
 
 ## Subcommand Flows
@@ -224,6 +235,9 @@ Calls `detect_os`, dispatches `$1` to the appropriate `cmd_*` handler, warns whe
 2. `_self_update` — pull the olecharms repo; re-exec if script changed
 3. `ensure_local_conf_template` — create the commented per-machine file if missing
 4. `install_packages` — install missing system packages (skip already-installed)
+4b. `install_mise` — Linux: mise's release binary into `~/.local/bin`, checked against the release's SHA-256 list (macOS: Homebrew)
+4c. `zoxide_import_autojump` — once: zoxide takes autojump's folders over
+4d. `tldr_cache_update` — tealdeer's pages
 5. `create_vim_dirs` — ensure vim directory structure
 6. `install_pathogen` — clone or use bundled pathogen
 7. `install_plugins` — clone/update all vim plugins
@@ -234,16 +248,20 @@ Calls `detect_os`, dispatches `$1` to the appropriate `cmd_*` handler, warns whe
 11. `run_post_commands` — execute user-defined commands
 12. `install_shell_commands` — generate loader, add to RC files
 13. `install_binary` — symlink `olecharms` to `~/.local/bin`
+13b. `install_bin_links` — link every command in `bin/` into `~/.local/bin` (see [Commands on PATH](#commands-on-path))
 14. `install_editor_env` — export `EDITOR=vim` and `VISUAL=vim` in RC files
 15. `restore_scheduled_features` — regenerate cleanup launchers, cron entries and the hook
 16. `sync_windows_side` — WSL only: Windows fonts, then Windows gVim config and plugins
+16b. `agents_refresh` — the instructions for coding agents (see [Coding agents](#coding-agents))
 17. `shared_offer_after_pull` — when `shared-config` changed since this machine last went through it (always, on a new machine) and differs here: with a terminal, `shared_apply` asks about each setting; otherwise it says so
-18. On install only, with a terminal and a clean run: show the result in zsh without nesting shells. Through the `olecharms()` shell function the calling shell itself is replaced (`exec zsh -l`); from a zsh started any other way olecharms only prints the command; from another shell it `exec`s zsh as before. On update, it says when the shell configuration changed
+18. On install only, with a terminal and a clean run: show the result in zsh without nesting shells. Through the `olecharms()` shell function the calling shell itself is replaced (`exec zsh -l`); from a zsh started any other way olecharms only prints the command; from another shell it `exec`s zsh as before. On update, sync, `doctor --fix` and `config`, the last thing shown is the reload offer or notice (see Reloading the terminal)
 
 ### `doctor` (alias `check`)
-Checks every area olecharms touches and prints `✓` / `~` (warning) / `✗` (problem), for warnings a plain-words line on why it matters (`doc_why`), and a `→` hint: system commands; the checkout (merge/rebase in progress, conflict markers, branch without upstream, commits ahead/behind as of the last fetch, stash entries, days since the last successful pull, git password helpers that no longer exist — `git_effective_helpers()` works out the ones git really runs for the olecharms remote, so a broken generic helper overridden for GitHub by `gh auth setup-git` is reported as harmless for olecharms); launcher symlink, exec bit and PATH; shell loader (generator stamp), its line in each RC file (and whether `.zshrc` loads it before oh-my-zsh), EDITOR, aliases, autojump activation, the clipboard backend, secrets (file mode, plain-text secrets in RC files and in old RC backups), login shell; vim dirs, pathogen, plugins, the `~/.vimrc` line (and an old full copy of olevimrc in it, which loads the config twice: `vimrc_own_lines()` compares it with every version of olevimrc.vim in git plus the pre-repo one, and lists any line that is the user's own); fonts; Oh My Zsh and theme; fzf and the zsh plugins; downloads cleanup (folder, backend, schedule, cron daemon, last run, what is due); paranoid mode; config version, moved checkout, local edits to `packages.conf`, differences from the shared settings; and on WSL the Windows side (fonts, Windows Terminal font — read with python3 for the WSL profiles —, gVim, `_vimrc`, `olevimrc.vim` copy, plugins). Exits 1 when there is a problem.
+Checks every area olecharms touches and prints `✓` / `~` (warning) / `✗` (problem), for warnings a plain-words line on why it matters (`doc_why`), and a `→` hint: system commands; the checkout (merge/rebase in progress, conflict markers, branch without upstream, commits ahead/behind as of the last fetch, stash entries, days since the last successful pull, git password helpers that no longer exist — `git_effective_helpers()` works out the ones git really runs for the olecharms remote, so a broken generic helper overridden for GitHub by `gh auth setup-git` is reported as harmless for olecharms); launcher symlink, exec bit and PATH; shell loader (generator stamp), its line in each RC file (and whether `.zshrc` loads it before oh-my-zsh), EDITOR, aliases, autojump activation, the clipboard backend, secrets (file mode, plain-text secrets in RC files and in old RC backups), login shell; vim dirs, pathogen, plugins, the `~/.vimrc` line (and an old full copy of olevimrc in it, which loads the config twice: `vimrc_own_lines()` compares it with every version of olevimrc.vim in git plus the pre-repo one, and lists any line that is the user's own); fonts; Oh My Zsh and theme; fzf and the zsh plugins; tools (rg, fd, bat, delta, jq, tldr, ag, zoxide, mise); commands linked into `~/.local/bin`; shell history (file mode, a later `unset HISTFILE`); shell startup time (only at a terminal, not in the daily run); SSH identities (key modes, bound folders that are gone); coding agents (instructions current, Claude Code permission rules); downloads cleanup (folder, backend, schedule, cron daemon, last run, what is due); paranoid mode; config version, moved checkout, local edits to `packages.conf`, differences from the shared settings; and on WSL the Windows side (fonts, Windows Terminal font — read with python3 for the WSL profiles —, gVim, `_vimrc`, `olevimrc.vim` copy, plugins). Exits 1 when there is a problem.
 
-`doctor --fix` first re-runs the local, offline steps (`run_local_steps()`: vim dirs, `~/.vimrc`, loader and RC lines, launcher, EDITOR, scheduled features, the Windows side), then checks. Repairs that change something outside olecharms' own files are registered by the checks with `doc_offer "question" command args...` and `doctor_apply_offers()` asks about each one (`[y/N]`, only at a terminal): remove a broken git password helper (`git_helper_remove()`, from the file `--show-origin` names, backup kept) or let git use the GitHub CLI login (`gh auth setup-git`); remove an old olevimrc copy from `~/.vimrc` (backup kept); set the Powerline font in Windows Terminal's `settings.json` (`wt_set_font()`, backup kept); `chsh` to zsh; go through differing shared settings; move plain-text secrets into the secrets file; make the secrets file or old RC backups holding secrets private. Checks whose hint is `olecharms update` / `olecharms sync` make it offer that run at the end. After any repair it checks again and prints the new totals.
+`doctor --fix` first re-runs the local, offline steps (`run_local_steps()`: vim dirs, `~/.vimrc`, loader and RC lines, launcher, EDITOR, scheduled features, the Windows side), then checks. Repairs that change something outside olecharms' own files are registered by the checks with `doc_offer "question" command args...` and `doctor_apply_offers()` asks about each one (`[y/N]`, only at a terminal): remove a broken git password helper (`git_helper_remove()`, from the file `--show-origin` names, backup kept) or let git use the GitHub CLI login (`gh auth setup-git`); remove an old olevimrc copy from `~/.vimrc` (backup kept); set the Powerline font in Windows Terminal's `settings.json` (`wt_set_font()`, backup kept); `chsh` to zsh; go through differing shared settings; move plain-text secrets into the secrets file; make the secrets file or old RC backups holding secrets private; make a private key or history file private; add the Claude Code permission rules (`agents_protect`). Checks whose hint is `olecharms update` / `olecharms sync` make it offer that run at the end. After any repair it checks again and prints the new totals.
+
+`doctor --profile` shows where a new interactive zsh spends its startup: `zsh -i -x` with a timestamped `PS4` writes a trace to a private temp file (deleted right away); the time between lines is summed per file and function and only names and times are printed — never the commands, which could hold secrets.
 
 Every run records its outcome in `~/.local/state/olecharms/doctor.problems` (removed when clean). With `daily_doctor=on` (the default; toggle in `config`) the shell hook runs `doctor --quiet` once a day in the background through `scripts/doctor-daily.sh`, and while that file exists every new shell prints one line about it — a machine you rarely use tells you when it drifted.
 
@@ -275,6 +293,10 @@ Shows OS, repo path, config version, repo commit, installed plugin versions (com
 
 Because a child process cannot change its parent shell's aliases, the generated loader defines an `olecharms()` shell function that runs the real script and reloads the alias files afterwards (also after `aliaslast` and `update`). For `aliaslast` it first writes a snapshot of the shell's history and taken names to a private temp dir (`OLECHARMS_SHELL_SNAPSHOT`), removed afterwards. That makes a new alias usable immediately in the shell that created it; the script prints `Ready to use in this session.` when it detects the wrapper (via `OLECHARMS_SHELL_WRAPPER`) and otherwise points at the file to `source`.
 
+### Reloading the terminal
+
+A running shell keeps the configuration it read at startup. The loader records when that was (`_olecharms_loaded_at`, epoch seconds: zsh `$EPOCHSECONDS`, bash `printf %(%s)T`, else `date`), and the `olecharms()` wrapper passes it to `update`, `sync`, `doctor` and `config` (`OLECHARMS_SHELL_LOADED_AT`) with an empty flag file of its own (`OLECHARMS_RELOAD_FLAG`). At the end, `shell_reload_needed()` checks whether anything the shell reads at startup (`shell_startup_files()`: RC files, `.profile`/`.zshenv`/`.zprofile`, loader, hook, secrets, `shell/*.sh`, the olecharms theme, the zsh extras) is newer than that — changed by this run, by a pull, or from another terminal. If so, the script writes the flag and the wrapper, once the script has exited, asks `Reload it now (exec zsh)? [Y/n]` (bash: `exec bash`); never with stopped or background jobs (it says to run it once they are done), and without a terminal it only says so. Run without the wrapper, the script compares `shell_config_snapshot()` hashes from before the pull (carried across the relaunch in `OLECHARMS_SHELL_BEFORE`) and prints the notice as its last line. `commit_generated()` leaves unchanged scripts alone so their dates do not trigger a false reload.
+
 ### `config`
 Interactive menu loop offering:
 1. **Downloads auto-cleanup** — enable with folder, schedule (hook/cron), trash-or-delete and a preview; once enabled, preview / change action / change max age / history / disable
@@ -283,9 +305,12 @@ Interactive menu loop offering:
 4. **Daily health check** — `daily_doctor` on/off
 5. **Shared settings** — share this machine's settings with every machine (`shared_publish`, through the same publish path as global aliases), apply the shared ones here (`shared_apply`), or follow again the ones kept different
 6. **Zsh extras** — fzf keys, suggestions and syntax colours on/off (`config_zsh_extras`)
+7. **Shell history** — `shell_history` on/off (`config_toggle`)
+8. **Agent instructions** — `agent_instructions` on/off
+9. **mise** — `mise` on/off (on: installed by the next update, activated in new shells)
 
 ### Shared settings
-`shared-config` in the checkout holds `SHARED_KEYS`: the cleanup's max age, action, quarantine days and on/off, paranoid mode, the daily health check and zsh extras — not folders, scheduling methods or the Windows integration, which stay per machine. It travels like `global-aliases.sh`: `shared_publish()` runs `global_alias_publish` with `GLOBAL_PUBLISH_FILE` set to it, so the commit holds that file alone and the push gets the same access checks and retries. A machine never applies shared settings on its own: `shared_apply()` asks about each difference — `[y]es` applies it the way `config` does (enabling the cleanup or paranoid mode shows the preview and asks again; a shorter max age shows what it removes), `[n]ot now`, or `[k]eep this machine different`, recorded in `shared_keep_local` and left out of comparisons. A cleanup age or action makes no difference while the cleanup is off on both sides and is not reported. `~/.local/state/olecharms/shared-seen` holds the fingerprint of the file this machine last went through, so `sync` / `update` speak up only when it changed; `doctor` always lists differences.
+`shared-config` in the checkout holds `SHARED_KEYS`: the cleanup's max age, action, quarantine days and on/off, paranoid mode, the daily health check, zsh extras, shell history, agent instructions and mise — not folders, scheduling methods or the Windows integration, which stay per machine. It travels like `global-aliases.sh`: `shared_publish()` runs `global_alias_publish` with `GLOBAL_PUBLISH_FILE` set to it, so the commit holds that file alone and the push gets the same access checks and retries. A machine never applies shared settings on its own: `shared_apply()` asks about each difference — `[y]es` applies it the way `config` does (enabling the cleanup or paranoid mode shows the preview and asks again; a shorter max age shows what it removes), `[n]ot now`, or `[k]eep this machine different`, recorded in `shared_keep_local` and left out of comparisons. A cleanup age or action makes no difference while the cleanup is off on both sides and is not reported. `~/.local/state/olecharms/shared-seen` holds the fingerprint of the file this machine last went through, so `sync` / `update` speak up only when it changed; `doctor` always lists differences.
 
 ### Clipboard
 `bin/olecharms-clip` (POSIX sh) is the one place that knows how to reach the system clipboard: over SSH without X forwarding, OSC 52 to the local terminal (wrapped for tmux and screen; paste is impossible that way and says so); macOS `pbcopy`/`pbpaste`; WSL `win32yank.exe` when present, else `clip.exe` fed UTF-16LE (so accents survive) and PowerShell's `Get-Clipboard` (about a second); Wayland `wl-copy`/`wl-paste`; X11 `xclip`/`xsel`. A copy of a single line drops its trailing newline. `OLECHARMS_CLIP_FILE` swaps the clipboard for a file in tests; `OLECHARMS_CLIP_BACKEND` forces a backend.
@@ -297,8 +322,25 @@ Terminal Vim (`olevimrc.vim`, not gVim, and only without a working `+clipboard`)
 ### Secrets
 `~/.config/olecharms/secrets` holds `export NAME='value'` lines, mode 600 from the first byte (`secret_rewrite()` writes a private temp file and renames it). The shell loader sources it when the user owns it, and the `olecharms()` wrapper re-sources it (or unsets the name) after `secret` so the current shell sees the change. `secret_scan()` finds unindented `NAME=value` lines outside any if/case/loop/function block (`rc_toplevel_lines()`, since `zsh -n` accepts an emptied block) in the shell startup files, whose name looks like a secret (`secret_name_like()`: KEY, TOKEN, SECRET, PASS(WORD), PAT, CREDENTIALS as a `_`-separated part — not `KEYTIMEOUT`) and whose value is a literal (no `$VAR`, `$(...)`). `secret_import()` moves those lines verbatim to the secrets file; in the RC file the first of them becomes `[ -f "$HOME/.config/olecharms/secrets" ] && . "$HOME/.config/olecharms/secrets"  # olecharms secrets`, so later lines that use them and shells that read only that file (`.zshenv`, `.profile`, cron, `ssh host cmd`) keep working, and the rest go. The edit is in place, with no lasting backup of the RC file (it would keep the secret in plain text): a private copy exists only until the write succeeded. It refuses when the line count is off or the edited file would no longer parse (`rc_parses_like()`, `bash -n` / `zsh -n`). Values are never printed.
 
+### Commands on PATH
+Every executable in `bin/` is linked into `~/.local/bin` (`install_bin_links()`), so scripts and coding agents — which never load the shell functions — can run them; `cmd_help` lists them from their second line (`# name — description`). A name already taken is left alone: a file of the user's in `~/.local/bin`, or another program on PATH (`bin_command_elsewhere()`: a system `trash`, say). Only links olecharms made (`bin_link_ours()`: into the `bin/` of an olecharms checkout, this one or a moved or vanished one, for names it ships) are ever replaced or removed — a broken link of the user's is not. Debian's `fdfind` and `batcat` get the usual names `fd` and `bat` the same way (`BIN_SHIMS`), removed again when the program goes. The loader puts `~/.local/bin` first on PATH itself, since the RC files' PATH line often comes after it.
+
+### trash
+`olecharms trash` (and `bin/trash`) moves files and folders away recoverably, with the cleanup's own backends and the cleanup's "auto" policy (`trash_backend_for()`): a Windows drive's Recycle Bin, the macOS Trash, a desktop session's trash (not on WSL, whatever `DISPLAY` says), else the quarantine. Each source folder gets its own quarantine batch, named after the time — a second later when that name is taken (`quarantine_new_batch()`), so batches never merge — with its `.origin`; `trash --restore` is the cleanup's restore picker, `trash --list` lists the batches, and every run expires old ones. `trash_refusal()` refuses `/`, anything holding the home folder, the checkout, the config or state folders, system locations, a whole drive, profile, home or volume, and what is already in the quarantine. A symlink goes as itself; a folder is judged where it really is.
+
+### SSH identities (ssk)
+`bin/ssk` keeps the key pairs `switchsshkey add` always stored (`~/.ssh/<name>.privatekey|.pubkey`) and adds details in `~/.config/olecharms/identities/<name>` (email, name, gh). Nothing global changes unless asked: `ssk run <name> -- cmd` exports `GIT_SSH_COMMAND` (`ssh -i <key> -o IdentitiesOnly=yes`, so an ssh-agent cannot offer another account's key first), the author and committer, and `GH_TOKEN` from `gh auth token --user` for that one command; `ssk bind <name> <folder>` writes `identities/<name>.gitconfig` (core.sshCommand, user.email/name) and an `includeIf "gitdir:<folder>/"` entry in `~/.gitconfig`, so git — for the user, scripts and agents alike — uses the identity inside that folder; one binding per folder; refuses `/` and the home folder; `unbind` removes only entries pointing at its own files (works for a folder that was deleted, by its path). `ssk which` says what git will use in a folder; `ssk test` asks the host (`ssh -T`, BatchMode) who the key is. The old `ssk <name>` still copies the pair over `~/.ssh/id_ed25519` (keeping an unnamed active key as `backup-<time>`) and warns when ssh-agent holds other keys. Changes refresh the agents' instructions. The `switchsshkey` / `ssk` shell functions call `bin/ssk`.
+
+### Coding agents
+`agents_text()` writes a short instruction text from the machine's real state: the identities (`ssk list --plain`, read field by field since `read` would merge the tabs around an empty field) and their folders, how to run a command as one, what never to do (switch globally, read or print private keys or the secrets file, edit `~/.ssh/config` or global git config, work around a permission error), and the commands installed (trash when linked, olecharms-clip, rg, fd, ag, jq, tldr, mise, worktrees, doctor). Always-loaded instructions rather than a skill: Vercel measured an AGENTS.md index at 100 % against 53 % for a skill agents often did not load. `agents_refresh()` (update, sync, `doctor --fix`, `config`, ssk) puts it, for the agents whose folder exists, in `~/.claude/rules/olecharms.md` (Claude Code's user-level rules; the file is olecharms' own, first line the marker — a file of the user's there is left alone) and in a marked block of `~/.codex/AGENTS.md` and `~/.gemini/GEMINI.md` (`agents_put_block()`: replaces the old block in place, never touches text outside it, writes with `cat >` to keep the file's mode and links). `agent_instructions=off` removes them. `olecharms agents protect` adds Claude Code permission rules (`AGENT_DENY_RULES`: no reading `~/.ssh/id_*`, `*.privatekey` or the secrets file, no editing `~/.ssh`) to `~/.claude/settings.json` with python3, after a backup, keeping everything else and refusing a file that is not valid JSON; the doctor offers it.
+
+### Shell history
+With `shell_history=on` the loader sources `shell/lib/history.zsh` or `history.bash` in interactive shells: `HISTFILE` in `~/.local/state/olecharms/history/` (dir 700, files 600), 50 000 lines, `hist_ignore_space` / `ignoreboth`. A line that looks like it holds a secret never reaches the file, and each shell does that with its own built-in mechanism rather than any code of ours: zsh's `zshaddhistory` hook returns 2 (the line stays in the session's memory, out of the file), and bash lists the same shapes in `HISTIGNORE`, which keeps a matching line out of the history list altogether, so bash never writes it either. Nothing unsets `HISTFILE`, truncates the file or removes an entry — bash keeps and trims it as it does by default (`histappend`, so one session does not overwrite another), and the rules only decide what is not taken down in the first place. That is deliberate: `unset HISTFILE`, `history -c`, `history -d` and `HISTSIZE=0` are the signatures EDR tools match for history tampering (T1070.003), and a config that keeps *more* history than the default, minus credentials, should not be written in their shape. "Looks like a secret": an assignment or option whose name has KEY, TOKEN, SECRET, PASS(WORD|WD), PAT or CREDENTIAL(S) before the `=` (not PATH, not `--author=`), known token shapes (ghp_, github_pat_, glpat-, xox?-, AKIA, AIza, sk-), Bearer / Authorization / X-Api-Key headers, `user:password@` in a URL, sshpass, private key blocks, and the value of any olecharms secret (names read once; the wrapper re-reads them after `olecharms secret`).
+
+zsh matches with one case-insensitive regexp; bash's `HISTIGNORE` takes shell globs that must match the whole line, so `history.bash` is wider by necessity — a length is pinned with one `?` per character (`*gh[pousr]_` + 20 `?`), the letters are spelled in `[Kk]` pairs because the match is case-sensitive, and the `=` has to follow the word itself so `PATH=` is not read as a PAT assignment. Two constraints shape that file: `HISTIGNORE` splits its list on `:`, so a colon inside a pattern is escaped `\:` (and so is one inside a secret's value); and it only enables extglob while `shopt extglob` is on, so no pattern uses `@(…)`/`*(…)` — a later `shopt -u extglob` would otherwise stop it matching, silently, which is the one failure that would leak. A secret value under 8 characters is left to the name patterns, being too short to pin a line down. `tests/13` checks both directions: the secret lines stay out, and a batch of ordinary ones (`PATH=`, `ssh://git@host`, `CC=clang`) survives, since a single stray catch-all pattern would quietly empty the file. Paranoid mode deletes both files. The user's own `unset HISTFILE` before olecharms' block is overridden; one after it wins, and the doctor says so.
+
 ### Zsh extras
-With `zsh_extras=on` the loader, in interactive shells only, sets up fzf's key bindings in bash and zsh (`fzf --zsh` / `--bash` on fzf ≥ 0.48, else the scripts the package ships) and, in zsh, sources zsh-autosuggestions (strategy `history completion`, since history is often not saved) and then zsh-syntax-highlighting, last as it requires. Each is skipped when something already loaded it. The setting is written into the loader, so changing it regenerates it. `pick_item()` (aliaslast, `cleanup --restore`) uses fzf when present — newest entry at the cursor, typing filters — unless `OLECHARMS_NO_FZF` is set.
+With `zsh_extras=on` the loader, in interactive shells at a terminal only (`zsh -ic` run by a script or by an editor reading the environment has no line editor, though zsh still sets its `zle` option, and fzf's bindings would print errors), sets up fzf's key bindings — listing files with fd (or `fdfind`), else ripgrep, else ag, and previewing with bat (or `batcat`), unless `FZF_DEFAULT_COMMAND` / `FZF_CTRL_T_OPTS` are already set — in bash and zsh (`fzf --zsh` / `--bash` on fzf ≥ 0.48, else the scripts the package ships) and, in zsh, sources zsh-autosuggestions (strategy `history completion`, since history is often not saved) and then zsh-syntax-highlighting, last as it requires. Each is skipped when something already loaded it. The setting is written into the loader, so changing it regenerates it. `pick_item()` (aliaslast, `cleanup --restore`) uses fzf when present — newest entry at the cursor, typing filters — unless `OLECHARMS_NO_FZF` is set.
 
 ## packages.conf
 
@@ -335,7 +377,9 @@ Shell commands that are auto-sourced into the user's shell session via a generat
 | `mksh` | Create a new shell script with strict-mode boilerplate, make it executable, open in editor |
 | `serveit` | Start a static file server using whichever runtime is available (python3 → python → npx → ruby → php) |
 | `each` | Run a command for every line of stdin, replacing `{}` with each line |
-| `switchsshkey` | Manage named SSH key pairs: `add`, `list`, or switch by name |
+| `switchsshkey` / `ssk` | SSH keys and git identities (see [SSH identities](#ssh-identities-ssk)); calls `bin/ssk` |
+| `tempe` | cd into a new empty folder in the temp dir |
+| `wt` | git worktrees in `<repo>.worktrees/<task>`, one branch each: `wt <task>` creates or enters, `wt rm` (never forced; an unmerged branch is kept), `wt list` (fzf picker), `wt root`, `wt prune` |
 | `copy` / `paste` | The system clipboard on Linux, macOS, WSL and over SSH (see [Clipboard](#clipboard)) |
 
 To add a new shell command, create a file in `shell/` following the format:
@@ -352,7 +396,7 @@ The first line (`# name — description`) is parsed by `cmd_help` to display ava
 
 These files are generated by `olecharms.sh` and are not committed to the repo:
 
-- **`olecharms-shell.sh`** — sources all `shell/*.sh` files (resolving its own directory at runtime to find `shell/`), activates autojump, loads the secrets file, sets up the zsh extras, loads the aliases and defines the `olecharms()` wrapper
+- **`olecharms-shell.sh`** — puts `~/.local/bin` on PATH, sources all `shell/*.sh` files (resolving its own directory at runtime to find `shell/`), activates zoxide (`j`, `ji`) or else autojump, activates mise (interactive shells, terminal or not), sets up the shell history, loads the secrets file, sets up the zsh extras, loads the aliases and defines the `olecharms()` wrapper
 - **`olecharms-hook.sh`** — shell-hook dispatcher; resolves its own directory at runtime to find sibling scripts and `.last-run/`
 - **`cleanup-downloads.sh`** — a launcher for `olecharms cleanup --scheduled`, which reads folder, age and action from the config at run time (see [Downloads Cleanup Engine](#3c-downloads-cleanup-engine-lines-1822-2392)). The engine works on the folder's resolved path — on WSL `~/downloads` is usually a symlink into `/mnt/c`, and plain `find` does not descend into a symlinked starting point
 - **`paranoid-cleanup.sh`** — every 12 hours, permanently deletes shell history (plus the shell's own `$HISTFILE`, which the hook passes as an argument: only a history-named file inside home), other tools' histories (less, python, node, sqlite, psql, mysql, irb, redis-cli, wget HSTS), the cleanup log, `~/.viminfo` and vim swap/undo files; on WSL also the Windows gVim's `_viminfo` and `vimfiles` swap/undo files
@@ -374,7 +418,7 @@ Simple `key=value` pairs. Parsed safely without `source` — only alphanumeric k
 - `migrate_config()` loops from the file's `CONFIG_VERSION` up to `CURRENT_CONFIG_VERSION`, calling `migrate_config_N_to_M()` functions if they exist
 - To add a new config flag: increment `CURRENT_CONFIG_VERSION`, add a `migrate_config_N_to_M()` function that calls `config_set` for the new key, and update `config_write_all()` to include it
 
-### Current config keys (v4)
+### Current config keys (v5)
 - `downloads_cleanup_enabled` (true/false)
 - `downloads_cleanup_dir` (path)
 - `downloads_cleanup_method` (hook/cron)
@@ -386,6 +430,7 @@ Simple `key=value` pairs. Parsed safely without `source` — only alphanumeric k
 - `windows_integration` (auto/off) — v3, WSL only
 - `daily_doctor` (on/off) — v4
 - `zsh_extras` (on/off, default on) — written only when changed
+- `shell_history`, `agent_instructions`, `mise` (on/off, default on) — v5
 - `shared_keep_local` (space-separated shareable keys this machine keeps different) — written only when used
 - `install_dir` (path) — records the installation directory for stale-path detection after folder moves
 
@@ -451,6 +496,12 @@ Every destructive path has two independent guards:
 | Zsh plugin clone that failed | plugin names are plain folder names | removes only the folder that very `git clone` created (it did not exist before) |
 | Lines moved out of RC files (`secret import`) | only unindented `NAME=literal` lines whose name looks like a secret, re-read right before the edit | the edited file must keep its line count minus those lines and still parse (`bash -n` / `zsh -n`); the lines themselves land in the secrets file first |
 | Old `olevimrc` copy in `~/.vimrc`, broken git helper, Windows Terminal font | only on a `y` in `doctor --fix`, after the doctor listed any line that is the user's own | a timestamped backup of the file first |
+| `trash` | `trash_refusal()`: never `/`, anything holding home, the checkout, config or state, system locations, a drive, profile, home or volume, nor the quarantine itself | moves only (Recycle Bin, Trash, quarantine batch per folder with its `.origin`, unique names); what is still there afterwards is reported as not moved |
+| Links in `~/.local/bin` | only links into an olecharms checkout's `bin/` (for names it ships) or the fd/bat shims | removed only when broken and pointing into this checkout's `bin/`, or a shim whose program is gone |
+| `wt rm` | the path must be one of git's own worktrees of this repository | `git worktree remove` without `--force` (refuses modified or untracked files); `git branch -d`, never `-D` |
+| `ssk unbind` / rebinding | only `includeIf` entries whose value is one of ssk's generated files | `--unset-all` with an anchored, escaped value pattern; the user's own entries stay |
+| Agent instructions | the Claude rules file only when its first line is olecharms' marker; elsewhere only the marked block | text outside the markers is copied through unchanged; `settings.json` gets a backup and is refused when it is not valid JSON |
+| mise download | a fresh `mktemp -d` | installed only after its SHA-256 matches the release's list and it runs; a mise installed some other way is never replaced |
 
 ### Windows side from WSL
 Windows' gVim cannot follow WSL symlinks and should not depend on WSL running, so it gets copies: the plugins olecharms already cloned for the terminal vim (without `.git`), pathogen and `olevimrc.vim`. Copies are stamped so updates can remove what olecharms put there and never touch anything else. Fonts are installed per user (HKCU), which needs no admin rights.
@@ -481,7 +532,7 @@ Blocks are added with `append_block()` (one blank separator line, none when the 
 
 ## Testing
 
-`tests/run.sh` runs every suite (about 410 checks, 2–3 minutes, offline); `tests/run.sh --full` adds `09-full-update` (48 more), which runs a real `olecharms update` twice and the Windows `vim.exe` on the result, so it needs WSL with Windows Vim and the network. `tests/run.sh 05 07` runs only the suites whose names start that way; `--keep` keeps the sandbox and logs (they are always kept when something fails). A suite can also run alone: `bash tests/05-deletion-safety.sh`.
+`tests/run.sh` runs every suite (about 600 checks, 5 minutes, offline; each suite is stopped after 15 minutes); `tests/run.sh --full` adds `09-full-update` (about 50 more), which runs a real `olecharms update` twice and the Windows `vim.exe` on the result, so it needs WSL with Windows Vim and the network. `tests/run.sh 05 07` runs only the suites whose names start that way; `--keep` keeps the sandbox and logs (they are always kept when something fails). A suite can also run alone: `bash tests/05-deletion-safety.sh`.
 
 | Suite | Covers |
 |-------|--------|
@@ -493,6 +544,10 @@ Blocks are added with `append_block()` (one blank separator line, none when the 
 | `06-sync-doctor-quarantine` | sync, doctor checkout checks, daily doctor, quarantine and restore, plugin retirement |
 | `07-clipboard-doctor-fix` | olecharms-clip, copy/paste, terminal Vim, doctor repairs (git helpers, old ~/.vimrc copy, Windows Terminal font), `--fix` prompts |
 | `08-shared-secrets-extras` | Shared settings, secrets, zsh extras, bootstrap (incl. socket stdin) |
+| `10-reload` | Reloading the terminal: load time, stale detection, notice, the wrapper's offer in real zsh and bash |
+| `11-utilities` | Links in `~/.local/bin` (names taken, shims, moved checkout, a broken link of yours), trash (backends, batches, restore, refusals), running/murder, tryna, timer, jsonformat, url, line, scratch, tempe, wt, zoxide/fzf/mise in the loader, mise install with checksum, tldr |
+| `12-identities` | ssk: add/set/list, bind/which/unbind (your own includeIf kept), run (key, author, GH_TOKEN), test, the old switch and its ssh-agent warning, doctor |
+| `13-agents-history-startup` | Agent instructions (Claude rules file, Codex block, refresh, off/on, a file of yours), Claude Code permission rules, history with secrets left out in real zsh and bash, paranoid wipe, startup time and `--profile` |
 | `09-full-update` | `--full` only: full update twice, Windows gVim sync and real `vim.exe`, doctor, local conf, config migration, self-update stash |
 
 **How they stay harmless** (`tests/lib/sandbox.sh`): each suite works on a copy of the checkout (without `.git` and `scripts/`) inside a temporary folder marked `.olecharms-test` — nothing is deleted outside a marked folder. `HOME`, `XDG_CONFIG_HOME` and the crontab (a fake one backed by a file, first on `PATH`) are the sandbox's; a fake `sudo` refuses, so no package is installed; `OLECHARMS_*` and `GIT_*` variables are cleared and the system git config ignored; Windows' gVim home is redirected into the sandbox (`OLECHARMS_WIN_VIM_HOME`), and `09-full-update` uses its own folder in the Windows temp dir, removed at the end. Like a real update, `09` installs the Powerline fonts for the Windows user if they are missing.

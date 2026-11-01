@@ -1,5 +1,5 @@
 #!/bin/sh
-# olecharms-clip — the system clipboard from a terminal, the same everywhere.
+# olecharms-clip — the system clipboard for scripts: copy / paste
 #
 #   olecharms-clip copy     < text     put stdin on the clipboard
 #   olecharms-clip paste    > text     print the clipboard

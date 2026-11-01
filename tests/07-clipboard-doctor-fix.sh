@@ -167,7 +167,8 @@ chk "summary after the repairs"              grep -q 'After the repairs:' <<< "$
 out=$(bash "$SB/repo/olecharms.sh" doctor 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
 chk "plain doctor points at --fix"           grep -q "Run 'olecharms doctor --fix'" <<< "$out"
 chk "clipboard line in doctor"               grep -q 'Clipboard:' <<< "$out"
-chk "generated loader has generator 5"       grep -q 'olecharms-generator: 5' "$SB/repo/scripts/olecharms-shell.sh"
+GV=$(sed -n 's/^GENERATOR_VERSION=//p' "$SB/repo/olecharms.sh")
+chk "generated loader has generator $GV"     grep -qx "# olecharms-generator: $GV" "$SB/repo/scripts/olecharms-shell.sh"
 chk "wrapper reloads aliases after doctor"   grep -q 'alias|aliaslast|update|sync|doctor)' "$SB/repo/scripts/olecharms-shell.sh"
 
 echo; echo "RESULT: $pass passed, $fail failed"

@@ -1,0 +1,74 @@
+#!/bin/sh
+# murder — stop processes by PID or text: TERM, then INT, KILL last
+# Usage: murder PID...        murder [-y] text   (a text matching several processes asks first; -y does not)
+yes=""
+[ "${1:-}" = -y ] && { yes=1; shift; }
+[ $# -gt 0 ] || { echo "Usage: murder PID... | murder [-y] text" >&2; exit 2; }
+me=$$ parent=$PPID
+pids=""
+case "$1" in
+    *[!0-9]*)
+        [ $# -eq 1 ] || { echo "murder: one text at a time (or PIDs)" >&2; exit 2; }
+        pat=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+        user=$(id -un)
+        # The list first, filtered afterwards: an awk running alongside ps
+        # would show up in it, with the text in its arguments
+        list=$(ps -A -o pid= -o user= -o args= 2>/dev/null)
+        matches=$(printf '%s\n' "$list" | awk -v pat="$pat" -v me="$me" -v parent="$parent" -v user="$user" '
+            { pid = $1; u = $2; cmd = $0; sub(/^ *[0-9]+ +[^ ]+ +/, "", cmd) }
+            pid == me || pid == parent || u != user { next }
+            cmd ~ /^ps -A -o pid= -o user= -o args=/ { next }
+            index(tolower(cmd), pat) && cmd !~ /(^|\/)murder( |$)/ { printf "%s\t%s\n", pid, cmd }')
+        [ -n "$matches" ] || { echo "murder: none of your processes matches '$1'" >&2; exit 1; }
+        n=$(printf '%s\n' "$matches" | wc -l | tr -d ' ')
+        if [ "$n" -gt 1 ] && [ -z "$yes" ]; then
+            printf '%s\n' "$matches" | awk -F '\t' '{ printf "%7s  %s\n", $1, $2 }'
+            if [ ! -t 0 ]; then
+                echo "murder: '$1' matches $n processes; name a PID, or add -y to stop them all" >&2
+                exit 1
+            fi
+            printf 'Stop these %s processes? [y/N] ' "$n"
+            read -r ans
+            case "$ans" in [yYsS]*) ;; *) echo "Nothing stopped"; exit 1 ;; esac
+        fi
+        pids=$(printf '%s\n' "$matches" | cut -f1 | tr '\n' ' ')
+        ;;
+    *)
+        for p in "$@"; do
+            case "$p" in ""|*[!0-9]*) echo "murder: not a PID: $p" >&2; exit 2 ;; esac
+            pids="$pids $p"
+        done
+        ;;
+esac
+
+alive() { kill -0 "$1" 2>/dev/null; }
+# Wait up to $2 tenths of a second for PID $1 to go
+gone_within() {
+    i=0
+    while [ "$i" -lt "$2" ]; do
+        alive "$1" || return 0
+        sleep 0.1 2>/dev/null || sleep 1
+        i=$((i + 1))
+    done
+    ! alive "$1"
+}
+rc=0
+for p in $pids; do
+    if [ "$p" -le 1 ] || [ "$p" = "$me" ] || [ "$p" = "$parent" ]; then
+        echo "murder: refusing PID $p" >&2; rc=1; continue
+    fi
+    if ! alive "$p"; then
+        echo "murder: no process $p you can signal" >&2; rc=1; continue
+    fi
+    for sig in TERM INT KILL; do
+        kill -s "$sig" "$p" 2>/dev/null || break
+        case "$sig" in KILL) t=20 ;; *) t=30 ;; esac
+        if gone_within "$p" "$t"; then
+            echo "Stopped $p ($sig)"
+            continue 2
+        fi
+    done
+    echo "murder: $p is still running" >&2
+    rc=1
+done
+exit "$rc"

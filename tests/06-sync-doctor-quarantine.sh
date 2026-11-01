@@ -22,7 +22,8 @@ printf 'CONFIG_VERSION=3\ndownloads_cleanup_enabled=false\nwindows_integration=o
 lib 'true' >/dev/null
 chk "daily_doctor=on added"                  grep -qx 'daily_doctor=on' "$H/.config/olecharms/config"
 chk "quarantine days added"                  grep -qx 'downloads_cleanup_quarantine_days=30' "$H/.config/olecharms/config"
-chk "version 4"                              grep -qx 'CONFIG_VERSION=4' "$H/.config/olecharms/config"
+CV=$(sed -n 's/^CURRENT_CONFIG_VERSION=//p' "$R/olecharms.sh")
+chk "current version ($CV)"                    grep -qx "CONFIG_VERSION=$CV" "$H/.config/olecharms/config"
 
 echo "== B. olecharms sync"
 gc -C "$R" init -q -b master && git -C "$R" add -A && gc -C "$R" commit -qm init

@@ -33,6 +33,13 @@ SB=$S/sb
 for _v in $(compgen -e | grep -E '^(OLECHARMS_|GIT_)'); do unset "$_v"; done
 unset _v XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME ZSH ZSH_CUSTOM ZDOTDIR HISTFILE
 unset SSH_CONNECTION SSH_TTY TMUX
+# Your own ~/.local/bin would make the tests depend on what you installed
+_p="" ; _IFS=$IFS; IFS=:
+for _d in $PATH; do
+    [ "$_d" = "$REAL_HOME/.local/bin" ] || [ "$_d" = "$REAL_HOME/bin" ] && continue
+    _p="$_p${_p:+:}$_d"
+done
+IFS=$_IFS; PATH=$_p; unset _p _d _IFS
 export GIT_CONFIG_NOSYSTEM=1
 
 # The Windows user's profile folder on WSL (empty elsewhere)

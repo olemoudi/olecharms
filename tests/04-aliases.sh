@@ -6,6 +6,9 @@ H=$SB/home R=$SB/repo
 export HOME=$H XDG_CONFIG_HOME=$H/.config PATH="$SB/bin:$PATH" CRON_FILE=$SB/crontab.txt
 export OLECHARMS_WIN_VIM_HOME=$SB/winhome GIT_CONFIG_NOSYSTEM=1
 unset XDG_DATA_HOME XDG_STATE_HOME ZSH ZSH_CUSTOM HISTFILE
+# These tests drive the built-in arrow-key picker; with fzf installed,
+# aliaslast would use fzf's instead
+export OLECHARMS_NO_FZF=1
 OC="bash $R/olecharms.sh"
 pass=0 fail=0
 ok()  { echo "  PASS $*"; pass=$((pass+1)); }

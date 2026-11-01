@@ -56,8 +56,10 @@ for f in "$TESTS_DIR"/[0-9][0-9]-*.sh; do
     fi
     log=$T/logs/$name.log
     printf '%-32s ' "$name"
-    OLECHARMS_TEST_TMP=$T bash "$f" > "$log" 2>&1
+    # A suite that hangs (waiting for input it will never get) is stopped
+    OLECHARMS_TEST_TMP=$T timeout "${OLECHARMS_TEST_TIMEOUT:-900}" bash "$f" > "$log" 2>&1
     rc=$?
+    [ "$rc" -eq 124 ] && echo "TIMEOUT: stopped after ${OLECHARMS_TEST_TIMEOUT:-900}s" >> "$log"
     if [ "$rc" -eq 77 ]; then
         echo "skipped: $(grep -m1 '^SKIP' "$log" | sed 's/^SKIP: //')"
         skipped=$((skipped + 1))
@@ -69,7 +71,7 @@ for f in "$TESTS_DIR"/[0-9][0-9]-*.sh; do
     passed=$((passed + ${p:-0}))
     if [ -z "$result" ] || [ "$rc" -ne 0 ]; then
         echo "FAILED (${p:-0} passed, ${n:-?} failed)"
-        grep -E '^ *FAIL |ABORT' "$log" | sed 's/^ */    /'
+        grep -E '^ *FAIL |ABORT|^TIMEOUT' "$log" | sed 's/^ */    /'
         [ -n "$result" ] || tail -n 5 "$log" | sed 's/^/    | /'
         failed=$((failed + ${n:-1}))
         bad_suites+=("$name")

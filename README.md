@@ -36,5 +36,19 @@ olecharms config        # downloads cleanup, paranoid mode, shared settings, zsh
 olecharms help          # every command
 ```
 
+Handy commands it adds (`olecharms help` lists them all):
+
+```sh
+j proj                  # jump to a folder you have visited (zoxide; ji picks one)
+trash old.zip build/    # delete recoverably (Recycle Bin, Trash or a 30-day quarantine)
+ssk bind work ~/work    # git inside ~/work always uses the "work" SSH key and email
+ssk run personal -- git push   # one command as another identity, nothing global changes
+wt feature-x            # a git worktree per task or agent; wt rm feature-x
+pwd | copy              # the clipboard, the same on Linux, macOS, WSL and over SSH
+```
+
+Coding agents (Claude Code, Codex, Gemini CLI) are told about these, and about
+which identity goes with which folder: `olecharms agents show`.
+
 How it works inside: [ARCHITECTURE.md](ARCHITECTURE.md). Tests: `tests/run.sh`
 (sandboxed: they never touch your files; `--full` adds a real update on WSL).

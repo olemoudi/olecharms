@@ -84,6 +84,9 @@ CLEANUP_BATCH_PERCENT=50
 CLEANUP_QUARANTINE_DAYS=30
 QUARANTINE_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/olecharms/quarantine"
 QUARANTINE_SIBLING=".olecharms-quarantine"
+# The quarantines on other filesystems in use (one per line), so trash
+# --list/--restore and the purge find them wherever they are
+QUARANTINE_REGISTRY="${XDG_STATE_HOME:-$HOME/.local/state}/olecharms/quarantines"
 # Daily background doctor run from the shell hook (config daily_doctor)
 DOCTOR_SCRIPT="$SCRIPTS_DIR/doctor-daily.sh"
 DOCTOR_PROBLEMS="$OLECHARMS_STATE_DIR/doctor.problems"
@@ -94,13 +97,15 @@ LAST_PULL_FILE="$OLECHARMS_STATE_DIR/last-pull"
 SHARED_SEEN_FILE="$OLECHARMS_STATE_DIR/shared-seen"
 # Plugins olecharms cloned, so dropping one from packages.conf retires it
 MANAGED_PLUGINS_FILE="$OLECHARMS_STATE_DIR/managed-plugins"
+# Shell history kept by olecharms (config shell_history), one file per shell
+HISTORY_DIR="$OLECHARMS_STATE_DIR/history"
 # Stamped into every generated script; `doctor` flags older ones.
-GENERATOR_VERSION=5
+GENERATOR_VERSION=6
 GENERATOR_STAMP="# olecharms-generator:"
 # Marks the plugin copies olecharms owns inside Windows' vimfiles\bundle
 WIN_MANAGED_STAMP=".olecharms-managed"
 WIN_VIMRC_LINE="source ~/vimfiles/olecharms/olevimrc.vim"
-CURRENT_CONFIG_VERSION=4
+CURRENT_CONFIG_VERSION=5
 
 # olecharms is a userland install: everything it writes lives under $HOME
 # (plus the checkout itself). Nothing here needs root except optional system
@@ -665,6 +670,12 @@ ensure_scripts_dir() {
 # half a file, and cron never runs one.
 commit_generated() {
     local tmp="$1" dest="$2"
+    # Unchanged: leave the file and its date alone (a running shell compares
+    # that date to tell whether it needs reloading)
+    if [ -s "$tmp" ] && [ -x "$dest" ] && cmp -s "$tmp" "$dest"; then
+        rm -f "$tmp"
+        return 0
+    fi
     if [ -s "$tmp" ] && chmod +x "$tmp" && mv -f "$tmp" "$dest"; then
         return 0
     fi
@@ -821,7 +832,29 @@ generate_shell_loader() {
         echo "_olecharms_secrets=$(printf '%q' "$SECRETS_FILE")"
         echo "_olecharms_zsh_extras=$(printf '%q' "$(config_get zsh_extras on)")"
         echo "_olecharms_zsh_plugins=$(printf '%q' "$ZSH_EXTRAS_DIR")"
+        echo "_olecharms_history=$(printf '%q' "$(config_get shell_history on)")"
+        echo "_olecharms_history_dir=$(printf '%q' "$HISTORY_DIR")"
+        echo "_olecharms_mise=$(printf '%q' "$(config_get mise on)")"
         cat <<'LOADER_EOF'
+# When this shell read its configuration (epoch seconds): `olecharms update`
+# and the like compare it with the files they change, to offer a reload
+if [ -n "${ZSH_VERSION:-}" ] && zmodload -F zsh/datetime p:EPOCHSECONDS 2>/dev/null; then
+    _olecharms_loaded_at=$EPOCHSECONDS
+elif [ -n "${BASH_VERSION:-}" ] && printf -v _olecharms_loaded_at '%(%s)T' -1 2>/dev/null; then
+    :
+else
+    _olecharms_loaded_at=$(date +%s)
+fi
+# ~/.local/bin first, as the PATH line of the RC files (often further down)
+# puts it, so the commands installed there (mise, ssk, trash, the fd and bat
+# names...) are found below
+case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) [ -d "$HOME/.local/bin" ] && PATH="$HOME/.local/bin:$PATH" ;;
+esac
+# Interactive shell; at a terminal (with a line editor)
+_olecharms_i="" _olecharms_tty=""
+case $- in *i*) _olecharms_i=1; [ -t 0 ] && _olecharms_tty=1 ;; esac
 _olecharms_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
 # Source the shell command files with alias expansion off. Shells expand
@@ -847,15 +880,20 @@ _olecharms_source_dir "${_olecharms_dir%/*}/shell"
 unset -f _olecharms_source_dir
 unset _olecharms_dir
 
-# autojump: the package installs it but nothing activates it. Source the
-# script for *this* shell (not $SHELL's) from the first install found — manual
-# ~/.autojump, Debian/Ubuntu, Homebrew — unless something already defined `j`.
+# Jumping to folders: `j part-of-a-name` (zoxide also has `ji` to pick with
+# fzf). zoxide when installed — it took autojump's folders over once — else
+# autojump, whose package installs it but activates nothing: its script for
+# *this* shell (not $SHELL's), from the first install found (manual
+# ~/.autojump, Debian/Ubuntu, Homebrew). Never over a `j` defined elsewhere.
 if ! command -v j >/dev/null 2>&1; then
     _olecharms_aj=""
     if [ -n "${ZSH_VERSION:-}" ]; then _olecharms_aj=zsh
     elif [ -n "${BASH_VERSION:-}" ]; then _olecharms_aj=bash
     fi
-    if [ -n "$_olecharms_aj" ]; then
+    if [ -n "$_olecharms_aj" ] && command -v zoxide >/dev/null 2>&1 &&
+       _olecharms_f=$(zoxide init "$_olecharms_aj" --cmd j 2>/dev/null) && [ -n "$_olecharms_f" ]; then
+        eval "$_olecharms_f"
+    elif [ -n "$_olecharms_aj" ]; then
         for _olecharms_f in "$HOME/.autojump/share/autojump" /usr/share/autojump \
                             /opt/homebrew/share/autojump /usr/local/share/autojump; do
             if [ -f "$_olecharms_f/autojump.$_olecharms_aj" ]; then
@@ -877,12 +915,38 @@ fi
 # keys in bash and zsh (Ctrl-R history, Ctrl-T file paths, Alt-C folders),
 # and in zsh, suggestions as you type plus syntax colours — that one last,
 # as zsh-syntax-highlighting asks. Each is skipped if already loaded (e.g.
-# by an oh-my-zsh plugin).
-case $- in *i*) _olecharms_i=1 ;; *) _olecharms_i="" ;; esac
-if [ "$_olecharms_zsh_extras" = on ] && [ -n "$_olecharms_i" ]; then
+# by an oh-my-zsh plugin). Only at a terminal: `zsh -ic` run by a script or
+# by an editor reading your environment has no line editor (zsh still claims
+# the zle option), and fzf's bindings would print "can't change option: zle".
+if [ "$_olecharms_zsh_extras" = on ] && [ -n "$_olecharms_tty" ]; then
     _olecharms_sh=""
     if [ -n "${ZSH_VERSION:-}" ]; then _olecharms_sh=zsh
     elif [ -n "${BASH_VERSION:-}" ]; then _olecharms_sh=bash
+    fi
+    # What fzf lists: fd (Debian calls it fdfind), else ripgrep, else ag —
+    # all skip .git and what .gitignore hides; Ctrl-T previews with bat
+    # (Debian: batcat). Settings of your own are kept.
+    if [ -z "${FZF_DEFAULT_COMMAND:-}" ]; then
+        _olecharms_f=""
+        if command -v fd >/dev/null 2>&1; then _olecharms_f=fd
+        elif command -v fdfind >/dev/null 2>&1; then _olecharms_f=fdfind
+        fi
+        if [ -n "$_olecharms_f" ]; then
+            export FZF_DEFAULT_COMMAND="$_olecharms_f --type f --hidden --exclude .git"
+            export FZF_ALT_C_COMMAND="${FZF_ALT_C_COMMAND:-$_olecharms_f --type d --hidden --exclude .git}"
+        elif command -v rg >/dev/null 2>&1; then
+            export FZF_DEFAULT_COMMAND="rg --files --hidden --glob '!.git'"
+        elif command -v ag >/dev/null 2>&1; then
+            export FZF_DEFAULT_COMMAND="ag -g '' --hidden --ignore .git"
+        fi
+        [ -n "${FZF_DEFAULT_COMMAND:-}" ] && export FZF_CTRL_T_COMMAND="${FZF_CTRL_T_COMMAND:-$FZF_DEFAULT_COMMAND}"
+    fi
+    if [ -z "${FZF_CTRL_T_OPTS:-}" ]; then
+        _olecharms_f=""
+        if command -v bat >/dev/null 2>&1; then _olecharms_f=bat
+        elif command -v batcat >/dev/null 2>&1; then _olecharms_f=batcat
+        fi
+        [ -n "$_olecharms_f" ] && export FZF_CTRL_T_OPTS="--preview '$_olecharms_f --color=always --style=numbers --line-range=:300 {} 2>/dev/null'"
     fi
     if [ -n "$_olecharms_sh" ] && command -v fzf >/dev/null 2>&1 &&
        ! type fzf-history-widget >/dev/null 2>&1 && ! type __fzf_history__ >/dev/null 2>&1; then
@@ -914,7 +978,28 @@ if [ "$_olecharms_zsh_extras" = on ] && [ -n "$_olecharms_i" ]; then
     fi
     unset _olecharms_sh _olecharms_f
 fi
-unset _olecharms_i
+
+# mise (olecharms config → mise): the tool versions and environment
+# variables a project asks for (mise.toml, .tool-versions), in interactive
+# shells — also without a terminal, so editors reading the environment get them
+if [ "$_olecharms_mise" != off ] && [ -n "$_olecharms_i" ] && command -v mise >/dev/null 2>&1; then
+    if [ -n "${ZSH_VERSION:-}" ]; then
+        eval "$(mise activate zsh 2>/dev/null)"
+    elif [ -n "${BASH_VERSION:-}" ]; then
+        eval "$(mise activate bash 2>/dev/null)"
+    fi
+fi
+
+# Shell history (olecharms config → Shell history): kept across sessions in a
+# private file, never with what looks like a secret (shell/lib/history.*)
+if [ "$_olecharms_history" = on ] && [ -n "$_olecharms_i" ]; then
+    if [ -n "${ZSH_VERSION:-}" ] && [ -f "${_olecharms_bin%/*}/shell/lib/history.zsh" ]; then
+        . "${_olecharms_bin%/*}/shell/lib/history.zsh"
+    elif [ -n "${BASH_VERSION:-}" ] && [ -f "${_olecharms_bin%/*}/shell/lib/history.bash" ]; then
+        . "${_olecharms_bin%/*}/shell/lib/history.bash"
+    fi
+fi
+unset _olecharms_i _olecharms_tty
 
 # Drop the aliases loaded last time, then load the current set: global ones
 # (in the repo, shared by every machine) first, so per-machine ones win. Run at
@@ -971,6 +1056,27 @@ _olecharms_snapshot() {
     return 0
 }
 
+# After update / sync / doctor / config changed what this shell read at
+# startup: offer to replace it with a fresh one (a child process cannot
+# reload the shell that started it). Never with stopped or background jobs.
+_olecharms_offer_reload() {
+    local _olecharms_sh=bash _olecharms_ans=""
+    [ -n "${ZSH_VERSION:-}" ] && _olecharms_sh=zsh
+    echo ""
+    if [ ! -t 0 ] || [ ! -t 1 ]; then
+        echo "[!] This shell still runs the previous configuration: run 'exec $_olecharms_sh' (new terminals load it already)."
+    elif _olecharms_has_jobs; then
+        echo "[!] This shell still runs the previous configuration and has stopped or background jobs: run 'exec $_olecharms_sh' once they are done."
+    else
+        printf '%s' "[?] This shell still runs the previous configuration. Reload it now (exec $_olecharms_sh)? [Y/n] "
+        read -r _olecharms_ans || _olecharms_ans=n
+        case "$_olecharms_ans" in
+            [nN]*) echo "    Later: run 'exec $_olecharms_sh' (new terminals load it already)." ;;
+            *) exec "$_olecharms_sh" ;;
+        esac
+    fi
+}
+
 # True if this shell has jobs. zsh's $(jobs) runs in a subshell that sees none.
 _olecharms_has_jobs() {
     if [ -n "${ZSH_VERSION:-}" ]; then
@@ -987,7 +1093,7 @@ _olecharms_has_jobs() {
 olecharms() {
     # The child bash cannot see this shell's aliases and functions (oh-my-zsh
     # defines hundreds), so tell `alias add` what the name means here.
-    local _olecharms_what="" _olecharms_rc _olecharms_snap=""
+    local _olecharms_what="" _olecharms_rc _olecharms_snap="" _olecharms_reload=""
     if [ "${1:-}" = alias ] && [ "${2:-}" = add ] && [ -n "${3:-}" ]; then
         _olecharms_what=$(type -- "$3" 2>/dev/null) || _olecharms_what=""
         _olecharms_what=${_olecharms_what%%$'\n'*}
@@ -996,8 +1102,14 @@ olecharms() {
         _olecharms_snap=$(mktemp -d "${TMPDIR:-/tmp}/olecharms.XXXXXX" 2>/dev/null) || _olecharms_snap=""
         [ -n "$_olecharms_snap" ] && _olecharms_snapshot "$_olecharms_snap"
     fi
+    case "${1:-}" in
+        update|sync|doctor|config)
+            _olecharms_reload=$(mktemp "${TMPDIR:-/tmp}/olecharms-reload.XXXXXX" 2>/dev/null) || _olecharms_reload="" ;;
+    esac
     OLECHARMS_SHELL_WRAPPER=1 OLECHARMS_NAME_TYPE="$_olecharms_what" \
-        OLECHARMS_SHELL_SNAPSHOT="$_olecharms_snap" "$_olecharms_bin" "$@"
+        OLECHARMS_SHELL_SNAPSHOT="$_olecharms_snap" \
+        OLECHARMS_SHELL_LOADED_AT="${_olecharms_loaded_at:-}" OLECHARMS_RELOAD_FLAG="$_olecharms_reload" \
+        "$_olecharms_bin" "$@"
     _olecharms_rc=$?
     [ -n "$_olecharms_snap" ] && rm -rf "$_olecharms_snap"
     case "${1:-}" in
@@ -1009,6 +1121,8 @@ olecharms() {
                     rm|remove|delete) [ -n "${3:-}" ] && unset "$3" 2>/dev/null ;;
                 esac
                 [ -f "$_olecharms_secrets" ] && [ -O "$_olecharms_secrets" ] && . "$_olecharms_secrets"
+                # The history filter also hides the new value from now on
+                if type _olecharms_hist_names >/dev/null 2>&1; then _olecharms_hist_names; fi
             fi
             ;;
         install)
@@ -1024,6 +1138,13 @@ olecharms() {
             fi
             ;;
     esac
+    if [ -n "$_olecharms_reload" ]; then
+        if [ -s "$_olecharms_reload" ]; then
+            rm -f "$_olecharms_reload"
+            _olecharms_offer_reload
+        fi
+        rm -f "$_olecharms_reload"
+    fi
     return $_olecharms_rc
 }
 LOADER_EOF
@@ -1259,6 +1380,7 @@ $GENERATOR_STAMP $GENERATOR_VERSION
 HOME_DIR=$(printf '%q' "$HOME")
 VIM_DIR=$(printf '%q' "$VIM_DIR")
 CLEANUP_LOG=$(printf '%q' "$CLEANUP_LOG")
+HISTORY_DIR=$(printf '%q' "$HISTORY_DIR")
 
 # Delete the files directly in dir \$1 whose names match \$2 — only when it
 # really is a folder of its own (a symlinked undodir pointing at home or /
@@ -1283,6 +1405,9 @@ if [ -n "\${1:-}" ] && [ -f "\$1" ] && [ ! -L "\$1" ]; then
         "\$HOME_DIR"/*) case "\${1##*/}" in *[hH][iI][sS][tT]*) rm -f "\$1" ;; esac ;;
     esac
 fi
+
+# The history olecharms keeps (olecharms config → Shell history)
+rm -f "\$HISTORY_DIR/zsh_history" "\$HISTORY_DIR/bash_history" 2>/dev/null
 
 # Other tools' histories: less, Python, Node, SQLite, PostgreSQL, MySQL, Ruby,
 # Redis, and wget's record of HSTS hosts
@@ -1925,7 +2050,7 @@ alias_save_global() {
 # Shareable keys, in the order they are applied (age and action before
 # enabling the cleanup, whose preview uses them). Folders, scheduling method
 # and Windows integration stay per machine.
-SHARED_KEYS="downloads_cleanup_max_age_days downloads_cleanup_action downloads_cleanup_quarantine_days downloads_cleanup_enabled paranoid_mode_enabled daily_doctor zsh_extras"
+SHARED_KEYS="downloads_cleanup_max_age_days downloads_cleanup_action downloads_cleanup_quarantine_days downloads_cleanup_enabled paranoid_mode_enabled daily_doctor zsh_extras shell_history agent_instructions mise"
 
 # Value of key $1 in the shared file ("" when unset or no file)
 shared_get() {
@@ -1943,6 +2068,7 @@ shared_local_value() {
         paranoid_mode_enabled)             config_get paranoid_mode_enabled false ;;
         daily_doctor)                      config_get daily_doctor on ;;
         zsh_extras)                        config_get zsh_extras on ;;
+        shell_history|agent_instructions|mise) config_get "$1" on ;;
     esac
 }
 
@@ -1960,6 +2086,12 @@ shared_describe() {
         daily_doctor=*)                  echo "daily health check off" ;;
         zsh_extras=on)                   echo "zsh extras on" ;;
         zsh_extras=*)                    echo "zsh extras off" ;;
+        shell_history=on)                echo "shell history kept" ;;
+        shell_history=*)                 echo "shell history not kept" ;;
+        agent_instructions=on)           echo "agent instructions on" ;;
+        agent_instructions=*)            echo "agent instructions off" ;;
+        mise=on)                         echo "mise on" ;;
+        mise=*)                          echo "mise off" ;;
         *)                               echo "$1=$2" ;;
     esac
 }
@@ -2114,6 +2246,8 @@ shared_apply() {
                 [ "$want" = on ] && install_zsh_extras
                 install_shell_commands >/dev/null
                 info "Zsh extras $want (new shells)" ;;
+            shell_history|agent_instructions|mise)
+                config_toggle "$key" "$want" ;;
         esac
         changed=1
     done
@@ -2280,13 +2414,31 @@ cleanup_quarantine_days() {
     echo "$days"
 }
 
-# Move NUL list $1 (files under real dir $2) into a new timestamped batch,
-# keeping their paths relative to $2 (written to .origin) for --restore
+# A new, empty batch folder in quarantine $1, named after the time — a
+# second later when that name is taken: batches must never merge (each has
+# one .origin)
+quarantine_new_batch() {
+    local base="$1" t i=0 name
+    mkdir -p "$base" || return 1
+    t=$(date +%s)
+    while [ "$i" -lt 600 ]; do
+        name=$(date -d "@$((t + i))" +%Y%m%d-%H%M%S 2>/dev/null || date -r "$((t + i))" +%Y%m%d-%H%M%S)
+        if mkdir "$base/$name" 2>/dev/null; then
+            printf '%s\n' "$base/$name"
+            return 0
+        fi
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# Move NUL list $1 (files or folders under real dir $2) into a new timestamped
+# batch, keeping their paths relative to $2 (written to .origin) for --restore
 cleanup_quarantine_move() {
     local list="$1" root="$2" base batch f rel
     base=$(cleanup_quarantine_base "$root")
-    batch="$base/$(date +%Y%m%d-%H%M%S)"
-    mkdir -p "$batch" || return 1
+    batch=$(quarantine_new_batch "$base") || return 1
+    [ "$base" = "$QUARANTINE_DATA_DIR" ] || quarantine_register "$base"
     printf '%s\n' "$root" > "$batch/.origin"
     while IFS= read -r -d '' f; do
         rel=${f#"$root"/}
@@ -2295,15 +2447,36 @@ cleanup_quarantine_move() {
     done < "$list"
 }
 
-# The quarantine batches of real dir $1 (both possible places), one per line
+quarantine_register() {
+    grep -qxF -- "$1" "$QUARANTINE_REGISTRY" 2>/dev/null && return 0
+    mkdir -p "${QUARANTINE_REGISTRY%/*}" 2>/dev/null
+    printf '%s\n' "$1" >> "$QUARANTINE_REGISTRY"
+}
+
+# The registered quarantines; only absolute paths ending in the sibling name
+quarantine_registered() {
+    local q
+    [ -f "$QUARANTINE_REGISTRY" ] || return 0
+    while IFS= read -r q; do
+        case "$q" in /*/"$QUARANTINE_SIBLING") printf '%s\n' "$q" ;; esac
+    done < "$QUARANTINE_REGISTRY"
+}
+
+# The quarantine batches of real dir $1 (both possible places) and of every
+# registered quarantine, one per line
 cleanup_quarantine_batches() {
-    local base d
-    for base in "$QUARANTINE_DATA_DIR" "${1%/*}/$QUARANTINE_SIBLING"; do
+    local base d seen=$'\n'
+    while IFS= read -r base; do
+        [ -n "$base" ] || continue
+        case "$seen" in *$'\n'"$base"$'\n'*) continue ;; esac
+        seen="$seen$base"$'\n'
         [ -d "$base" ] && [ ! -L "$base" ] || continue
         for d in "$base"/[0-9]*-[0-9]*; do
             cleanup_quarantine_is_batch "$d" && printf '%s\n' "$d"
         done
-    done
+    done <<< "$QUARANTINE_DATA_DIR
+${1%/*}/$QUARANTINE_SIBLING
+$(quarantine_registered)"
 }
 
 # A batch is a real dir named YYYYMMDD-HHMMSS directly inside a quarantine
@@ -2330,7 +2503,28 @@ cleanup_quarantine_purge() {
         rm -rf "$d" && cleanup_log_line "quarantine: deleted ${d##*/} (older than $days days)"
     done <<< "$(cleanup_quarantine_batches "$1")"
     rmdir "${1%/*}/$QUARANTINE_SIBLING" 2>/dev/null
+    quarantine_registry_tidy
     return 0
+}
+
+# Remove the empty registered quarantines and forget the ones that are gone.
+# One whose parent is missing too (a drive not mounted now) is kept.
+quarantine_registry_tidy() {
+    local q keep="" tmp
+    [ -f "$QUARANTINE_REGISTRY" ] || return 0
+    while IFS= read -r q; do
+        [ -n "$q" ] || continue
+        rmdir "$q" 2>/dev/null
+        if [ -d "$q" ] || [ ! -d "${q%/*}" ]; then
+            keep="$keep$q"$'\n'
+        fi
+    done <<< "$(quarantine_registered)"
+    if [ -z "$keep" ]; then
+        rm -f "$QUARANTINE_REGISTRY"
+    elif [ "$keep" != "$(cat "$QUARANTINE_REGISTRY")"$'\n' ]; then
+        tmp=$(mktemp "$QUARANTINE_REGISTRY.XXXXXX") || return 0
+        printf '%s' "$keep" > "$tmp" && mv "$tmp" "$QUARANTINE_REGISTRY"
+    fi
 }
 
 # "2026-10-31 17:45" from a batch path
@@ -2339,25 +2533,55 @@ cleanup_batch_label() {
     echo "${n:0:4}-${n:4:2}-${n:6:2} ${n:9:2}:${n:11:2}"
 }
 
-# `cleanup --restore`: pick a batch (newest preselected), put its files back
-# where they were. Never overwrites: a name taken meanwhile is reported.
+# Put quarantined $1 back as $2, never overwriting: a folder whose name is
+# taken by a folder is merged entry by entry; anything else whose name is
+# taken stays in the quarantine. Files, links and folders (empty ones too)
+# all go back. Counts in QR_RESTORED / QR_TAKEN (files and links).
+quarantine_restore_entry() {
+    local src="$1" dst="$2" e n
+    if [ ! -e "$dst" ] && [ ! -L "$dst" ]; then
+        if [ -d "$src" ] && [ ! -L "$src" ]; then
+            n=$(find "$src" ! -type d 2>/dev/null | wc -l | tr -d ' ')
+        else
+            n=1
+        fi
+        if mv "$src" "$dst" 2>/dev/null; then
+            QR_RESTORED=$((QR_RESTORED + n))
+        else
+            QR_TAKEN=$((QR_TAKEN + n))
+        fi
+    elif [ -d "$src" ] && [ ! -L "$src" ] && [ -d "$dst" ] && [ ! -L "$dst" ]; then
+        for e in "$src"/* "$src"/.[!.]* "$src"/..?*; do
+            [ -e "$e" ] || [ -L "$e" ] || continue
+            quarantine_restore_entry "$e" "$dst/${e##*/}"
+        done
+        rmdir "$src" 2>/dev/null
+    else
+        QR_TAKEN=$((QR_TAKEN + $(find "$src" ! -type d 2>/dev/null | wc -l | tr -d ' ')))
+    fi
+    return 0
+}
+
+# `cleanup --restore` and `trash --restore`: pick a batch (newest
+# preselected), put what it holds back where it was, never overwriting
 cleanup_quarantine_restore() {
-    local dir real d origin f rel target n kb restored=0 taken=0 batches=()
+    local dir real d origin e n kb batches=()
     dir=$(config_get downloads_cleanup_dir)
-    real=$(cleanup_real_dir "$dir") || real="${dir%/}"
+    real=$(cleanup_real_dir "$dir" 2>/dev/null) || real="${dir%/}"
     PICK_ITEMS=()
     while IFS= read -r d; do
         [ -n "$d" ] || continue
-        n=$(find "$d" -type f ! -name .origin 2>/dev/null | wc -l | tr -d ' ')
+        n=$(find "$d" ! -type d ! -path "$d/.origin" 2>/dev/null | wc -l | tr -d ' ')
         kb=$(du -sk "$d" 2>/dev/null | cut -f1)
+        origin=$(head -n 1 "$d/.origin" 2>/dev/null)
         batches+=("$d")
-        PICK_ITEMS+=("$(cleanup_batch_label "$d")  $n files, $(human_kb "${kb:-0}")")
-    done <<< "$(cleanup_quarantine_batches "$real")"
+        PICK_ITEMS+=("$(cleanup_batch_label "$d")  $n files from $(home_tilde "$origin"), $(human_kb "${kb:-0}")")
+    done <<< "$(cleanup_quarantine_batches "${real:-$HOME/.olecharms-none}")"
     if [ ${#batches[@]} -eq 0 ]; then
         info "The quarantine is empty"
         return 0
     fi
-    echo -e "${BOLD}Restore a cleanup from the quarantine${NC} (kept $(cleanup_quarantine_days) days)"
+    echo -e "${BOLD}Restore from the quarantine${NC} (cleanups and trash; kept $(cleanup_quarantine_days) days)"
     echo ""
     pick_item || { info "Cancelled"; return 0; }
     d=${batches[$PICK_INDEX]}
@@ -2366,25 +2590,22 @@ cleanup_quarantine_restore() {
         error "Its folder ${origin:-<unknown>} does not exist any more; the files are in $d"
         return 1
     fi
-    while IFS= read -r -d '' f; do
-        rel=${f#"$d"/}
-        target="$origin/$rel"
-        if [ -e "$target" ] || [ -L "$target" ]; then
-            taken=$((taken + 1))
-            continue
-        fi
-        mkdir -p "$(dirname "$target")" 2>/dev/null
-        mv "$f" "$target" 2>/dev/null && restored=$((restored + 1))
-    done < <(find "$d" -type f ! -path "$d/.origin" -print0 2>/dev/null)
-    cleanup_log_line "restore: $restored files from ${d##*/} back to $origin"
-    # Drop the batch once it is empty
-    find "$d" -mindepth 1 -depth -type d -empty -exec rmdir {} \; 2>/dev/null
-    if [ -z "$(find "$d" -type f ! -name .origin 2>/dev/null | head -n 1)" ]; then
+    origin=$(cd -P "$origin" && pwd) || return 1
+    QR_RESTORED=0 QR_TAKEN=0
+    for e in "$d"/* "$d"/.[!.]* "$d"/..?*; do
+        [ -e "$e" ] || [ -L "$e" ] || continue
+        [ "$e" = "$d/.origin" ] && continue
+        quarantine_restore_entry "$e" "$origin/${e##*/}"
+    done
+    cleanup_log_line "restore: $QR_RESTORED files from ${d##*/} back to $origin"
+    # Drop the batch once nothing is left in it
+    if [ -z "$(find "$d" -mindepth 1 ! -path "$d/.origin" 2>/dev/null | head -n 1)" ]; then
         rm -f "$d/.origin"
         rmdir "$d" 2>/dev/null
+        quarantine_registry_tidy
     fi
-    info "Restored $restored files to $origin"
-    [ "$taken" -gt 0 ] && warn "$taken files were not restored: their names are taken again in $origin (they stay in $d)"
+    info "Restored $QR_RESTORED files to $origin"
+    [ "$QR_TAKEN" -gt 0 ] && warn "$QR_TAKEN files were not restored: their names are taken again in $origin (they stay in $d)"
     return 0
 }
 
@@ -3325,6 +3546,13 @@ windows_integration=$(config_get windows_integration auto)
 # Run doctor once a day in the background; new shells mention problems (on | off)
 daily_doctor=$(config_get daily_doctor on)
 
+# Keep the shell history in a private file, without secrets (on | off)
+shell_history=$(config_get shell_history on)
+# Tell coding agents (Claude Code, Codex, Gemini CLI) about this machine (on | off)
+agent_instructions=$(config_get agent_instructions on)
+# Per-project tool versions with mise (on | off)
+mise=$(config_get mise on)
+
 install_dir=$(config_get install_dir "$SCRIPT_DIR")
 CFG_EOF
 }
@@ -3365,6 +3593,9 @@ config_bootstrap() {
     printf -v OLECHARMS_CFG_windows_integration '%s' auto
     printf -v OLECHARMS_CFG_downloads_cleanup_quarantine_days '%s' "$CLEANUP_QUARANTINE_DAYS"
     printf -v OLECHARMS_CFG_daily_doctor '%s' on
+    printf -v OLECHARMS_CFG_shell_history '%s' on
+    printf -v OLECHARMS_CFG_agent_instructions '%s' on
+    printf -v OLECHARMS_CFG_mise '%s' on
     printf -v OLECHARMS_CFG_install_dir '%s' "$SCRIPT_DIR"
 
     config_write_all
@@ -3401,6 +3632,12 @@ migrate_config_2_to_3() {
 migrate_config_3_to_4() {
     config_set downloads_cleanup_quarantine_days "$CLEANUP_QUARANTINE_DAYS"
     config_set daily_doctor on
+}
+
+migrate_config_4_to_5() {
+    config_set shell_history on
+    config_set agent_instructions on
+    config_set mise on
 }
 
 config_ensure() {
@@ -3939,6 +4176,816 @@ run_post_commands() {
     done
 }
 
+# ─── Commands on PATH and extra tools ───────────────────────────────────────
+
+# Every executable in bin/ gets a link in ~/.local/bin, so scripts and coding
+# agents — which do not load the shell functions — can run them too. A name
+# already taken (a file of yours in ~/.local/bin, or another program on PATH,
+# like a system `trash`) is left alone. Debian calls fd and bat fdfind and
+# batcat: the usual names are linked to them.
+BIN_SHIMS=( "fd|fdfind" "bat|batcat" )
+
+# Whether link $1 in ~/.local/bin is one olecharms made: into the bin/ of an
+# olecharms checkout (this one, or one that moved or is gone), or a shim
+bin_link_ours() {
+    local link="$1" name target entry
+    [ -L "$link" ] || return 1
+    name=${link##*/}
+    target=$(readlink "$link")
+    case "$target" in
+        "$SCRIPT_DIR/bin/$name") return 0 ;;
+        */bin/"$name")
+            # another (moved) checkout, or one that is gone — for names we ship
+            [ -f "${target%/bin/*}/olecharms.sh" ] && return 0
+            [ ! -e "$target" ] && [ -f "$SCRIPT_DIR/bin/$name" ] && return 0 ;;
+    esac
+    for entry in "${BIN_SHIMS[@]}"; do
+        [ "$name" = "${entry%%|*}" ] || continue
+        case "$target" in */"${entry#*|}") return 0 ;; esac
+    done
+    return 1
+}
+
+# Another program called $1 on PATH, outside ~/.local/bin (empty if none)
+bin_command_elsewhere() {
+    local p
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        case "$p" in "$BIN_DIR"/*) continue ;; esac
+        printf '%s\n' "$p"
+        return 0
+    done <<< "$(type -aP "$1" 2>/dev/null)"
+    return 1
+}
+
+install_bin_links() {
+    local f name dest entry real n=0
+    mkdir -p "$BIN_DIR" 2>/dev/null || { error "Could not create $BIN_DIR"; return 1; }
+    for f in "$SCRIPT_DIR"/bin/*; do
+        [ -f "$f" ] && [ -x "$f" ] || continue
+        name=${f##*/}
+        dest="$BIN_DIR/$name"
+        if [ -L "$dest" ] && bin_link_ours "$dest"; then
+            [ "$(readlink "$dest")" = "$f" ] && continue
+            ln -sfn "$f" "$dest" && n=$((n + 1))
+            continue
+        fi
+        { [ -e "$dest" ] || [ -L "$dest" ]; } && continue
+        bin_command_elsewhere "$name" >/dev/null && continue
+        ln -s "$f" "$dest" && n=$((n + 1))
+    done
+    # Links to commands that left this bin/, and shims whose program went away
+    for dest in "$BIN_DIR"/*; do
+        [ -L "$dest" ] && [ ! -e "$dest" ] || continue
+        case "$(readlink "$dest")" in
+            "$SCRIPT_DIR/bin/${dest##*/}") rm -f "$dest" ;;
+            */fdfind|*/batcat) bin_link_ours "$dest" && rm -f "$dest" ;;
+        esac
+    done
+    for entry in "${BIN_SHIMS[@]}"; do
+        name=${entry%%|*}
+        dest="$BIN_DIR/$name"
+        { [ -e "$dest" ] || [ -L "$dest" ]; } && continue
+        bin_command_elsewhere "$name" >/dev/null && continue
+        real=$(type -P "${entry#*|}" 2>/dev/null) || continue
+        ln -s "$real" "$dest" && n=$((n + 1))
+    done
+    [ "$n" -gt 0 ] && info "Linked $n olecharms commands into $BIN_DIR (also for scripts and agents)"
+    return 0
+}
+
+doctor_check_bin_links() {
+    doc_section "Commands for scripts and agents"
+    local f name dest linked=() taken=() other
+    for f in "$SCRIPT_DIR"/bin/*; do
+        [ -f "$f" ] && [ -x "$f" ] || continue
+        name=${f##*/}
+        dest="$BIN_DIR/$name"
+        if [ -L "$dest" ] && [ "$(readlink "$dest")" = "$f" ]; then
+            linked+=("$name")
+        elif other=$(bin_command_elsewhere "$name"); then
+            taken+=("$name: $other")
+        elif [ -e "$dest" ] || [ -L "$dest" ]; then
+            taken+=("$name: $(home_tilde "$dest") is yours")
+        else
+            doc_warn "$name is not linked into $(home_tilde "$BIN_DIR")"
+            doc_why "Scripts and coding agents only find olecharms' commands through it."
+            doc_hint "olecharms doctor --fix"
+        fi
+    done
+    [ ${#linked[@]} -gt 0 ] && doc_ok "In $(home_tilde "$BIN_DIR"): ${linked[*]}"
+    [ ${#taken[@]} -gt 0 ] && doc_ok "Name taken, so not linked: $(printf '%s; ' "${taken[@]}" | sed 's/; $//')"
+    return 0
+}
+
+# zoxide takes autojump's folders over once, so `j` keeps knowing them
+zoxide_import_autojump() {
+    check_command zoxide || return 0
+    local db marker="$OLECHARMS_STATE_DIR/zoxide-imported"
+    [ -f "$marker" ] && return 0
+    for db in "${XDG_DATA_HOME:-$HOME/.local/share}/autojump/autojump.txt" "$HOME/Library/autojump/autojump.txt"; do
+        [ -s "$db" ] || continue
+        if ! zoxide import --from autojump --merge "$db" >/dev/null 2>&1; then
+            warn "zoxide could not import autojump's folders from $db"
+            return 0
+        fi
+        info "zoxide took over autojump's folders: j works as before (ji picks one with fzf)"
+        break
+    done
+    mkdir -p "$OLECHARMS_STATE_DIR" 2>/dev/null && date > "$marker"
+}
+
+# tealdeer (tldr) keeps its pages in a cache it does not fill by itself
+tldr_cache_update() {
+    check_command tldr || return 0
+    tldr --version 2>&1 | grep -qi tealdeer || return 0
+    tldr --update >/dev/null 2>&1 || warn "tldr could not download its pages (offline?)"
+    return 0
+}
+
+# mise on Linux: no apt package, so the release binary from GitHub, checked
+# against the release's SHA-256 list, into ~/.local/bin. Only a mise that
+# olecharms installed is updated; one installed some other way is left alone.
+# (macOS: Homebrew, from packages.conf.) OLECHARMS_MISE_TAG and
+# OLECHARMS_MISE_BASE point the tests at a local copy.
+MISE_RELEASES="https://github.com/jdx/mise/releases"
+MISE_STATE="$OLECHARMS_STATE_DIR/mise-version"
+install_mise() {
+    [ "$(config_get mise on)" = off ] && return 0
+    [ "$OS" = linux ] || return 0
+    local existing arch tag base tmp want got
+    existing=$(type -P mise 2>/dev/null)
+    if [ -n "$existing" ] && [ "$existing" != "$BIN_DIR/mise" ]; then
+        return 0
+    fi
+    if [ -e "$BIN_DIR/mise" ] && [ ! -f "$MISE_STATE" ]; then
+        return 0
+    fi
+    case "$(uname -m)" in
+        x86_64|amd64)  arch=x64 ;;
+        aarch64|arm64) arch=arm64 ;;
+        *) warn "mise: no release for $(uname -m); install it yourself (https://mise.jdx.dev)"; return 0 ;;
+    esac
+    tag=${OLECHARMS_MISE_TAG:-$(curl -fsSI --max-time 20 "$MISE_RELEASES/latest" 2>/dev/null |
+        tr -d '\r' | sed -n 's#^[Ll]ocation: .*/tag/##p' | tail -n 1)}
+    if ! [[ "$tag" =~ ^v[0-9][0-9.]*$ ]]; then
+        warn "mise: could not find its latest release${tag:+ ($tag)} (offline?)"
+        return 0
+    fi
+    if [ -x "$BIN_DIR/mise" ] && [ "$(cat "$MISE_STATE" 2>/dev/null)" = "$tag" ]; then
+        return 0
+    fi
+    info "Installing mise $tag..."
+    tmp=$(mktemp -d) || return 1
+    base="${OLECHARMS_MISE_BASE:-$MISE_RELEASES/download}/$tag"
+    if ! curl -fsSL --max-time 300 -o "$tmp/mise" "$base/mise-$tag-linux-$arch" ||
+       ! curl -fsSL --max-time 60 -o "$tmp/sums" "$base/SHASUMS256.txt"; then
+        rm -rf "$tmp"
+        warn "mise: download failed; nothing installed"
+        return 0
+    fi
+    want=$(awk -v f="mise-$tag-linux-$arch" '$2 == f || $2 == "./" f { print $1; exit }' "$tmp/sums")
+    got=$( (sha256sum "$tmp/mise" 2>/dev/null || shasum -a 256 "$tmp/mise" 2>/dev/null) | cut -d' ' -f1)
+    if [ -z "$want" ] || [ "$want" != "$got" ]; then
+        rm -rf "$tmp"
+        error "mise: the download does not match the release's checksum; not installed"
+        return 1
+    fi
+    chmod +x "$tmp/mise"
+    if ! "$tmp/mise" --version >/dev/null 2>&1; then
+        rm -rf "$tmp"
+        error "mise: the downloaded program does not run here; not installed"
+        return 1
+    fi
+    mkdir -p "$BIN_DIR" "$OLECHARMS_STATE_DIR" 2>/dev/null
+    if mv -f "$tmp/mise" "$BIN_DIR/mise"; then
+        echo "$tag" > "$MISE_STATE"
+        info "mise $tag installed in $BIN_DIR (checksum verified)"
+    fi
+    rm -rf "$tmp"
+    return 0
+}
+
+doctor_check_tools() {
+    doc_section "Tools"
+    local have=() missing=() t
+    for t in rg fd bat delta jq tldr ag zoxide; do
+        case "$t" in
+            fd)  { check_command fd || check_command fdfind; } && have+=(fd) || missing+=(fd) ;;
+            bat) { check_command bat || check_command batcat; } && have+=(bat) || missing+=(bat) ;;
+            *)   check_command "$t" && have+=("$t") || missing+=("$t") ;;
+        esac
+    done
+    [ ${#have[@]} -gt 0 ] && doc_ok "${have[*]}"
+    if [ ${#missing[@]} -gt 0 ]; then
+        doc_warn "Not installed: ${missing[*]}"
+        doc_why "Fast search (rg, fd, ag), previews (bat), readable diffs (delta), JSON (jq), examples (tldr), folder jumping (zoxide)."
+        doc_hint "olecharms update installs them"
+    fi
+    if check_command zoxide; then
+        doc_ok "Folder jumping: j (zoxide; ji picks with fzf)"
+    elif check_command autojump; then
+        doc_ok "Folder jumping: j (autojump; zoxide replaces it after 'olecharms update')"
+    fi
+    if [ "$(config_get mise on)" = off ]; then
+        doc_ok "mise off (olecharms config → mise)"
+    elif check_command mise || [ -x "$BIN_DIR/mise" ]; then
+        doc_ok "mise $("$(type -P mise 2>/dev/null || echo "$BIN_DIR/mise")" --version 2>/dev/null | awk '{ print $1 }'): per-project tool versions"
+    else
+        doc_warn "mise is not installed"
+        doc_why "It gives each project the tool versions it asks for (mise.toml, .tool-versions)."
+        doc_hint "olecharms update installs it"
+    fi
+    return 0
+}
+
+# ─── trash: recoverable deletion ────────────────────────────────────────────
+
+trash_usage() {
+    echo "Usage: trash <files or folders...>   move them to the trash"
+    echo "       trash --list                   what olecharms' quarantine holds"
+    echo "       trash --restore                put a quarantined batch back"
+    echo ""
+    echo "  On a Windows drive (WSL): the Recycle Bin. macOS: the Trash. Linux in a"
+    echo "  desktop session: the desktop trash. Elsewhere (WSL's Linux side, servers):"
+    echo "  olecharms' quarantine, kept $(cleanup_quarantine_days) days, then deleted."
+}
+
+# Why real path $1 must not be trashed (prints nothing when it may)
+trash_refusal() {
+    local real="$1" home_real p rest
+    [ "$real" = / ] && { echo "the whole disk"; return; }
+    home_real=$(cd -P "$HOME" 2>/dev/null && pwd)
+    for p in "$HOME" "$home_real" "$SCRIPT_DIR" "$OLECHARMS_CONFIG_DIR" "$OLECHARMS_STATE_DIR"; do
+        [ -n "$p" ] || continue
+        case "${p%/}/" in "$real"/*) echo "it holds $(home_tilde "$p")"; return ;; esac
+    done
+    case "$real/" in
+        "$QUARANTINE_DATA_DIR"/*|*/"$QUARANTINE_SIBLING"/*) echo "it is in the quarantine already"; return ;;
+    esac
+    case "$real" in
+        /bin|/bin/*|/boot|/boot/*|/dev|/dev/*|/etc|/etc/*|/lib|/lib/*|/lib32|/lib32/*|/lib64|/lib64/*|\
+        /proc|/proc/*|/sbin|/sbin/*|/sys|/sys/*|/usr|/usr/*|/System|/System/*|/Library|/Library/*|\
+        /Applications|/opt|/var|/srv|/root|/home|/Users|/Volumes|/media|/mnt|/tmp|/private|/snap|/run|\
+        /mnt/wsl|/mnt/wsl/*|/mnt/wslg|/mnt/wslg/*|\
+        /mnt/[a-zA-Z]|/mnt/[a-zA-Z]/Users|/mnt/[a-zA-Z]/Windows|/mnt/[a-zA-Z]/Windows/*|\
+        /mnt/[a-zA-Z]/Program\ Files*|/mnt/[a-zA-Z]/ProgramData|/mnt/[a-zA-Z]/ProgramData/*)
+            echo "a system location"; return ;;
+        /mnt/[a-zA-Z]/Users/*|/Users/*|/home/*|/Volumes/*|/media/*)
+            # a user profile, home or volume itself
+            rest=${real#/mnt/?/Users/}
+            [ "$rest" = "$real" ] && rest=${real#/*/}
+            case "$rest" in */*) ;; *) echo "a whole profile, home or volume" ;; esac
+            ;;
+    esac
+}
+
+# Where items of real folder $1 go. "auto" policy of the cleanup: a trash the
+# user actually empties (Recycle Bin, macOS Trash, a desktop session's), else
+# the quarantine — WSL's Linux side has no desktop, whatever DISPLAY says.
+trash_backend_for() {
+    local b
+    b=$(cleanup_trash_backend "$1") || b=""
+    case "$b" in
+        recycle-bin|macos-trash) echo "$b" ;;
+        gio|trash-put)
+            if [ -z "${IS_WSL:-}" ] && [ -n "${XDG_CURRENT_DESKTOP:-}" ]; then echo "$b"; else echo quarantine; fi ;;
+        *) echo quarantine ;;
+    esac
+}
+
+trash_list() {
+    local real d n origin any=""
+    real=$(cleanup_real_dir "$(config_get downloads_cleanup_dir)" 2>/dev/null) || real=""
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        any=1
+        n=$(find "$d" -mindepth 1 -maxdepth 1 ! -name .origin 2>/dev/null | wc -l | tr -d ' ')
+        origin=$(head -n 1 "$d/.origin" 2>/dev/null)
+        printf '  %s  %s items from %s\n' "$(cleanup_batch_label "$d")" "$n" "$(home_tilde "$origin")"
+    done <<< "$(cleanup_quarantine_batches "${real:-$HOME/.olecharms-none}")"
+    [ -n "$any" ] || echo "  The quarantine is empty"
+    echo "  (kept $(cleanup_quarantine_days) days; trash --restore puts a batch back)"
+}
+
+cmd_trash() {
+    case "${1:-}" in
+        ""|-h|--help) trash_usage; [ -n "${1:-}" ]; return ;;
+        --list)       trash_list; return 0 ;;
+        --restore)    cleanup_quarantine_restore; return ;;
+    esac
+    [ "$1" = -- ] && shift
+    local arg base dir real path check why parents="" p list backend moved failed rc=0
+    local -a items=()
+    for arg in "$@"; do
+        if [ ! -e "$arg" ] && [ ! -L "$arg" ]; then
+            error "trash: no such file or folder: $arg"; rc=1; continue
+        fi
+        base=${arg%/}
+        base=${base##*/}
+        case "$base" in ""|.|..) error "trash: refusing '$arg'"; rc=1; continue ;; esac
+        dir=$(dirname -- "${arg%/}")
+        real=$(cd -P -- "$dir" 2>/dev/null && pwd) || { error "trash: cannot reach $(dirname -- "$arg")"; rc=1; continue; }
+        path="${real%/}/$base"
+        # A folder is judged where it really is; a file or a link as itself
+        check=$path
+        [ -d "$path" ] && [ ! -L "$path" ] && check=$(cd -P -- "$path" && pwd)
+        why=$(trash_refusal "$check")
+        if [ -n "$why" ]; then
+            error "trash: refusing $arg: $why"; rc=1; continue
+        fi
+        items+=("$path")
+        case $'\n'"$parents"$'\n' in *$'\n'"$real"$'\n'*) ;; *) parents="$parents${parents:+$'\n'}$real" ;; esac
+    done
+    [ ${#items[@]} -gt 0 ] || return "${rc:-1}"
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        list=$(mktemp) || return 1
+        for path in "${items[@]}"; do
+            [ "${path%/*}" = "$p" ] || { [ "$p" = / ] && [ "${path%/*}" = "" ]; } || continue
+            printf '%s\0' "$path" >> "$list"
+        done
+        backend=$(trash_backend_for "$p")
+        case "$backend" in
+            recycle-bin) win_recycle "$list" "$p" >/dev/null ;;
+            macos-trash) cleanup_macos_trash "$list" ;;
+            gio)         xargs -0 gio trash -- < "$list" 2>/dev/null ;;
+            trash-put)   xargs -0 trash-put -- < "$list" 2>/dev/null ;;
+            quarantine)  cleanup_quarantine_move "$list" "$p"; cleanup_quarantine_purge "$p" ;;
+        esac
+        moved=0 failed=()
+        while IFS= read -r -d '' path; do
+            if [ -e "$path" ] || [ -L "$path" ]; then failed+=("$path"); else moved=$((moved + 1)); fi
+        done < "$list"
+        rm -f "$list"
+        if [ "$moved" -gt 0 ]; then
+            case "$backend" in
+                quarantine) info "Moved $moved to the quarantine (kept $(cleanup_quarantine_days) days; trash --restore puts them back)" ;;
+                *)          info "Moved $moved: $(cleanup_backend_label "$backend")" ;;
+            esac
+            cleanup_log_line "trash: $moved from $p ($backend)"
+        fi
+        if [ ${#failed[@]} -gt 0 ]; then
+            error "trash: could not move: ${failed[*]}"
+            rc=1
+        fi
+    done <<< "$parents"
+    return "$rc"
+}
+
+# ─── Coding agents: what they should know about this machine ────────────────
+
+# A short text every coding agent loads in every session: which git/SSH
+# identity goes where and the commands it may use (only the ones installed).
+# Claude Code: a file of its own in ~/.claude/rules (its user-level rules);
+# Codex and Gemini CLI: a marked block in ~/.codex/AGENTS.md and
+# ~/.gemini/GEMINI.md. Only for the agents whose folder exists; refreshed by
+# update, sync, doctor --fix and ssk. Config agent_instructions on/off.
+AGENTS_BEGIN="<!-- olecharms:begin — generated by 'olecharms agents'; edits here are overwritten -->"
+AGENTS_END="<!-- olecharms:end -->"
+CLAUDE_RULES_FILE="$HOME/.claude/rules/olecharms.md"
+CLAUDE_SETTINGS_FILE="$HOME/.claude/settings.json"
+# Claude Code permission rules `olecharms agents protect` adds (deny wins
+# over any allow): no reading private keys or the secrets file, no editing ~/.ssh
+AGENT_DENY_RULES=( "Read(~/.ssh/id_*)" "Read(~/.ssh/*.privatekey)" "Read(~/.config/olecharms/secrets)" "Edit(~/.ssh/**)" )
+
+# "kind<TAB>file" for each agent installed here
+agents_targets() {
+    [ -d "$HOME/.claude" ] && printf 'claude\t%s\n' "$CLAUDE_RULES_FILE"
+    [ -d "$HOME/.codex" ] && printf 'codex\t%s\n' "$HOME/.codex/AGENTS.md"
+    [ -d "$HOME/.gemini" ] && printf 'gemini\t%s\n' "$HOME/.gemini/GEMINI.md"
+    return 0
+}
+
+agents_text() {
+    local ids name email gh dirs n=0 tools=()
+    echo "$AGENTS_BEGIN"
+    echo "## This machine (set up by olecharms)"
+    echo ""
+    echo "### Git and SSH identities"
+    ids=$(bash "$SCRIPT_DIR/bin/ssk" list --plain 2>/dev/null | grep -v '^backup-')
+    if [ -n "$ids" ]; then
+        echo "Several accounts live here. Never switch them globally."
+        local line tab=$'\t'
+        while IFS= read -r line; do
+            # Split by hand: read would merge the tabs around an empty field
+            name=${line%%"$tab"*};  line=${line#*"$tab"}
+            email=${line%%"$tab"*}; line=${line#*"$tab"}
+            gh=${line%%"$tab"*};    dirs=${line#*"$tab"}
+            [ -n "$name" ] || continue
+            n=$((n + 1))
+            printf -- '- `%s`%s%s%s\n' "$name" "${email:+: $email}" "${gh:+, GitHub user $gh}" "${dirs:+; git uses it automatically inside $dirs}"
+        done <<< "$ids"
+        echo "- Inside a folder listed above, just use git: the right key and email are already set."
+        echo "- Elsewhere, run one command as an identity: \`ssk run <name> -- git push\` (it also sets GH_TOKEN for gh)."
+        echo "- Do not run \`ssk <name>\` on its own: it switches the key for every terminal and agent."
+    else
+        echo "- One SSH identity: the default ~/.ssh key."
+    fi
+    echo "- Never read, print or copy private keys (~/.ssh) or ~/.config/olecharms/secrets; do not edit ~/.ssh/config or \`git config --global\`."
+    local check='`ssk which`'
+    [ -n "$ids" ] && check='`ssk which` and `ssk test <name>`'
+    echo "- If git or ssh answers \"Permission denied (publickey)\" or 403: run $check, report what you found and ask; do not work around it."
+    echo ""
+    echo "### Commands"
+    [ "$(readlink "$BIN_DIR/trash" 2>/dev/null)" = "$SCRIPT_DIR/bin/trash" ] &&
+        echo "- \`trash <paths>\` deletes recoverably (Recycle Bin, Trash or a 30-day quarantine): use it instead of \`rm -rf\` for the user's files."
+    [ -x "$SCRIPT_DIR/bin/olecharms-clip" ] && echo "- \`olecharms-clip copy\` (stdin) / \`olecharms-clip paste\`: the system clipboard."
+    check_command rg && tools+=("\`rg\`")
+    { check_command fd || check_command fdfind; } && tools+=("\`fd\`")
+    check_command ag && tools+=("\`ag\`")
+    check_command jq && tools+=("\`jq\`")
+    [ ${#tools[@]} -gt 0 ] && echo "- Search and data: $(printf '%s, ' "${tools[@]}" | sed 's/, $//')."
+    check_command tldr && echo "- \`tldr <command>\`: short examples."
+    { check_command mise || [ -x "$BIN_DIR/mise" ]; } && [ "$(config_get mise on)" != off ] &&
+        echo "- Projects with mise.toml or .tool-versions: \`mise exec -- <command>\` uses their tool versions."
+    echo "- Parallel tasks: one git worktree each, \`git worktree add ../<repo>.worktrees/<task> -b <task>\`."
+    echo "- \`olecharms doctor\` checks this machine's setup (read-only)."
+    echo "$AGENTS_END"
+}
+
+# Put text file $2 in the marked block of markdown file $1 (in place of the
+# old block, or at the end). Text outside the markers is never changed.
+agents_put_block() {
+    local f="$1" text="$2" tmp rc=0
+    tmp=$(mktemp) || return 1
+    if [ -f "$f" ] && grep -qF "${AGENTS_BEGIN%% —*}" "$f"; then
+        awk -v b="${AGENTS_BEGIN%% —*}" -v e="$AGENTS_END" -v t="$text" "$AGENTS_BLOCK_AWK" "$f" > "$tmp" || rc=$?
+    elif [ -s "$f" ] && grep -q $'\r$' "$f"; then
+        # A file saved by a Windows editor: the block gets its CRLF endings
+        { cat "$f"; printf '\r\n'; sed 's/$/\r/' "$text"; } > "$tmp"
+    else
+        { [ -s "$f" ] && { cat "$f"; echo ""; }; cat "$text"; } > "$tmp"
+    fi
+    if [ "$rc" -ne 0 ]; then
+        rm -f "$tmp"
+        agents_block_unclosed "$f" "$rc"
+        return 1
+    fi
+    if [ -f "$f" ] && cmp -s "$tmp" "$f"; then
+        rm -f "$tmp"; return 0
+    fi
+    mkdir -p "$(dirname "$f")" 2>/dev/null
+    # cat > keeps the file's owner, mode and links
+    cat "$tmp" > "$f" && rm -f "$tmp"
+}
+
+agents_drop_block() {
+    local f="$1" tmp rc=0
+    [ -f "$f" ] && grep -qF "${AGENTS_BEGIN%% —*}" "$f" || return 0
+    tmp=$(mktemp) || return 1
+    awk -v b="${AGENTS_BEGIN%% —*}" -v e="$AGENTS_END" -v t="" "$AGENTS_BLOCK_AWK" "$f" > "$tmp" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        rm -f "$tmp"
+        agents_block_unclosed "$f" "$rc"
+        return 1
+    fi
+    cat "$tmp" > "$f" && rm -f "$tmp"
+}
+# The awk shared by the two above: copies the file with the marked block
+# replaced by the lines of file t (dropped when t is empty). Line endings may
+# be CRLF. A begin marker with no end marker after it exits 3, and the caller
+# leaves the file alone: guessing where the block ends could eat the user's text.
+AGENTS_BLOCK_AWK='
+    { l = $0; sub(/\r$/, "", l) }
+    !skip && index(l, b) == 1 {
+        if (!done && t != "") {
+            cr = ($0 ~ /\r$/) ? "\r" : ""
+            while ((getline x < t) > 0) print x cr
+            close(t)
+        }
+        done = 1; skip = 1; next
+    }
+    skip { if (l == e) skip = 0; next }
+    { print }
+    END { if (skip) exit 3 }'
+agents_block_unclosed() {
+    if [ "$2" = 3 ]; then
+        warn "$(home_tilde "$1"): the olecharms block has no end line ($AGENTS_END), so it was left as it is"
+        warn "  Put that line back where the block ends, or delete the block, then run: olecharms agents"
+    else
+        warn "Could not update $(home_tilde "$1") (left as it is)"
+    fi
+}
+
+# Is file $1 the rules file olecharms writes (or absent)?
+agents_rules_ours() {
+    [ ! -e "$1" ] || head -n 1 "$1" 2>/dev/null | grep -qF "${AGENTS_BEGIN%% —*}"
+}
+
+# Refresh every agent's instructions; prints what changed unless --quiet
+agents_refresh() {
+    local quiet="${1:-}" kind f text changed=()
+    if [ "$(config_get agent_instructions on)" = off ]; then
+        agents_remove "$quiet"
+        return 0
+    fi
+    text=$(mktemp) || return 1
+    agents_text > "$text"
+    while IFS=$'\t' read -r kind f; do
+        [ -n "$kind" ] || continue
+        case "$kind" in
+            claude)
+                if ! agents_rules_ours "$f"; then
+                    [ -n "$quiet" ] || warn "$(home_tilde "$f") is not olecharms' (left alone)"
+                    continue
+                fi
+                if ! cmp -s "$text" "$f" 2>/dev/null; then
+                    mkdir -p "$(dirname "$f")" && cp "$text" "$f" && chmod 644 "$f" && changed+=("$(home_tilde "$f")")
+                fi
+                ;;
+            *)
+                local before
+                before=$(_file_hash "$f")
+                agents_put_block "$f" "$text" && [ "$(_file_hash "$f")" != "$before" ] && changed+=("$(home_tilde "$f")")
+                ;;
+        esac
+    done <<< "$(agents_targets)"
+    rm -f "$text"
+    [ -z "$quiet" ] && [ ${#changed[@]} -gt 0 ] && info "Agent instructions updated: ${changed[*]}"
+    return 0
+}
+
+agents_remove() {
+    local quiet="${1:-}" kind f
+    while IFS=$'\t' read -r kind f; do
+        [ -n "$kind" ] || continue
+        case "$kind" in
+            claude) [ -f "$f" ] && agents_rules_ours "$f" && rm -f "$f" && [ -z "$quiet" ] && info "Removed $(home_tilde "$f")" ;;
+            *)      agents_drop_block "$f" ;;
+        esac
+    done <<< "$(agents_targets)"
+    return 0
+}
+
+# Whether the instructions on disk match what would be written now
+agents_current() {
+    local kind f text rc=0
+    text=$(mktemp) || return 1
+    agents_text > "$text"
+    while IFS=$'\t' read -r kind f; do
+        [ -n "$kind" ] || continue
+        case "$kind" in
+            claude) cmp -s "$text" "$f" || rc=1 ;;
+            *)      grep -qF "${AGENTS_BEGIN%% —*}" "$f" 2>/dev/null &&
+                    awk -v b="${AGENTS_BEGIN%% —*}" -v e="$AGENTS_END" '{ sub(/\r$/, "") } index($0, b) == 1 { p = 1 } p { print } p && $0 == e { exit }' "$f" | cmp -s - "$text" || rc=1 ;;
+        esac
+    done <<< "$(agents_targets)"
+    rm -f "$text"
+    return "$rc"
+}
+
+# The deny rules missing from Claude Code's settings (one per line)
+agents_protect_missing() {
+    [ -d "$HOME/.claude" ] && check_command python3 || return 0
+    python3 -I - "$CLAUDE_SETTINGS_FILE" "${AGENT_DENY_RULES[@]}" <<'PY' 2>/dev/null
+import json, os, sys
+path, rules = sys.argv[1], sys.argv[2:]
+try:
+    data = json.load(open(path)) if os.path.exists(path) else {}
+except Exception:
+    print("!invalid")
+    sys.exit(0)
+deny = ((data.get("permissions") or {}).get("deny") or [])
+for r in rules:
+    if r not in deny:
+        print(r)
+PY
+}
+
+# Add the deny rules to ~/.claude/settings.json (a backup first)
+agents_protect() {
+    [ -d "$HOME/.claude" ] || { error "Claude Code is not set up here (~/.claude)"; return 1; }
+    check_command python3 || { error "python3 is needed to edit $(home_tilde "$CLAUDE_SETTINGS_FILE")"; return 1; }
+    if [ -f "$CLAUDE_SETTINGS_FILE" ]; then
+        backup_file "$CLAUDE_SETTINGS_FILE" || return 1
+    fi
+    if python3 -I - "$CLAUDE_SETTINGS_FILE" "${AGENT_DENY_RULES[@]}" <<'PY'
+import json, os, stat, sys
+# A symlinked settings.json (dotfiles, stow) is edited where it really lives,
+# so the link stays; the file keeps its permissions (it may hold API keys)
+path = os.path.realpath(sys.argv[1])
+rules = sys.argv[2:]
+data, mode = {}, 0o600
+if os.path.exists(path):
+    try:
+        data = json.load(open(path))
+    except Exception as e:
+        sys.exit("not valid JSON (%s); left as it is" % e)
+    if not isinstance(data, dict):
+        sys.exit("not a JSON object; left as it is")
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+perms = data.setdefault("permissions", {})
+deny = perms.setdefault("deny", [])
+for r in rules:
+    if r not in deny:
+        deny.append(r)
+tmp = path + ".olecharms-tmp"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+os.chmod(tmp, mode)
+os.replace(tmp, path)
+PY
+    then
+        info "Claude Code may no longer read your private keys or secrets file, nor edit ~/.ssh ($(home_tilde "$CLAUDE_SETTINGS_FILE"))"
+    else
+        error "Could not update $(home_tilde "$CLAUDE_SETTINGS_FILE")"
+        return 1
+    fi
+}
+
+doctor_check_agents() {
+    doc_section "Coding agents"
+    local targets kind f names=() missing
+    targets=$(agents_targets)
+    if [ -z "$targets" ]; then
+        doc_ok "No coding agent set up here (Claude Code, Codex, Gemini CLI)"
+        return 0
+    fi
+    while IFS=$'\t' read -r kind f; do [ -n "$kind" ] && names+=("$kind"); done <<< "$targets"
+    if [ "$(config_get agent_instructions on)" = off ]; then
+        doc_ok "Instructions for ${names[*]} off (olecharms config → Agent instructions)"
+    elif [ -f "$CLAUDE_RULES_FILE" ] && ! agents_rules_ours "$CLAUDE_RULES_FILE"; then
+        doc_warn "$(home_tilde "$CLAUDE_RULES_FILE") is not olecharms'; Claude Code gets no instructions from it"
+        doc_why "Rename your file to keep it; olecharms then writes its own there."
+    elif agents_current; then
+        doc_ok "Instructions for ${names[*]}: identities and commands, current"
+    else
+        doc_warn "The instructions for ${names[*]} are out of date"
+        doc_why "Agents would not know your current identities or commands."
+        doc_hint "olecharms doctor --fix"
+    fi
+    if [ -d "$HOME/.claude" ]; then
+        missing=$(agents_protect_missing)
+        if [ "$missing" = "!invalid" ]; then
+            doc_warn "$(home_tilde "$CLAUDE_SETTINGS_FILE") is not valid JSON"
+            doc_why "Claude Code ignores it, with any permission rules in it."
+        elif [ -n "$missing" ]; then
+            doc_warn "Claude Code may read your private keys and secrets file"
+            doc_why "Instructions ask it not to; permission rules make sure: $(echo "$missing" | paste -sd' ' -)"
+            doc_offer "Add Claude Code rules that stop it reading your private keys and secrets file (a backup of settings.json first)?" agents_protect
+        else
+            doc_ok "Claude Code may not read your private keys or secrets file"
+        fi
+    fi
+    return 0
+}
+
+cmd_agents() {
+    case "${1:-status}" in
+        status)
+            local kind f
+            echo -e "${BOLD}olecharms agents${NC}"
+            if [ -z "$(agents_targets)" ]; then
+                echo "  No coding agent set up here (~/.claude, ~/.codex, ~/.gemini)"
+            fi
+            while IFS=$'\t' read -r kind f; do
+                [ -n "$kind" ] || continue
+                printf '  %-7s %s\n' "$kind" "$(home_tilde "$f")"
+            done <<< "$(agents_targets)"
+            echo "  Instructions: $(config_get agent_instructions on)$(agents_current 2>/dev/null && echo ', current' || echo ', out of date (olecharms agents refresh)')"
+            echo ""
+            echo "  olecharms agents show | refresh | on | off | protect"
+            ;;
+        show)    agents_text ;;
+        refresh) agents_refresh "${2:-}" ;;
+        on)      config_set agent_instructions on; agents_refresh ;;
+        off)     config_set agent_instructions off; agents_remove; info "Agent instructions off" ;;
+        protect) agents_protect ;;
+        *)       error "Usage: olecharms agents [status|show|refresh|on|off|protect]"; return 1 ;;
+    esac
+}
+
+# ─── Shell startup time ─────────────────────────────────────────────────────
+
+# Milliseconds an interactive zsh takes to start, best of three (empty if it
+# cannot be measured: no zsh, no terminal). Each try is stopped after 10 s.
+zsh_startup_ms() {
+    check_command zsh && [ -t 0 ] || return 1
+    zsh -fc '
+        zmodload zsh/datetime || exit 1
+        best=999999
+        for i in 1 2 3; do
+            s=$EPOCHREALTIME
+            zsh -i -c exit </dev/tty >/dev/null 2>&1 &
+            pid=$!
+            ( sleep 10; kill $pid 2>/dev/null ) &
+            dog=$!
+            wait $pid; rc=$?
+            kill $dog 2>/dev/null
+            (( rc > 128 )) && exit 1
+            e=$EPOCHREALTIME
+            t=$(( (e - s) * 1000 ))
+            (( t < best )) && best=$t
+        done
+        printf "%.0f\n" $best' 2>/dev/null
+}
+
+STARTUP_SLOW_MS=500
+doctor_check_startup() {
+    doc_section "Shell startup"
+    local ms
+    if ! ms=$(zsh_startup_ms) || [ -z "$ms" ]; then
+        doc_ok "Not measured (needs zsh and a terminal)"
+        return 0
+    fi
+    if [ "$ms" -lt "$STARTUP_SLOW_MS" ]; then
+        doc_ok "A new zsh is ready in ${ms} ms"
+    else
+        doc_warn "A new zsh takes ${ms} ms to start"
+        doc_why "Every new tab or pane waits that long; under 300 ms feels instant."
+        doc_hint "olecharms doctor --profile shows what takes the time"
+    fi
+}
+
+# `doctor --profile`: where a new interactive zsh spends its startup, by file
+# and function. zsh -x writes a timestamp and the command before every step;
+# a command could hold a secret, so the trace is piped straight into awk and
+# never written to a file (nothing to orphan if this is interrupted). Only the
+# file and function names and their times are shown, never the commands.
+doctor_profile() {
+    check_command zsh || { error "zsh is not installed"; return 1; }
+    echo -e "${BOLD}Where a new zsh spends its startup${NC}"
+    # 2>&1 >/dev/null: the -x trace (stderr) goes down the pipe, zsh's own
+    # output to /dev/null, so only names and times reach awk and then the screen
+    PS4='+%D{%s.%.} %N> ' zsh -i -x -c exit </dev/null 2>&1 >/dev/null | awk '
+        /^\+[0-9]+\.[0-9]+ / {
+            t = substr($1, 2) + 0
+            name = $2; sub(/>$/, "", name)
+            if (prev != "") { spent[prevname] += t - prev }
+            if (first == "") first = t
+            prev = t; prevname = name; last = t
+        }
+        END {
+            if (first == "") { print "  (no trace: zsh -x printed nothing)"; exit }
+            printf "  Total: %d ms (without a terminal: fzf and the zsh extras are not loaded)\n\n", (last - first) * 1000
+            for (n in spent) if (spent[n] >= 0.002) printf "%8.0f ms  %s\n", spent[n] * 1000, n
+        }' | { IFS= read -r head; echo "$head"; IFS= read -r blank; echo "$blank"; sort -rn | head -n 15; }
+    echo ""
+    echo "  Common fixes: lazy-load nvm/pyenv/conda; a compinit that runs twice; oh-my-zsh"
+    echo "  plugins you do not use (plugins=(...) in ~/.zshrc)."
+}
+
+# ─── Shell history and SSH identities in the doctor ─────────────────────────
+
+doctor_check_history() {
+    doc_section "Shell history"
+    local f mode
+    if [ "$(config_get shell_history on)" != on ]; then
+        doc_ok "Not kept by olecharms (olecharms config → Shell history)"
+        return 0
+    fi
+    doc_ok "Kept in $(home_tilde "$HISTORY_DIR"), without lines that look like secrets"
+    for f in "$HISTORY_DIR/zsh_history" "$HISTORY_DIR/bash_history"; do
+        [ -f "$f" ] || continue
+        mode=$(stat -c %a "$f" 2>/dev/null || stat -f %Lp "$f" 2>/dev/null)
+        if [ -n "$mode" ] && [ "$mode" != 600 ]; then
+            doc_warn "$(home_tilde "$f") can be read by others (mode $mode)"
+            doc_offer "Make $(home_tilde "$f") private (chmod 600)?" chmod 600 "$f"
+        fi
+    done
+    # A line after olecharms' block that turns the history off again
+    if [ -f "$HOME/.zshrc" ] && awk -v m="$SHELL_MARKER" 'index($0, m) { seen = 1 } seen && /^[[:space:]]*(unset[[:space:]]+HISTFILE|HISTFILE=)/ { found = 1 } END { exit !found }' "$HOME/.zshrc"; then
+        doc_warn "~/.zshrc changes HISTFILE after olecharms' block"
+        doc_why "That line wins: the history would not be kept where olecharms filters it."
+    fi
+    return 0
+}
+
+doctor_check_identities() {
+    local f name key mode dir id n=0
+    for f in "$HOME/.ssh"/*.pubkey; do
+        [ -f "$f" ] || continue
+        n=$((n + 1))
+        [ "$n" -eq 1 ] && doc_section "SSH identities (ssk)"
+        name=${f##*/}; name=${name%.pubkey}
+        key="${f%.pubkey}.privatekey"
+        if [ ! -f "$key" ]; then
+            doc_warn "$name has no private key ($(home_tilde "$key"))"
+            continue
+        fi
+        mode=$(stat -c %a "$key" 2>/dev/null || stat -f %Lp "$key" 2>/dev/null)
+        if [ -n "$mode" ] && [ "$mode" != 600 ] && [ "$mode" != 400 ]; then
+            doc_warn "$(home_tilde "$key") can be read by others (mode $mode)"
+            doc_why "ssh refuses private keys others can read."
+            doc_offer "Make $(home_tilde "$key") private (chmod 600)?" chmod 600 "$key"
+        fi
+    done
+    [ "$n" -gt 0 ] || return 0
+    while IFS=$'\t' read -r dir id; do
+        [ -n "$dir" ] || continue
+        if [ ! -d "$dir" ]; then
+            doc_warn "$(home_tilde "$dir") is bound to '$id' but no longer exists"
+            doc_hint "ssk unbind $dir"
+        elif [ ! -f "$HOME/.ssh/$id.privatekey" ]; then
+            doc_fail "$(home_tilde "$dir") is bound to '$id', which has no key"
+        fi
+    done <<< "$(bash "$SCRIPT_DIR/bin/ssk" bindings 2>/dev/null)"
+    doc_ok "$n identities; ssk list shows them and their folders"
+}
+
 # ─── Subcommand Handlers ─────────────────────────────────────────────────────
 
 _self_update() {
@@ -3984,9 +5031,65 @@ _self_update() {
 # whether it is now stale.
 shell_config_snapshot() {
     local f
-    for f in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.zshrc" "$SHELL_LOADER" "$ALIAS_FILE" "$GLOBAL_ALIAS_FILE"; do
-        printf '%s ' "$(_file_hash "$f")"
+    { shell_startup_files; printf '%s\n' "$ALIAS_FILE" "$GLOBAL_ALIAS_FILE"; } |
+    while IFS= read -r f; do
+        printf '%s:%s ' "$f" "$(_file_hash "$f")"
     done
+}
+
+# The files an interactive shell reads at startup, one per line (those that
+# exist). Aliases aside: the `olecharms` shell function reloads them itself.
+shell_startup_files() {
+    local f entry
+    for f in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile" \
+             "$HOME/.zshenv" "$HOME/.zprofile" "$HOME/.zshrc" \
+             "$SHELL_LOADER" "$HOOK_SCRIPT" "$SECRETS_FILE" "$SHELL_DIR"/*.sh "$SHELL_DIR"/lib/* \
+             "${ZSH_CUSTOM:-${ZSH:-$HOME/.oh-my-zsh}/custom}/themes/olecharms.zsh-theme"; do
+        [ -f "$f" ] && printf '%s\n' "$f"
+    done
+    for entry in "${ZSH_EXTRA_PLUGINS[@]}"; do
+        f="$ZSH_EXTRAS_DIR/${entry%%|*}/${entry%%|*}.zsh"
+        [ -f "$f" ] && printf '%s\n' "$f"
+    done
+    return 0
+}
+
+# Modification time of $1 in seconds (GNU or BSD stat)
+_file_mtime() {
+    stat -c %Y -- "$1" 2>/dev/null || stat -f %m -- "$1" 2>/dev/null
+}
+
+# True when the shell that called us runs a stale configuration. The
+# `olecharms` shell function passes when that shell read it
+# (OLECHARMS_SHELL_LOADED_AT): anything it reads changed since — by this run,
+# a pull, or another terminal. Without it, compare with snapshot $1.
+shell_reload_needed() {
+    local since="${OLECHARMS_SHELL_LOADED_AT:-}" f m
+    case "$since" in
+        ""|*[!0-9]*)
+            [ -n "${1:-}" ] && [ "$(shell_config_snapshot)" != "$1" ]
+            return ;;
+    esac
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        m=$(_file_mtime "$f")
+        [ -n "$m" ] && [ "$m" -gt "$since" ] && return 0
+    done <<< "$(shell_startup_files)"
+    return 1
+}
+
+# Last words of update / sync / doctor --fix / config: when this terminal
+# needs reloading, say so — or let the `olecharms` shell function offer it,
+# since a child process cannot reload the shell that started it.
+shell_reload_notice() {
+    shell_reload_needed "${1:-}" || return 0
+    if [ -n "${OLECHARMS_RELOAD_FLAG:-}" ] && [ -f "$OLECHARMS_RELOAD_FLAG" ] && [ -O "$OLECHARMS_RELOAD_FLAG" ]; then
+        echo 1 > "$OLECHARMS_RELOAD_FLAG"
+        return 0
+    fi
+    echo ""
+    echo -e "${YELLOW}${BOLD}[!] This terminal still runs the previous shell configuration: run 'exec zsh' to load the new one${NC}"
+    echo "    (new terminals load it already)"
 }
 
 # True when the shell that started us is a zsh
@@ -3997,7 +5100,6 @@ parent_is_zsh() {
     return 1
 }
 
-# The steps shared by install and update, in order
 # ─── Zsh extras ─────────────────────────────────────────────────────────────
 
 # Clone or fast-forward one zsh plugin into ZSH_EXTRAS_DIR. Never deletes:
@@ -4053,9 +5155,13 @@ config_zsh_extras() {
     fi
 }
 
+# The steps shared by install and update, in order
 run_setup_steps() {
     ensure_local_conf_template
     install_packages
+    install_mise
+    zoxide_import_autojump
+    tldr_cache_update
     create_vim_dirs
     install_pathogen
     install_plugins
@@ -4066,9 +5172,11 @@ run_setup_steps() {
     run_post_commands
     install_shell_commands
     install_binary
+    install_bin_links
     install_editor_env
     restore_scheduled_features
     sync_windows_side
+    agents_refresh
 }
 
 cmd_install() {
@@ -4114,11 +5222,14 @@ cmd_update() {
 
     load_config || return 1
 
+    # What the shell had before the pull, kept across the relaunch below
+    local before
+    before=${OLECHARMS_SHELL_BEFORE:-$(shell_config_snapshot)}
+    export OLECHARMS_SHELL_BEFORE="$before"
+
     # Self-update: pull the olecharms repo
     _self_update update
-
-    local before
-    before=$(shell_config_snapshot)
+    unset OLECHARMS_SHELL_BEFORE
 
     run_setup_steps
 
@@ -4128,10 +5239,8 @@ cmd_update() {
     else
         warn "Update complete with $ERROR_COUNT error(s). Review output above."
     fi
-    if [ "$(shell_config_snapshot)" != "$before" ]; then
-        info "Shell configuration changed — run 'exec zsh' (or open a new terminal) to load it."
-    fi
     shared_offer_after_pull
+    shell_reload_notice "$before"
 }
 
 # ─── Doctor ─────────────────────────────────────────────────────────────────
@@ -4237,7 +5346,7 @@ autojump_script_dir() {
 
 doctor_check_commands() {
     doc_section "System commands"
-    local cmd cmds="git vim curl zsh ag autojump"
+    local cmd cmds="git vim curl zsh"
     [ "$OS" = "linux" ] && cmds="$cmds fc-cache"
     for cmd in $cmds; do
         if check_command "$cmd"; then
@@ -5030,12 +6139,18 @@ doctor_run_checks() {
     DOC_WANTS_UPDATE=""
     DOC_WANTS_SYNC=""
     doctor_check_commands
+    doctor_check_tools
     doctor_check_checkout
     doctor_check_launcher
+    doctor_check_bin_links
     doctor_check_shell
     doctor_check_vim
     doctor_check_zsh
     doctor_check_zsh_extras
+    doctor_check_history
+    [ -z "${DOC_NO_STARTUP:-}" ] && doctor_check_startup
+    doctor_check_identities
+    doctor_check_agents
     doctor_check_cleanup
     doctor_check_paranoid
     doctor_check_config
@@ -5063,9 +6178,11 @@ run_local_steps() {
     install_vimrc
     install_shell_commands
     install_binary
+    install_bin_links
     install_editor_env
     restore_scheduled_features
     sync_windows_side
+    agents_refresh
     config_set install_dir "$SCRIPT_DIR"
 }
 
@@ -5086,23 +6203,27 @@ cmd_doctor() {
         case "$arg" in
             --fix) fix=1 ;;
             --quiet) quiet=1 ;;
-            -h|--help) echo "Usage: olecharms doctor [--fix]"; return 0 ;;
+            --profile) doctor_profile; return ;;
+            -h|--help) echo "Usage: olecharms doctor [--fix | --profile]"; return 0 ;;
             *) error "Unknown doctor option: $arg"; return 1 ;;
         esac
     done
     load_config || return 1
 
     # The daily background run: nothing on screen, only the problems file
+    # (and no startup timing: it would start shells on the terminal)
     if [ -n "$quiet" ]; then
         out=$(mktemp) || return 1
-        doctor_run_checks > "$out" 2>&1
+        DOC_NO_STARTUP=1 doctor_run_checks > "$out" 2>&1
         rm -f "$out"
         doctor_record
         [ "$DOC_FAIL" -eq 0 ]
         return $?
     fi
 
+    local shell_before=""
     if [ -n "$fix" ]; then
+        shell_before=$(shell_config_snapshot)
         echo -e "${BOLD}olecharms doctor --fix${NC}"
         echo ""
         run_local_steps
@@ -5116,7 +6237,7 @@ cmd_doctor() {
         if doctor_apply_offers; then
             # Check again, showing only the outcome
             out=$(mktemp) || return 1
-            doctor_run_checks > "$out" 2>&1
+            DOC_NO_STARTUP=1 doctor_run_checks > "$out" 2>&1
             rm -f "$out"
             doctor_record
             echo ""
@@ -5130,6 +6251,7 @@ cmd_doctor() {
             echo "Run 'olecharms doctor --fix' for local repairs, or 'olecharms update' for packages and plugins."
         fi
     fi
+    [ -n "$fix" ] && shell_reload_notice "$shell_before"
     [ "$DOC_FAIL" -eq 0 ]
 }
 
@@ -5629,7 +6751,55 @@ config_paranoid_mode() {
     fi
 }
 
+# Menu items 7-9: explain, ask, switch on/off and apply ($2: the answer
+# when called from the shared settings, which already asked)
+config_toggle() {
+    local key="$1" want="${2:-}" now
+    now=$(config_get "$key" on)
+    if [ -z "$want" ]; then
+        case "$key" in
+            shell_history)
+                echo "  Shell history: your commands are kept across sessions in a private file"
+                echo "  ($(home_tilde "$HISTORY_DIR")), so Ctrl-R and the arrows find them tomorrow. A line"
+                echo "  that looks like it holds a secret (TOKEN=…, API_KEY=…, ghp_…, Bearer …, a"
+                echo "  password in a URL, the value of an olecharms secret) stays out of the file,"
+                echo "  as does one you start with a space. Paranoid mode wipes the file." ;;
+            agent_instructions)
+                echo "  Agent instructions: Claude Code, Codex and Gemini CLI are told which git/SSH"
+                echo "  identity goes with which folder and which commands they may use (trash,"
+                echo "  ssk run, rg...). Written to ~/.claude/rules/olecharms.md and a marked block"
+                echo "  in ~/.codex/AGENTS.md and ~/.gemini/GEMINI.md (where those agents exist)." ;;
+            mise)
+                echo "  mise: projects get the tool versions they ask for (node, python, go...) from"
+                echo "  mise.toml or .tool-versions, in every shell. 'olecharms update' installs it." ;;
+        esac
+        echo ""
+        if [ "$now" = off ]; then
+            confirm_default_yes "  It is off. Turn it on?" || { info "No changes made"; return 0; }
+            want=on
+        else
+            confirm_default_no "  It is on. Turn it off?" || { info "No changes made"; return 0; }
+            want=off
+        fi
+    fi
+    config_set "$key" "$want"
+    case "$key" in
+        shell_history)
+            install_shell_commands >/dev/null
+            info "Shell history $want from the next shell" ;;
+        agent_instructions)
+            agents_refresh
+            info "Agent instructions $want" ;;
+        mise)
+            install_shell_commands >/dev/null
+            [ "$want" = on ] && ! check_command mise && [ ! -x "$BIN_DIR/mise" ] && install_mise
+            info "mise $want from the next shell" ;;
+    esac
+}
+
 cmd_config() {
+    local shell_before
+    shell_before=$(shell_config_snapshot)
     echo -e "${BOLD}olecharms config${NC}"
     echo ""
 
@@ -5672,6 +6842,15 @@ cmd_config() {
         local zx_status="${GREEN}on${NC}"
         [ "$(config_get zsh_extras on)" = off ] && zx_status="${RED}off${NC}"
         echo -e "    6) Zsh extras              [$zx_status]  fzf keys, suggestions, syntax colours"
+        local key st
+        for key in shell_history agent_instructions mise; do
+            if [ "$(config_get "$key" on)" = off ]; then st="${RED}off${NC}"; else st="${GREEN}on${NC}"; fi
+            case "$key" in
+                shell_history)      echo -e "    7) Shell history           [$st]  kept privately, without secrets" ;;
+                agent_instructions) echo -e "    8) Agent instructions      [$st]  what Claude Code, Codex, Gemini know here" ;;
+                mise)               echo -e "    9) mise                    [$st]  per-project tool versions" ;;
+            esac
+        done
         echo ""
         echo "    0) Exit"
         echo ""
@@ -5733,8 +6912,24 @@ cmd_config() {
                 config_zsh_extras
                 echo ""
                 ;;
+            7)
+                echo ""
+                config_toggle shell_history
+                echo ""
+                ;;
+            8)
+                echo ""
+                config_toggle agent_instructions
+                echo ""
+                ;;
+            9)
+                echo ""
+                config_toggle mise
+                echo ""
+                ;;
             0|"")
-                return
+                shell_reload_notice "$shell_before"
+                return 0
                 ;;
             *)
                 warn "Invalid selection"
@@ -6133,6 +7328,7 @@ cmd_sync() {
             return 1
         fi
         before=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null)
+        snap=$(shell_config_snapshot)
         info "Pulling $SCRIPT_DIR..."
         checkout_pull
         case $? in
@@ -6151,16 +7347,15 @@ cmd_sync() {
             return 1
         fi
         # Finish with the code just pulled
-        exec bash "$SCRIPT_PATH" sync --local
+        OLECHARMS_SHELL_BEFORE="$snap" exec bash "$SCRIPT_PATH" sync --local
     fi
 
-    snap=$(shell_config_snapshot)
+    snap=${OLECHARMS_SHELL_BEFORE:-$(shell_config_snapshot)}
+    unset OLECHARMS_SHELL_BEFORE
     run_local_steps
-    if [ "$snap" != "$(shell_config_snapshot)" ]; then
-        info "Shell configuration changed — open a new shell (or run 'exec zsh') to pick it all up"
-    fi
     info "Synced. Packages and vim plugins are updated by 'olecharms update'."
     shared_offer_after_pull
+    shell_reload_notice "$snap"
 }
 
 # Pick one of the latest commands from the shell history, name it, save it as
@@ -6249,17 +7444,21 @@ cmd_help() {
     echo "  sync      Light update: pull the checkout (global aliases, config, code) and"
     echo "            refresh shell, vim and schedules — no packages or plugins"
     echo "  doctor    Check the whole setup (offline), exit 1 on problems; --fix repairs"
-    echo "            what it can. Also runs once a day in the background; new shells"
-    echo "            mention problems (alias: check)"
+    echo "            what it can; --profile shows what slows zsh's startup. Also runs once"
+    echo "            a day in the background; new shells mention problems (alias: check)"
     echo "  status    Show what's installed with version info"
     echo "  config    Interactive menu: downloads cleanup, paranoid mode, Windows sync (WSL),"
-    echo "            settings shared by all your machines, zsh extras (fzf...)"
+    echo "            settings shared by all your machines, zsh extras (fzf...), shell"
+    echo "            history, instructions for coding agents, mise"
     echo "  cleanup   Clean the downloads folder now; --dry-run lists what would go,"
     echo "            --log shows past runs"
     echo "  alias     Manage shell aliases (add / list / delete); --global shares one"
     echo "            with every machine through git"
     echo "  aliaslast Pick one of your latest commands and save it as an alias"
     echo "  secret    Keep API keys and tokens out of your RC files (set / list / rm / import)"
+    echo "  trash     Move files to the trash, recoverably (also the 'trash' command)"
+    echo "  agents    What coding agents (Claude Code, Codex, Gemini CLI) are told about this"
+    echo "            machine: show / refresh / on / off / protect"
     [ -n "${IS_WSL:-}" ] && echo "  windows   Sync Windows' gVim (config, plugins) and fonts now; 'status' to check"
     echo "  help      Show this help message"
     echo ""
@@ -6281,6 +7480,20 @@ cmd_help() {
             if [ -n "$name" ]; then
                 printf "  %-10s %s\n" "$name" "$detail"
             fi
+        done
+    fi
+
+    # Commands in bin/ (linked into ~/.local/bin): "# name — description" on line 2
+    local bin_files=("$SCRIPT_DIR"/bin/*) b line
+    if [ -e "${bin_files[0]}" ]; then
+        echo ""
+        echo -e "${BLUE}Commands (also for scripts and coding agents):${NC}"
+        for b in "${bin_files[@]}"; do
+            [ -x "$b" ] || continue
+            line=$(sed -n 2p "$b")
+            case "$line" in "# "*" — "*) ;; *) continue ;; esac
+            line=${line#\# }
+            printf "  %-10s %s\n" "${line%% — *}" "${line#* — }"
         done
     fi
 
@@ -6626,7 +7839,7 @@ main() {
             config_ensure
             fix_moved_install fix
             ;;
-        alias|aliaslast|cleanup|windows|secret)
+        alias|aliaslast|cleanup|windows|secret|trash|agents)
             config_ensure
             ;;
         doctor|check)
@@ -6656,6 +7869,8 @@ main() {
         alias)   shift; cmd_alias "$@" || cmd_rc=$? ;;
         aliaslast) shift; cmd_aliaslast "$@" || cmd_rc=$? ;;
         secret)  shift; cmd_secret "$@" || cmd_rc=$? ;;
+        trash)   shift; cmd_trash "$@" || cmd_rc=$? ;;
+        agents)  shift; cmd_agents "$@" || cmd_rc=$? ;;
         help|--help|-h) cmd_help ;;
         "")
             cmd_help

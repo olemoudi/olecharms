@@ -1,0 +1,9 @@
+#!/bin/sh
+# line — print line N of a file or of stdin (-1: the last)
+# Usage: line N [file]
+n=${1:-}
+case "$n" in ""|-|*[!0-9-]*|?*-*) echo "Usage: line N [file]   (N >= 1, or -1 for the last)" >&2; exit 2 ;; esac
+shift
+if [ "$n" = -1 ]; then exec tail -n 1 "$@"; fi
+case "$n" in -*|0) echo "line: N must be 1 or more (or -1)" >&2; exit 2 ;; esac
+exec sed -n "${n}{p;q;}" "$@"

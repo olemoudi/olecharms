@@ -115,7 +115,8 @@ echo "== 10. config with CRLF"
 sed -i 's/$/\r/' "$H/.config/olecharms/config"
 chk "CRLF value parsed" test "$(lib 'config_read; config_get downloads_cleanup_enabled')" = true
 
-echo "== 11. switchsshkey"
+echo "== 11. switchsshkey (the shell functions, through bin/ssk)"
+export _olecharms_bin=$SB/repo/olecharms.sh
 mkdir -p "$H/.ssh"; echo PRIV-ORIG > "$H/.ssh/id_ed25519"; echo "ssh-ed25519 ORIG" > "$H/.ssh/id_ed25519.pub"
 out=$(zsh -c "source '$SB/repo/shell/switchsshkey.sh'; ssk list; echo rc=\$?" 2>&1)
 chk "zsh: list with no keys ok ($out)" test "$out" = "rc=0"
@@ -128,6 +129,7 @@ bash -c "source '$SB/repo/shell/switchsshkey.sh'; ssk work" >/dev/null 2>&1
 chk "no extra backup when key is named" test "$(ls "$H"/.ssh/backup-* | wc -l)" -eq "$n"
 bash -c "source '$SB/repo/shell/switchsshkey.sh'; ssk add ../evil '$SB/w' '$SB/w.pub'" >/dev/null 2>&1
 chk "path-like key name rejected"      test ! -e "$H/evil.pubkey"
+unset _olecharms_bin
 
 echo "== 12. generated loader works in zsh and bash"
 lib 'install_shell_commands' >/dev/null

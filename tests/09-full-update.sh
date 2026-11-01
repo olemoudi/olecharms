@@ -38,7 +38,8 @@ guard() { grep -q "^downloads_cleanup_dir=\($SB\|$WSB\)" "$H/.config/olecharms/c
 echo "== A. cleanup engine (Linux folder → auto = delete)"
 lib 'enable_downloads_cleanup "$HOME/downloads" hook 30' >/dev/null; guard
 CS=$SB/repo/scripts/cleanup-downloads.sh
-chk "launcher stamped with generator version" grep -q '^# olecharms-generator: 5$' "$CS"
+GV=$(sed -n 's/^GENERATOR_VERSION=//p' "$SB/repo/olecharms.sh")
+chk "launcher stamped with generator version" grep -qx "# olecharms-generator: $GV" "$CS"
 out=$($OC cleanup --dry-run 2>&1)
 chk "dry-run lists old1.zip"              grep -q 'old1.zip' <<< "$out"
 chk "dry-run hides desktop.ini/.localized" bash -c "! grep -qE 'desktop.ini$|\.localized$' <<< \"\$1\"" _ "$out"
@@ -67,6 +68,7 @@ echo "== C. full update twice in sandbox (incl. Windows gVim sync into $WSB/home
 cd "$SB/repo"
 timeout 500 $OC update </dev/null > "$S/u1.log" 2>&1; rc=$?
 chk "update #1 exit 0 (got $rc)" test "$rc" -eq 0
+chk "update #1 ends saying to reload the terminal" bash -c "tail -n 2 '$S/u1.log' | grep -q \"previous shell configuration: run 'exec zsh'\""
 grep -E '\[-\]|Windows|gVim|_vimrc|fonts' "$S/u1.log" | sed 's/^/    /'
 VF=$WSB/home/vimfiles
 chk "_vimrc created with marker + source line" bash -c "tr -d '\r' < '$WSB/home/_vimrc' | grep -qx 'source ~/vimfiles/olecharms/olevimrc.vim'"
@@ -83,7 +85,7 @@ chk "update #2 exit 0 (got $rc)" test "$rc" -eq 0
 chk "update #2: _vimrc untouched"         cmp -s "$S/vimrc1" "$WSB/home/_vimrc"
 chk "update #2: says already sources"     grep -q 'already sources olecharms' "$S/u2.log"
 chk "user's own plugin dir left alone"    test -f "$VF/bundle/mine/plugin.vim"
-chk "update #2: no shell-config-changed notice" bash -c "! grep -q 'Shell configuration changed' '$S/u2.log'"
+chk "update #2: no reload notice (nothing changed)" bash -c "! grep -q 'previous shell configuration' '$S/u2.log'"
 
 echo "== D. real Windows vim.exe loads the synced config"
 WOUT=$(wslpath -w "$WSB/out.txt")
@@ -125,7 +127,8 @@ chk "local conf extends APT_PACKAGES and sees OLECHARMS_WSL ($out)" grep -q 'zzf
 sed -i '/^downloads_cleanup_action=/d; /^windows_integration=/d; s/^CONFIG_VERSION=.*/CONFIG_VERSION=2/' "$H/.config/olecharms/config"
 lib 'true' >/dev/null
 chk "v2 → v3 migration adds new keys" grep -q '^downloads_cleanup_action=auto' "$H/.config/olecharms/config"
-chk "CONFIG_VERSION=4"                grep -q '^CONFIG_VERSION=4' "$H/.config/olecharms/config"
+CV=$(sed -n 's/^CURRENT_CONFIG_VERSION=//p' "$SB/repo/olecharms.sh")
+chk "CONFIG_VERSION=$CV"                grep -q "^CONFIG_VERSION=$CV" "$H/.config/olecharms/config"
 
 echo "== H. self-update warns about local packages.conf changes and stash"
 G=$SB/git; rm -rf "$G"; mkdir -p "$G"

@@ -27,13 +27,15 @@ zstyle ':omz:update' mode disabled
 plugins=(git common-aliases)
 source \$ZSH/oh-my-zsh.sh
 EOF
+# A shell command that uses cp: its body must keep the plain cp
+printf '# zzcp — test helper\nzzcp() { cp "$1" "$2"; }\n' > "$SB/repo/shell/zzcp.sh"
 lib 'install_shell_commands' >/dev/null
 zi() { (cd "$H" && ZDOTDIR=$H zsh -ic "$1" 2>&1 </dev/null); }
 
 echo "== 1. loader after oh-my-zsh (zsh -i)"
-out=$(zi 'functions switchsshkey')
+out=$(zi 'functions zzcp')
 chk "omz alias cp='cp -i' is defined"      grep -q "cp -i" <<< "$(zi 'alias cp')"
-chk "ssk body has plain cp, not cp -i"     bash -c "grep -q 'cp \"' <<< \"\$1\" && ! grep -q 'cp -i' <<< \"\$1\"" _ "$out"
+chk "function body has plain cp, not cp -i"     bash -c "grep -q 'cp \"' <<< \"\$1\" && ! grep -q 'cp -i' <<< \"\$1\"" _ "$out"
 chk "aliases option still on afterwards"   test "$(zi '[[ -o aliases ]] && echo on')" = on
 chk "null_glob not leaked"                 test "$(zi '[[ -o null_glob ]] && echo on || echo off')" = off
 chk "omz git alias usable (gst)"           grep -q 'git status' <<< "$(zi 'alias gst')"
@@ -43,7 +45,7 @@ chk "no startup errors"                    test -z "$(zi 'true')"
 echo "== 2. bash -i with an alias defined before the loader"
 printf 'alias cp="cp -i"\n' > "$H/.bashrc.pre"
 cat "$H/.bashrc.pre" "$H/.bashrc" > "$H/.bashrc.new" && mv "$H/.bashrc.new" "$H/.bashrc"
-bout=$(cd "$H" && bash -ic 'type switchsshkey; shopt expand_aliases' 2>&1 </dev/null)
+bout=$(cd "$H" && bash -ic 'type zzcp; shopt expand_aliases' 2>&1 </dev/null)
 chk "bash: function body has plain cp"     bash -c "! grep -q 'cp -i' <<< \"\$1\"" _ "$bout"
 chk "bash: expand_aliases restored"        grep -qE 'expand_aliases\s+on' <<< "$bout"
 

@@ -1,0 +1,24 @@
+#!/bin/sh
+# url — split a URL into its parts and decoded query parameters
+# Usage: url URL   (or the URL on stdin)
+command -v python3 >/dev/null 2>&1 || { echo "url: needs python3" >&2; exit 1; }
+if [ $# -gt 0 ]; then u=$1; else IFS= read -r u; fi
+[ -n "$u" ] || { echo "Usage: url URL" >&2; exit 2; }
+exec python3 -I -c '
+import sys
+from urllib.parse import urlsplit, parse_qsl, unquote
+p = urlsplit(sys.argv[1].strip())
+if not p.scheme and not p.netloc:
+    sys.exit("url: not a URL: " + sys.argv[1])
+rows = [("scheme", p.scheme), ("user", unquote(p.username or "")),
+        ("password", "(set)" if p.password else ""), ("host", p.hostname or ""),
+        ("port", str(p.port or "")), ("path", unquote(p.path)), ("fragment", unquote(p.fragment))]
+for k, v in rows:
+    if v:
+        print(f"{k:9} {v}")
+q = parse_qsl(p.query, keep_blank_values=True)
+if q:
+    print("query")
+    for k, v in q:
+        print(f"  {k} = {v}")
+' "$u"

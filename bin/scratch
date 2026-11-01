@@ -1,0 +1,11 @@
+#!/bin/sh
+# scratch — open a throwaway file in your editor (scratch md: Markdown)
+# Usage: scratch [extension]
+ext=${1:-txt}
+case "$ext" in *[!A-Za-z0-9]*) echo "scratch: the extension must be letters or digits" >&2; exit 2 ;; esac
+dir=$(mktemp -d "${TMPDIR:-/tmp}/scratch.XXXXXX") || exit 1
+f="$dir/scratch.$ext"
+: > "$f"
+# As git does: the editor setting may carry arguments (EDITOR="code -w")
+sh -c "${VISUAL:-${EDITOR:-vim}} \"\$1\"" scratch "$f"
+[ -s "$f" ] && echo "Kept in $f" || { rm -f "$f"; rmdir "$dir" 2>/dev/null; }

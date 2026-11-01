@@ -1,0 +1,11 @@
+#!/bin/sh
+# jsonformat — pretty-print JSON from a file or stdin (jq, else python3)
+# Usage: jsonformat [file]
+if [ $# -gt 0 ] && [ ! -r "$1" ]; then echo "jsonformat: cannot read $1" >&2; exit 2; fi
+if command -v jq >/dev/null 2>&1; then
+    exec jq . "$@"
+elif command -v python3 >/dev/null 2>&1; then
+    exec python3 -m json.tool "$@"
+fi
+echo "jsonformat: needs jq or python3" >&2
+exit 1

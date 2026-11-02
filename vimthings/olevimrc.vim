@@ -12,6 +12,19 @@ scriptencoding utf-8
 " same file serves the terminal vim and Windows' gVim (olecharms copies it).
 let s:vimdir = expand(has('win32') ? '$HOME/vimfiles' : '$HOME/.vim')
 
+" MacVim opened from the Dock or Finder does not get the terminal's PATH:
+" put ~/.local/bin (olecharms' commands, the tools it installs in your home,
+" mvim) and Homebrew's bin in it, so :grep with rg, CtrlP and the clipboard
+" helper find them as they do in the terminal.
+if has('gui_macvim')
+    for s:dir in ['/opt/homebrew/bin', '/usr/local/bin', expand('~/.local/bin')]
+        if isdirectory(s:dir) && index(split($PATH, ':'), s:dir) < 0
+            let $PATH = s:dir . ':' . $PATH
+        endif
+    endfor
+    unlet! s:dir
+endif
+
 " Pathogen load
 filetype off
 

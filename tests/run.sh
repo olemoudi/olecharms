@@ -6,9 +6,9 @@
 #   tests/run.sh 05 07            only the suites whose names start that way
 #   tests/run.sh --keep ...       keep the sandbox and logs afterwards
 #
-# Every suite works on a copy of this checkout with a fake HOME, crontab and
-# sudo (see tests/lib/sandbox.sh): your files, crontab, git config and
-# packages are never touched. Needs Linux or WSL (GNU coreutils, util-linux
+# Every suite works on a copy of this checkout with a fake HOME, crontab,
+# sudo and npm (see tests/lib/sandbox.sh): your files, crontab, git config
+# and packages are never touched. Needs Linux or WSL (GNU coreutils, util-linux
 # `script`), plus bash, zsh, vim, git, python3 and rsync.
 
 TESTS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

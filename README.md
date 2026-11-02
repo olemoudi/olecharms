@@ -14,7 +14,11 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/olemoudi/olecharms/maste
 
 It installs git if it is missing, clones this repository into `~/olecharms`
 (set `OLECHARMS_DIR` to use another folder) and runs `olecharms install`,
-which asks for sudo to install system packages. Running it again is safe: an
+which asks before using sudo for system packages. Without root or Homebrew
+it installs what it can in your home instead (rg, fd, bat, delta, jq, fzf,
+zoxide, tldr and mise, with mise, npm or the project's install script, which
+it downloads first and then runs, never piped), points `npm install -g` at
+`~/.local`, and tells you what is left. Running it again is safe: an
 existing checkout is updated, never replaced.
 
 Or by hand:
@@ -46,6 +50,9 @@ ssk run personal -- git push   # one command as another identity, nothing global
 wt feature-x            # a git worktree per task or agent; wt rm feature-x
 pwd | copy              # the clipboard, the same on Linux, macOS, WSL and over SSH
 ```
+
+On macOS, `olecharms macvim` installs MacVim in `~/Applications` (no admin
+needed) with the same config and plugins as vim, and links `mvim`.
 
 Coding agents (Claude Code, Codex, Gemini CLI) are told about these, and about
 which identity goes with which folder: `olecharms agents show`.

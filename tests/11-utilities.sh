@@ -31,6 +31,7 @@ printf '#!/bin/sh\necho system-timer\n' > "$SB/sys/timer"; chmod +x "$SB/sys/tim
 PATH="$SB/sys:$PATH" lib 'install_bin_links' >/dev/null
 chk "another program's name is not shadowed" test ! -e "$L/timer"
 printf '#!/bin/sh\necho fdfind "$@"\n' > "$SB/sys/fdfind"; chmod +x "$SB/sys/fdfind"
+rm -f "$L/fd"   # a host with fd-find already got fd → its own /usr/bin/fdfind above
 PATH="$SB/sys:$PATH" lib 'install_bin_links' >/dev/null
 chk "fd linked to Debian's fdfind"          test "$(readlink "$L/fd")" = "$SB/sys/fdfind"
 ln -s /nonexistent/olecharms-old/bin/ssk "$L/ssk2" 2>/dev/null
@@ -41,7 +42,7 @@ chk "link from a vanished checkout redone"  test "$(readlink "$L/trash")" = "$B/
 chk "a broken link of yours is left alone"  test -L "$L/node"
 rm -f "$SB/sys/fdfind"
 lib 'install_bin_links' >/dev/null
-chk "shim whose program went away removed"  test ! -L "$L/fd"
+chk "shim whose program went away removed"  test "$(readlink "$L/fd")" != "$SB/sys/fdfind"
 rm -f "$L/url" "$L/node" "$L/ssk2"
 lib 'install_bin_links' >/dev/null
 out=$($OC help 2>&1 | plain)

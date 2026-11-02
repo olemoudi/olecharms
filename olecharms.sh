@@ -100,7 +100,7 @@ MANAGED_PLUGINS_FILE="$OLECHARMS_STATE_DIR/managed-plugins"
 # Shell history kept by olecharms (config shell_history), one file per shell
 HISTORY_DIR="$OLECHARMS_STATE_DIR/history"
 # Stamped into every generated script; `doctor` flags older ones.
-GENERATOR_VERSION=6
+GENERATOR_VERSION=7
 GENERATOR_STAMP="# olecharms-generator:"
 # Marks the plugin copies olecharms owns inside Windows' vimfiles\bundle
 WIN_MANAGED_STAMP=".olecharms-managed"
@@ -175,6 +175,7 @@ ensure_local_conf_template() {
 #
 # APT_PACKAGES+=( htop jq )
 # BREW_PACKAGES+=( htop jq )
+# HOME_TOOLS+=( "lazygit|aqua:jesseduffield/lazygit||" )   # without root: mise|npm|script
 # VIM_PLUGINS+=( "commentary|https://github.com/tpope/vim-commentary.git" )
 # FONT_FAMILIES+=( "SourceCodePro" )
 # [ "$OLECHARMS_OS" = macos ] && BREW_PACKAGES+=( coreutils )
@@ -1351,7 +1352,7 @@ paranoid_covers_windows() {
 paranoid_print_targets() {
     echo "    - Shell history (~/.bash_history, ~/.zsh_history and the shell's own \$HISTFILE)"
     echo "    - Other histories: less, python, node, sqlite, psql, mysql, irb, redis-cli, wget HSTS"
-    echo "    - Vim history: commands, searches, registers, marks (~/.viminfo)"
+    echo "    - Vim history: commands, searches, registers, marks (~/.viminfo$([ "${OS:-}" = macos ] && echo ', MacVim too'))"
     echo "    - Vim undo files ($VIM_DIR/undodir/), and swap files ($VIM_DIR/swapfiles/)"
     echo "      when no vim is running — they are an open vim's crash recovery"
     if paranoid_covers_windows; then
@@ -1425,9 +1426,10 @@ purge_dir "\$VIM_DIR/undodir" "\$UNDO_NAMES"
 
 # Swap files are a running vim's crash recovery and its "already being
 # edited" guard, and vim never recreates a deleted one: leave them while any
-# vim of this user runs (and when that cannot be told).
+# vim of this user runs (and when that cannot be told). MacVim's processes
+# are called MacVim and Vim; it keeps its swap files in the same folder.
 if command -v pgrep >/dev/null 2>&1 &&
-   ! pgrep -u "\$(id -u)" -x 'g?vim|nvim|vi|view|gview|vimdiff|mvim' >/dev/null 2>&1; then
+   ! pgrep -u "\$(id -u)" -x 'g?vim|nvim|vi|view|gview|vimdiff|mvim|MacVim|Vim' >/dev/null 2>&1; then
     purge_dir "\$VIM_DIR/swapfiles" "\$SWAP_NAMES"
 fi
 PARANOID_EOF
@@ -3461,6 +3463,169 @@ win_bin_status() {
     return 1
 }
 
+# ─── MacVim (macOS) ─────────────────────────────────────────────────────────
+# MacVim is to macOS what gVim is to Windows, but it reads the same ~/.vimrc
+# and ~/.vim as the terminal vim: the config, plugins and Powerline font
+# (~/Library/Fonts) reach it with nothing copied. What olecharms adds: the app
+# itself (`olecharms macvim`: the official release into ~/Applications — no
+# admin needed, and MacVim's own updater keeps it current there), its `mvim`
+# command linked into ~/.local/bin, ~/.local/bin on MacVim's PATH
+# (olevimrc.vim) and, in paranoid mode, MacVim counted as a running vim.
+MACVIM_DMG_URL="https://github.com/macvim-dev/macvim/releases/latest/download/MacVim.dmg"
+
+# MacVim.app: yours (~/Applications), the system's (/Applications), or
+# Homebrew's macvim formula
+macvim_find() {
+    local d
+    for d in "$HOME/Applications/MacVim.app" /Applications/MacVim.app \
+             /opt/homebrew/opt/macvim/MacVim.app /usr/local/opt/macvim/MacVim.app; do
+        [ -d "$d/Contents/MacOS" ] && { echo "$d"; return 0; }
+    done
+    return 1
+}
+
+# MacVim's version, from app $1 (defaults reads binary and XML plists alike)
+macvim_version() {
+    local plist="$1/Contents/Info.plist" v=""
+    check_command defaults && v=$(defaults read "${plist%.plist}" CFBundleShortVersionString 2>/dev/null)
+    [ -n "$v" ] || v=$(sed -n '/<key>CFBundleShortVersionString<\/key>/{n;s/.*<string>\(.*\)<\/string>.*/\1/p;}' "$plist" 2>/dev/null)
+    echo "${v:-?}"
+}
+
+# mvim (MacVim from the terminal: mvim file, mvim -d a b) into ~/.local/bin,
+# unless another mvim is on PATH (Homebrew's formula links its own)
+macvim_link() {
+    local src="$1/Contents/bin/mvim" dest="$BIN_DIR/mvim"
+    [ -x "$src" ] || return 0
+    if [ -L "$dest" ] && bin_link_ours "$dest"; then
+        [ "$(readlink "$dest")" = "$src" ] || ln -sfn "$src" "$dest"
+        return 0
+    fi
+    { [ -e "$dest" ] || [ -L "$dest" ]; } && return 0
+    bin_command_elsewhere mvim >/dev/null && return 0
+    mkdir -p "$BIN_DIR" 2>/dev/null && ln -s "$src" "$dest" &&
+        info "Linked mvim (MacVim from the terminal) into $(home_tilde "$BIN_DIR")"
+}
+
+# install/update, doctor --fix: what MacVim needs, when it is there
+sync_macvim_side() {
+    [ "$OS" = macos ] || return 0
+    local app
+    if ! app=$(macvim_find); then
+        info "MacVim not found — skipping (install it with: olecharms macvim)"
+        return 0
+    fi
+    macvim_link "$app"
+}
+
+# The official MacVim release into ~/Applications, without admin rights. The
+# app in the disk image must pass macOS' own checks — signed by its
+# developers and notarized by Apple (codesign, spctl) — or nothing is copied.
+# OLECHARMS_MACVIM_URL points the tests at a local image.
+macvim_install() {
+    local url="${OLECHARMS_MACVIM_URL:-$MACVIM_DMG_URL}" dest="$HOME/Applications/MacVim.app"
+    local tmp mnt app c
+    for c in curl hdiutil codesign spctl; do
+        if ! check_command "$c"; then
+            error "MacVim: $c is missing here; download MacVim from https://macvim.org instead"
+            return 1
+        fi
+    done
+    tmp=$(mktemp -d) || return 1
+    mnt="$tmp/mnt"
+    mkdir -p "$mnt"
+    info "Downloading MacVim ($url)..."
+    if ! curl -fsSL --proto '=https,file' --proto-redir '=https' --connect-timeout 15 --max-time 900 \
+            -o "$tmp/MacVim.dmg" "$url"; then
+        rm -rf "$tmp"
+        error "MacVim: download failed; nothing installed"
+        return 1
+    fi
+    if ! hdiutil attach -nobrowse -readonly -noautoopen -quiet -mountpoint "$mnt" "$tmp/MacVim.dmg" >/dev/null; then
+        rm -rf "$tmp"
+        error "MacVim: could not open the disk image; nothing installed"
+        return 1
+    fi
+    app="$mnt/MacVim.app"
+    if [ ! -d "$app/Contents/MacOS" ] ||
+       ! codesign --verify --deep --strict "$app" >/dev/null 2>&1 ||
+       ! spctl --assess --type execute "$app" >/dev/null 2>&1; then
+        hdiutil detach "$mnt" -quiet >/dev/null 2>&1
+        rmdir "$mnt" 2>/dev/null && rm -f "$tmp/MacVim.dmg" && rmdir "$tmp"
+        error "MacVim: the app in the download is not signed and notarized as it should be; nothing installed"
+        return 1
+    fi
+    mkdir -p "$HOME/Applications"
+    if check_command ditto; then
+        ditto "$app" "$dest"
+    else
+        cp -R "$app" "$dest"
+    fi
+    c=$?
+    # Never rm -rf a folder that may still hold the mounted image
+    hdiutil detach "$mnt" -quiet >/dev/null 2>&1 || hdiutil detach "$mnt" -force -quiet >/dev/null 2>&1
+    rmdir "$mnt" 2>/dev/null && rm -f "$tmp/MacVim.dmg" && rmdir "$tmp"
+    if [ "$c" -ne 0 ] || [ ! -d "$dest/Contents/MacOS" ]; then
+        error "MacVim: could not copy the app into $(home_tilde "$HOME/Applications")"
+        return 1
+    fi
+    info "MacVim $(macvim_version "$dest") installed in $(home_tilde "$HOME/Applications") (no admin needed; it updates itself)"
+}
+
+doctor_check_macvim() {
+    [ "$OS" = macos ] || return 0
+    doc_section "MacVim (macOS)"
+    local app
+    if ! app=$(macvim_find); then
+        doc_warn "MacVim is not installed"
+        doc_why "The graphical vim for macOS. It reads the same ~/.vimrc and ~/.vim as vim in the terminal, so it gets olecharms' config, plugins and font."
+        doc_hint "olecharms macvim   (installs it in ~/Applications; no admin needed)"
+        return 0
+    fi
+    doc_ok "MacVim $(macvim_version "$app") at $(home_tilde "$app"), with the same config and plugins as vim"
+    if check_command mvim || [ -x "$BIN_DIR/mvim" ]; then
+        doc_ok "mvim opens files in MacVim from the terminal"
+    elif [ -x "$app/Contents/bin/mvim" ]; then
+        doc_warn "mvim is not linked into $(home_tilde "$BIN_DIR")"
+        doc_why "It opens files in MacVim from the terminal (mvim file, mvim -d a b)."
+        doc_hint "olecharms doctor --fix"
+    fi
+    return 0
+}
+
+# olecharms macvim [install|status]
+cmd_macvim() {
+    if [ "$OS" != macos ]; then
+        error "'olecharms macvim' only works on macOS"
+        return 1
+    fi
+    load_config || return 1
+    local app
+    case "${1:-install}" in
+        install)
+            echo -e "${BOLD}olecharms macvim${NC}"
+            echo ""
+            if app=$(macvim_find); then
+                info "MacVim $(macvim_version "$app") is already installed ($(home_tilde "$app"))"
+            else
+                macvim_install || return 1
+                app=$(macvim_find) || return 1
+            fi
+            macvim_link "$app"
+            ;;
+        status)
+            echo -e "${BOLD}olecharms macvim status${NC}"
+            DOC_OK=0 DOC_WARN=0 DOC_FAIL=0
+            doctor_check_macvim
+            [ "$DOC_FAIL" -eq 0 ]
+            ;;
+        *)
+            error "Usage: olecharms macvim [install|status]"
+            return 1
+            ;;
+    esac
+}
+
 # ─── Config Versioning ──────────────────────────────────────────────────────
 
 config_read() {
@@ -3721,8 +3886,61 @@ fix_moved_install() {
 
 # ─── Core Operations ─────────────────────────────────────────────────────────
 
+# The command system package $1 provides (packages.conf names apt and brew
+# packages; most are called like their command)
+pkg_command() {
+    case "$1" in
+        ripgrep)                               echo rg ;;
+        fd-find)                               echo fd ;;
+        git-delta)                             echo delta ;;
+        tealdeer)                              echo tldr ;;
+        silversearcher-ag|the_silver_searcher) echo ag ;;
+        fontconfig)                            echo fc-list ;;
+        *)                                     echo "$1" ;;
+    esac
+}
+
+# Whether command $1 is there: on PATH, or in ~/.local/bin (not on PATH yet
+# in the shell of a first install). Debian's fdfind and batcat count as fd, bat.
+tool_available() {
+    case "$1" in
+        fd)  check_command fdfind && return 0 ;;
+        bat) check_command batcat && return 0 ;;
+    esac
+    check_command "$1" || [ -x "$BIN_DIR/$1" ]
+}
+
+# Whether sudo may install system packages $1 (a list, for the messages).
+# Without a password it just does. A password is only asked for at a
+# terminal and after a yes: declining, or a sudo that refuses this user,
+# leaves those packages to the installs in your home (install_home_tools).
+sudo_usable() {
+    if ! check_command sudo; then
+        warn "No sudo on this machine; system packages are out of reach: $1"
+        return 1
+    fi
+    sudo -n true 2>/dev/null && return 0
+    # Without a terminal, sudo would block on a password prompt forever
+    if [ ! -t 0 ]; then
+        warn "sudo needs a password and there is no terminal; skipping: $1"
+        return 1
+    fi
+    if ! confirm_default_yes "  Install them with sudo (it asks for your password)? No: olecharms installs what it can in your home instead"; then
+        return 1
+    fi
+    sudo -v && return 0
+    warn "sudo did not work for this user; installing what can go in your home instead"
+    return 1
+}
+
+# System packages olecharms could not install (no root, no Homebrew, or a
+# name this release lacks). install_home_tools then covers what it can, and
+# packages_summary reports the rest: a warning, never an error.
+SYS_MISSING=()
+
 install_packages() {
-    local packages=()
+    local packages=() pkg
+    SYS_MISSING=()
     if [ "$OS" = "linux" ]; then
         packages=("${APT_PACKAGES[@]}")
     elif [ "$OS" = "macos" ]; then
@@ -3737,17 +3955,33 @@ install_packages() {
         return
     fi
 
-    # Filter out already-installed packages
+    # Filter out already-installed packages. Without a package manager to
+    # ask (another Linux, a Mac without Homebrew), the commands themselves say.
     local missing=()
-    if [ "$OS" = "linux" ]; then
-        if ! check_command dpkg || ! check_command apt-get; then
-            warn "Not a Debian/Ubuntu system — install these yourself: ${packages[*]}"
-            return
-        fi
-        # dpkg -s also succeeds for removed-but-not-purged packages
-        # ("deinstall ok config-files"), which would then never come back
+    if { [ "$OS" = "linux" ] && { ! check_command dpkg || ! check_command apt-get; }; } ||
+       { [ "$OS" = "macos" ] && ! check_command brew; }; then
         for pkg in "${packages[@]}"; do
-            if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'ok installed'; then
+            tool_available "$(pkg_command "$pkg")" || missing+=("$pkg")
+        done
+        [ ${#missing[@]} -eq 0 ] && return 0
+        if [ "$OS" = "macos" ]; then
+            warn "Homebrew is not installed (setting it up needs an admin); missing: ${missing[*]}"
+        else
+            warn "Not a Debian/Ubuntu system, so no system packages from olecharms; missing: ${missing[*]}"
+        fi
+        info "Installing what can go in your home instead (no root needed)"
+        SYS_MISSING=("${missing[@]}")
+        return 0
+    fi
+    if [ "$OS" = "linux" ]; then
+        # dpkg -s also succeeds for removed-but-not-purged packages
+        # ("deinstall ok config-files"), which would then never come back.
+        # A command that is already there some other way (installed in your
+        # home, built by hand) needs no package — and no sudo prompt on every
+        # update.
+        for pkg in "${packages[@]}"; do
+            if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'ok installed' &&
+               ! tool_available "$(pkg_command "$pkg")"; then
                 missing+=("$pkg")
             fi
         done
@@ -3765,19 +3999,15 @@ install_packages() {
     fi
 
     info "Installing missing packages: ${missing[*]}"
+    local failed=()
     if [ "$OS" = "linux" ]; then
         # System packages are the one step that needs root; everything else
         # olecharms does stays in userland.
         local sudo_cmd=()
         if [ "$(id -u 2>/dev/null)" != "0" ]; then
-            if ! check_command sudo; then
-                error "sudo not available. Install packages manually: apt-get install ${missing[*]}"
-                return
-            fi
-            # Without a terminal, sudo would block on a password prompt forever
-            if [ ! -t 0 ] && ! sudo -n true 2>/dev/null; then
-                warn "sudo needs a password and there is no terminal; skipping: ${missing[*]}"
-                return
+            if ! sudo_usable "${missing[*]}"; then
+                SYS_MISSING=("${missing[@]}")
+                return 0
             fi
             sudo_cmd=(sudo)
         fi
@@ -3789,26 +4019,43 @@ install_packages() {
         # apt installs nothing when one name is unknown to this release, and
         # packages.conf is shared across distros: retry one by one then.
         if ! "${sudo_cmd[@]}" apt-get install -y -qq "${missing[@]}"; then
-            local failed=()
             warn "Batch install failed; installing one package at a time"
             for pkg in "${missing[@]}"; do
                 "${sudo_cmd[@]}" apt-get install -y -qq "$pkg" >/dev/null 2>&1 || failed+=("$pkg")
             done
-            [ ${#failed[@]} -gt 0 ] && error "Could not install: ${failed[*]} (move distro-specific ones to $LOCAL_CONF_FILE)"
+            [ ${#failed[@]} -gt 0 ] && warn "Could not install: ${failed[*]} (move distro-specific ones to $LOCAL_CONF_FILE)"
         fi
     elif [ "$OS" = "macos" ]; then
-        if check_command brew; then
-            if ! brew install "${missing[@]}"; then
-                local failed=()
-                for pkg in "${missing[@]}"; do
-                    brew list "$pkg" >/dev/null 2>&1 || failed+=("$pkg")
-                done
-                [ ${#failed[@]} -gt 0 ] && error "Could not install: ${failed[*]}"
-            fi
-        else
-            error "Homebrew not found. Install it from https://brew.sh"
+        if ! brew install "${missing[@]}"; then
+            for pkg in "${missing[@]}"; do
+                brew list "$pkg" >/dev/null 2>&1 || failed+=("$pkg")
+            done
+            [ ${#failed[@]} -gt 0 ] && warn "Could not install: ${failed[*]}"
         fi
     fi
+    SYS_MISSING=("${failed[@]}")
+    return 0
+}
+
+# After the system packages and the installs in your home: what is still
+# missing. A warning, not an error — the rest of olecharms works without it.
+packages_summary() {
+    local p cmd still=() seen=" "
+    for p in "${SYS_MISSING[@]}"; do
+        cmd=$(pkg_command "$p")
+        tool_available "$cmd" && continue
+        still+=("$p")
+        seen="$seen$cmd "
+    done
+    for cmd in "${HOME_FAILED[@]}"; do
+        case "$seen" in *" $cmd "*) continue ;; esac
+        tool_available "$cmd" || still+=("$cmd")
+    done
+    [ ${#still[@]} -eq 0 ] && return 0
+    echo ""
+    warn "Not installed: ${still[*]}"
+    echo "    Everything else works without them. They need root or Homebrew, or could not be"
+    echo "    installed in your home; 'olecharms doctor' lists what is missing."
 }
 
 create_vim_dirs() {
@@ -4203,6 +4450,11 @@ bin_link_ours() {
         [ "$name" = "${entry%%|*}" ] || continue
         case "$target" in */"${entry#*|}") return 0 ;; esac
     done
+    # A tool installed in your home with mise (install_home_tools), MacVim's mvim
+    case "$target" in
+        "$MISE_DATA"/installs/*/"$name") return 0 ;;
+        */MacVim.app/Contents/bin/mvim) [ "$name" = mvim ] && return 0 ;;
+    esac
     return 1
 }
 
@@ -4234,12 +4486,15 @@ install_bin_links() {
         bin_command_elsewhere "$name" >/dev/null && continue
         ln -s "$f" "$dest" && n=$((n + 1))
     done
-    # Links to commands that left this bin/, and shims whose program went away
+    # Links to commands that left this bin/, and shims whose program went away;
+    # a tool mise installed points at the version mise has now
     for dest in "$BIN_DIR"/*; do
         [ -L "$dest" ] && [ ! -e "$dest" ] || continue
         case "$(readlink "$dest")" in
             "$SCRIPT_DIR/bin/${dest##*/}") rm -f "$dest" ;;
             */fdfind|*/batcat) bin_link_ours "$dest" && rm -f "$dest" ;;
+            "$MISE_DATA"/installs/*) bin_link_ours "$dest" && home_tool_relink "$dest" ;;
+            */MacVim.app/Contents/bin/mvim) bin_link_ours "$dest" && rm -f "$dest" ;;
         esac
     done
     for entry in "${BIN_SHIMS[@]}"; do
@@ -4303,17 +4558,23 @@ tldr_cache_update() {
     return 0
 }
 
-# mise on Linux: no apt package, so the release binary from GitHub, checked
-# against the release's SHA-256 list, into ~/.local/bin. Only a mise that
-# olecharms installed is updated; one installed some other way is left alone.
-# (macOS: Homebrew, from packages.conf.) OLECHARMS_MISE_TAG and
-# OLECHARMS_MISE_BASE point the tests at a local copy.
+# mise: on Linux (no apt package) and on a Mac without Homebrew, the release
+# binary from GitHub, checked against the release's SHA-256 list, into
+# ~/.local/bin. Only a mise that olecharms installed is updated; one installed
+# some other way is left alone. (A Mac with Homebrew: brew, from
+# packages.conf.) When GitHub cannot be reached and there is no mise at all,
+# npm's official package or mise's install script (mise_install_other_ways).
+# OLECHARMS_MISE_TAG and OLECHARMS_MISE_BASE point the tests at a local copy.
 MISE_RELEASES="https://github.com/jdx/mise/releases"
 MISE_STATE="$OLECHARMS_STATE_DIR/mise-version"
 install_mise() {
     [ "$(config_get mise on)" = off ] && return 0
-    [ "$OS" = linux ] || return 0
-    local existing arch tag base tmp want got
+    local existing arch tag base tmp want got os
+    case "$OS" in
+        linux) os=linux ;;
+        macos) check_command brew && return 0; os=macos ;;
+        *) return 0 ;;
+    esac
     existing=$(type -P mise 2>/dev/null)
     if [ -n "$existing" ] && [ "$existing" != "$BIN_DIR/mise" ]; then
         return 0
@@ -4330,6 +4591,7 @@ install_mise() {
         tr -d '\r' | sed -n 's#^[Ll]ocation: .*/tag/##p' | tail -n 1)}
     if ! [[ "$tag" =~ ^v[0-9][0-9.]*$ ]]; then
         warn "mise: could not find its latest release${tag:+ ($tag)} (offline?)"
+        mise_install_other_ways
         return 0
     fi
     if [ -x "$BIN_DIR/mise" ] && [ "$(cat "$MISE_STATE" 2>/dev/null)" = "$tag" ]; then
@@ -4338,13 +4600,14 @@ install_mise() {
     info "Installing mise $tag..."
     tmp=$(mktemp -d) || return 1
     base="${OLECHARMS_MISE_BASE:-$MISE_RELEASES/download}/$tag"
-    if ! curl -fsSL --max-time 300 -o "$tmp/mise" "$base/mise-$tag-linux-$arch" ||
+    if ! curl -fsSL --max-time 300 -o "$tmp/mise" "$base/mise-$tag-$os-$arch" ||
        ! curl -fsSL --max-time 60 -o "$tmp/sums" "$base/SHASUMS256.txt"; then
         rm -rf "$tmp"
         warn "mise: download failed; nothing installed"
+        mise_install_other_ways
         return 0
     fi
-    want=$(awk -v f="mise-$tag-linux-$arch" '$2 == f || $2 == "./" f { print $1; exit }' "$tmp/sums")
+    want=$(awk -v f="mise-$tag-$os-$arch" '$2 == f || $2 == "./" f { print $1; exit }' "$tmp/sums")
     got=$( (sha256sum "$tmp/mise" 2>/dev/null || shasum -a 256 "$tmp/mise" 2>/dev/null) | cut -d' ' -f1)
     if [ -z "$want" ] || [ "$want" != "$got" ]; then
         rm -rf "$tmp"
@@ -4366,21 +4629,282 @@ install_mise() {
     return 0
 }
 
+# mise without its GitHub release (GitHub unreachable or blocked), and only
+# when there is no mise at all: npm's official package (@jdxcode/mise, from
+# the npm registry), else mise's own install script (it checks its download
+# against the release's checksums). olecharms does not update a mise
+# installed these ways; mise does (`mise self-update`).
+MISE_SCRIPT_URL="https://mise.run"
+mise_install_other_ways() {
+    { check_command mise || [ -x "$BIN_DIR/mise" ]; } && return 0
+    if npm_install_global @jdxcode/mise && { check_command mise || [ -x "$BIN_DIR/mise" ]; }; then
+        info "mise installed with npm"
+        return 0
+    fi
+    if run_install_script mise "${OLECHARMS_MISE_SCRIPT:-$MISE_SCRIPT_URL}" && [ -x "$BIN_DIR/mise" ]; then
+        info "mise installed in $(home_tilde "$BIN_DIR") by its install script"
+        return 0
+    fi
+    warn "mise could not be installed; projects' tool versions (mise.toml) will not apply"
+    return 0
+}
+
+# ─── Installs in your home (no root) ────────────────────────────────────────
+# What the system packages did not provide — no Homebrew, no root, or a
+# package this release lacks — olecharms installs in your home, with what
+# packages.conf HOME_TOOLS lists for each command, in this order:
+#   1. mise, from the project's own GitHub releases (aqua registry, checksums
+#      verified), kept in mise's global config so `mise upgrade` updates it;
+#      the command is linked into ~/.local/bin, where scripts, agents and
+#      editors find it too (mise's activation only reaches interactive shells)
+#   2. npm, official packages only, with `npm install -g` pointed at your home
+#   3. the project's install script: downloaded to a file first, then run —
+#      never piped into a shell — and without root
+# What none of them can install is reported at the end (packages_summary).
+
+MISE_DATA="${MISE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mise}"
+HOME_INSTALLED=()
+HOME_FAILED=()
+
+# mise's path, when it is installed and switched on (olecharms config → mise)
+mise_cmd() {
+    [ "$(config_get mise on)" = off ] && return 1
+    type -P mise 2>/dev/null && return 0
+    [ -x "$BIN_DIR/mise" ] && echo "$BIN_DIR/mise"
+}
+
+# Where mise has command $2 (mise at $1), from the home folder: a project's
+# mise.toml in the current folder must not pick the version
+mise_which() {
+    (cd "$HOME" && MISE_YES=1 "$1" which "$2" 2>/dev/null)
+}
+
+# Link ~/.local/bin/$1 to $2, unless that name holds a file of yours
+home_tool_link() {
+    local dest="$BIN_DIR/$1"
+    if { [ -e "$dest" ] || [ -L "$dest" ]; } && ! bin_link_ours "$dest"; then
+        warn "$(home_tilde "$dest") is yours, so $1 is not linked there"
+        return 1
+    fi
+    [ "$(readlink "$dest" 2>/dev/null)" = "$2" ] && return 0
+    mkdir -p "$BIN_DIR" 2>/dev/null && ln -sfn "$2" "$dest"
+}
+
+# A link of ours into mise's installs that broke (`mise prune`, an upgrade):
+# point it at the version mise has now, or remove it when there is none
+home_tool_relink() {
+    local dest="$1" mise real
+    if mise=$(mise_cmd) && real=$(mise_which "$mise" "${dest##*/}") && [ -x "$real" ]; then
+        ln -sfn "$real" "$dest"
+    else
+        rm -f "$dest"
+    fi
+}
+
+# Install tool $2 with mise and link its command $1 into ~/.local/bin
+home_tool_mise() {
+    local cmd="$1" tool="$2" mise real log
+    mise=$(mise_cmd) || return 1
+    info "Installing $cmd with mise ($tool)..."
+    log=$(cd "$HOME" && MISE_YES=1 "$mise" use -g "$tool@latest" 2>&1 </dev/null)
+    if ! real=$(mise_which "$mise" "$cmd") || [ ! -x "$real" ]; then
+        warn "mise could not install $cmd:"
+        printf '%s\n' "$log" | tail -n 3 | sed 's/^/    /' >&2
+        return 1
+    fi
+    home_tool_link "$cmd" "$real"
+}
+
+# npm, unless it is Windows' (reached from WSL through interop): that one
+# installs for Windows
+npm_cmd() {
+    local p
+    p=$(type -P npm 2>/dev/null) || return 1
+    case "$p" in
+        /mnt/[a-zA-Z]/*) [ -n "${IS_WSL:-}" ] && return 1 ;;
+    esac
+    echo "$p"
+}
+
+# Whether npm global prefix $1 takes installs without root: its
+# lib/node_modules and bin, or the nearest folders above them that exist
+npm_prefix_writable() {
+    local d
+    for d in "$1/lib/node_modules" "$1/bin"; do
+        while [ ! -e "$d" ]; do
+            d=${d%/*}
+            [ -n "$d" ] || { d=/; break; }
+        done
+        [ -w "$d" ] || return 1
+    done
+}
+
+# Why olecharms must not set npm's prefix (prints nothing when it may): one
+# you chose stays yours, and nvm refuses to run with one in ~/.npmrc
+npm_prefix_blocker() {
+    if [ -n "${NPM_CONFIG_PREFIX:-}${npm_config_prefix:-}" ]; then
+        echo "NPM_CONFIG_PREFIX is set in your environment"
+    elif grep -qE '^[[:space:]]*prefix[[:space:]]*=' "$HOME/.npmrc" 2>/dev/null; then
+        echo "~/.npmrc sets a prefix of its own"
+    elif [ -s "${NVM_DIR:-$HOME/.nvm}/nvm.sh" ]; then
+        echo "nvm is installed and refuses a prefix in ~/.npmrc; 'nvm install --lts' gives you an npm of your own"
+    fi
+}
+
+# `npm install -g` writes into npm's prefix: /usr or /usr/local for a system
+# Node, which needs root. When that prefix is not yours, olecharms points npm
+# at ~/.local (prefix in ~/.npmrc): packages in ~/.local/lib/node_modules,
+# their commands in ~/.local/bin, which the loader puts on PATH. nvm, Volta,
+# Homebrew and mise give npm a folder of yours already: nothing to do there.
+# Returns 1 when global installs still need root afterwards.
+NPM_HOME_PREFIX="$HOME/.local"
+NPM_PREFIX_MARK="$OLECHARMS_STATE_DIR/npm-prefix"
+npm_home_prefix() {
+    local npm prefix why
+    npm=$(npm_cmd) || return 0
+    prefix=$("$npm" prefix -g 2>/dev/null </dev/null) || return 0
+    [ -n "$prefix" ] || return 0
+    npm_prefix_writable "$prefix" && return 0
+    why=$(npm_prefix_blocker)
+    if [ -n "$why" ]; then
+        warn "npm install -g needs root here ($prefix), and olecharms leaves it: $why"
+        return 1
+    fi
+    [ -f "$HOME/.npmrc" ] && { backup_file "$HOME/.npmrc" || return 1; }
+    mkdir -p "$NPM_HOME_PREFIX/bin" "$NPM_HOME_PREFIX/lib" 2>/dev/null
+    if ! "$npm" config set prefix "$NPM_HOME_PREFIX" >/dev/null 2>&1 </dev/null; then
+        warn "Could not point npm's global installs at $(home_tilde "$NPM_HOME_PREFIX")"
+        return 1
+    fi
+    mkdir -p "$OLECHARMS_STATE_DIR" 2>/dev/null && echo "$prefix" > "$NPM_PREFIX_MARK"
+    info "npm install -g now installs into $(home_tilde "$NPM_HOME_PREFIX") (commands in $(home_tilde "$BIN_DIR")), no sudo: $prefix needs root"
+}
+
+# npm install -g package $1, into a folder of yours
+npm_install_global() {
+    local npm out
+    npm=$(npm_cmd) || return 1
+    npm_home_prefix || return 1
+    info "Installing $1 with npm..."
+    if ! out=$("$npm" install -g --no-fund --no-audit "$1" 2>&1 </dev/null); then
+        warn "npm could not install $1:"
+        printf '%s\n' "$out" | tail -n 3 | sed 's/^/    /' >&2
+        return 1
+    fi
+}
+
+# Run project $1's install script from URL $2, the safe way round: curl saves
+# it to a file first, and only a complete download runs — never `curl | sh`,
+# where a dropped connection runs half a script. https only (or a local
+# file://), redirects included. It runs without root: `sudo` and `doas` are
+# stand-ins that refuse, so a script that wants to elevate fails instead of
+# asking for your password, and nothing lands outside your home.
+run_install_script() {
+    local name="$1" url="$2" tmp shell=sh c
+    case "$url" in
+        https://*|file://*) ;;
+        *) warn "$name: not running an install script that does not come over https ($url)"; return 1 ;;
+    esac
+    if ! check_command curl; then
+        warn "$name: its install script needs curl"
+        return 1
+    fi
+    tmp=$(mktemp -d) || return 1
+    if ! curl -fsSL --proto '=https,file' --proto-redir '=https' --connect-timeout 15 --max-time 120 \
+            -o "$tmp/install.sh" "$url" 2>/dev/null || [ ! -s "$tmp/install.sh" ]; then
+        warn "$name: could not download its install script ($url)"
+        rm -rf "$tmp"
+        return 1
+    fi
+    head -n 1 "$tmp/install.sh" | grep -q bash && shell=bash
+    mkdir -p "$tmp/noroot"
+    for c in sudo doas; do
+        printf '#!/bin/sh\necho "%s: olecharms runs install scripts without root" >&2\nexit 1\n' "$c" > "$tmp/noroot/$c"
+        chmod +x "$tmp/noroot/$c"
+    done
+    info "Running $name's install script (downloaded from $url)..."
+    if ! (cd "$tmp" && PATH="$tmp/noroot:$PATH" "$shell" ./install.sh) </dev/null > "$tmp/log" 2>&1; then
+        warn "$name: its install script failed:"
+        tail -n 5 "$tmp/log" | sed 's/^/    /' >&2
+        rm -rf "$tmp"
+        return 1
+    fi
+    rm -rf "$tmp"
+}
+
+# Each HOME_TOOLS command that is still missing: mise, then npm, then the
+# install script, as its entry allows
+install_home_tools() {
+    local entry cmd tool pkg url how
+    HOME_INSTALLED=()
+    HOME_FAILED=()
+    for entry in "${HOME_TOOLS[@]}"; do
+        IFS='|' read -r cmd tool pkg url <<< "$entry"
+        [ -n "$cmd" ] || continue
+        tool_available "$cmd" && continue
+        how=""
+        if [ -n "$tool" ] && home_tool_mise "$cmd" "$tool"; then
+            how=mise
+        elif [ -n "$pkg" ] && npm_install_global "$pkg" && tool_available "$cmd"; then
+            how=npm
+        elif [ -n "$url" ] && run_install_script "$cmd" "$url" && tool_available "$cmd"; then
+            how="install script"
+        fi
+        if [ -n "$how" ]; then
+            HOME_INSTALLED+=("$cmd ($how)")
+        else
+            HOME_FAILED+=("$cmd")
+        fi
+    done
+    [ ${#HOME_INSTALLED[@]} -gt 0 ] &&
+        info "Installed in your home: $(printf '%s, ' "${HOME_INSTALLED[@]}" | sed 's/, $//')"
+    return 0
+}
+
 doctor_check_tools() {
     doc_section "Tools"
-    local have=() missing=() t
+    local have=() missing=() home=() broken=() t p entry npm prefix why
     for t in rg fd bat delta jq tldr ag zoxide; do
-        case "$t" in
-            fd)  { check_command fd || check_command fdfind; } && have+=(fd) || missing+=(fd) ;;
-            bat) { check_command bat || check_command batcat; } && have+=(bat) || missing+=(bat) ;;
-            *)   check_command "$t" && have+=("$t") || missing+=("$t") ;;
-        esac
+        if tool_available "$t"; then
+            have+=("$t")
+            # Where it really lives: the fd/bat shims in ~/.local/bin point at
+            # the system's fdfind and batcat
+            p=$(type -P "$t" 2>/dev/null) || p="$BIN_DIR/$t"
+            case "$(resolve_link "$p")" in "$HOME"/*) home+=("$t") ;; esac
+        else
+            missing+=("$t")
+        fi
     done
     [ ${#have[@]} -gt 0 ] && doc_ok "${have[*]}"
+    [ ${#home[@]} -gt 0 ] && doc_ok "Installed in your home, no root: ${home[*]}"
     if [ ${#missing[@]} -gt 0 ]; then
         doc_warn "Not installed: ${missing[*]}"
         doc_why "Fast search (rg, fd, ag), previews (bat), readable diffs (delta), JSON (jq), examples (tldr), folder jumping (zoxide)."
-        doc_hint "olecharms update installs them"
+        doc_hint "olecharms update installs them (without root or Homebrew: those it can, in your home)"
+    fi
+    for entry in "${HOME_TOOLS[@]}"; do
+        t=${entry%%|*}
+        [ -L "$BIN_DIR/$t" ] && [ ! -e "$BIN_DIR/$t" ] && bin_link_ours "$BIN_DIR/$t" && broken+=("$t")
+    done
+    if [ ${#broken[@]} -gt 0 ]; then
+        doc_warn "Broken links in $(home_tilde "$BIN_DIR"): ${broken[*]} (mise no longer has that version)"
+        doc_why "Those commands stop working outside interactive shells: scripts, agents, editors."
+        doc_hint "olecharms doctor --fix"
+    fi
+    if npm=$(npm_cmd) && prefix=$("$npm" prefix -g 2>/dev/null </dev/null) && [ -n "$prefix" ]; then
+        if npm_prefix_writable "$prefix"; then
+            doc_ok "npm install -g: into $(home_tilde "$prefix"), no sudo needed"
+        else
+            doc_warn "npm install -g needs root ($prefix is not yours)"
+            doc_why "Global npm packages (command-line tools such as coding agents) then need sudo, and leave files owned by root."
+            why=$(npm_prefix_blocker)
+            if [ -n "$why" ]; then
+                doc_hint "olecharms leaves it: $why"
+            else
+                doc_hint "olecharms doctor --fix (points it at ~/.local in ~/.npmrc)"
+                doc_offer "Make npm install -g use ~/.local (prefix in ~/.npmrc; commands land in ~/.local/bin)?" npm_home_prefix
+            fi
+        fi
     fi
     if check_command zoxide; then
         doc_ok "Folder jumping: j (zoxide; ji picks with fzf)"
@@ -4597,6 +5121,8 @@ agents_text() {
     check_command jq && tools+=("\`jq\`")
     [ ${#tools[@]} -gt 0 ] && echo "- Search and data: $(printf '%s, ' "${tools[@]}" | sed 's/, $//')."
     check_command tldr && echo "- \`tldr <command>\`: short examples."
+    [ -f "$NPM_PREFIX_MARK" ] && grep -qxF "prefix=$NPM_HOME_PREFIX" "$HOME/.npmrc" 2>/dev/null &&
+        echo "- \`npm install -g <package>\` needs no sudo here: it installs into ~/.local (commands in ~/.local/bin)."
     { check_command mise || [ -x "$BIN_DIR/mise" ]; } && [ "$(config_get mise on)" != off ] &&
         echo "- Projects with mise.toml or .tool-versions: \`mise exec -- <command>\` uses their tool versions."
     echo "- Parallel tasks: one git worktree each, \`git worktree add ../<repo>.worktrees/<task> -b <task>\`."
@@ -5159,7 +5685,9 @@ config_zsh_extras() {
 run_setup_steps() {
     ensure_local_conf_template
     install_packages
+    npm_home_prefix
     install_mise
+    install_home_tools
     zoxide_import_autojump
     tldr_cache_update
     create_vim_dirs
@@ -5176,6 +5704,7 @@ run_setup_steps() {
     install_editor_env
     restore_scheduled_features
     sync_windows_side
+    sync_macvim_side
     agents_refresh
 }
 
@@ -5189,6 +5718,7 @@ cmd_install() {
     _self_update install
 
     run_setup_steps
+    packages_summary
 
     echo ""
     if [ $ERROR_COUNT -eq 0 ]; then
@@ -5232,6 +5762,7 @@ cmd_update() {
     unset OLECHARMS_SHELL_BEFORE
 
     run_setup_steps
+    packages_summary
 
     echo ""
     if [ $ERROR_COUNT -eq 0 ]; then
@@ -6155,6 +6686,7 @@ doctor_run_checks() {
     doctor_check_paranoid
     doctor_check_config
     doctor_check_windows
+    doctor_check_macvim
     echo ""
     local summary="$DOC_OK ok, $DOC_WARN warnings, $DOC_FAIL problems"
     if [ "$DOC_FAIL" -gt 0 ]; then
@@ -6182,6 +6714,7 @@ run_local_steps() {
     install_editor_env
     restore_scheduled_features
     sync_windows_side
+    sync_macvim_side
     agents_refresh
     config_set install_dir "$SCRIPT_DIR"
 }
@@ -7460,6 +7993,7 @@ cmd_help() {
     echo "  agents    What coding agents (Claude Code, Codex, Gemini CLI) are told about this"
     echo "            machine: show / refresh / on / off / protect"
     [ -n "${IS_WSL:-}" ] && echo "  windows   Sync Windows' gVim (config, plugins) and fonts now; 'status' to check"
+    [ "${OS:-}" = macos ] && echo "  macvim    Install MacVim in ~/Applications (no admin needed) and link mvim; 'status' to check"
     echo "  help      Show this help message"
     echo ""
     echo -e "${BLUE}Aliases:${NC}"
@@ -7839,7 +8373,7 @@ main() {
             config_ensure
             fix_moved_install fix
             ;;
-        alias|aliaslast|cleanup|windows|secret|trash|agents)
+        alias|aliaslast|cleanup|windows|macvim|secret|trash|agents)
             config_ensure
             ;;
         doctor|check)
@@ -7866,6 +8400,7 @@ main() {
         config)  cmd_config || cmd_rc=$? ;;
         cleanup) shift; cmd_cleanup "$@" || cmd_rc=$? ;;
         windows) shift; cmd_windows "$@" || cmd_rc=$? ;;
+        macvim)  shift; cmd_macvim "$@" || cmd_rc=$? ;;
         alias)   shift; cmd_alias "$@" || cmd_rc=$? ;;
         aliaslast) shift; cmd_aliaslast "$@" || cmd_rc=$? ;;
         secret)  shift; cmd_secret "$@" || cmd_rc=$? ;;

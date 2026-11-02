@@ -3,8 +3,9 @@
 #   $SB/repo   a copy of this checkout (without .git and scripts/)
 #   $SB/home   a fake HOME, with .bashrc/.zshrc and a "downloads" symlink
 #   $SB/win    a fake Windows downloads folder holding back-dated files
-#   $SB/bin    first on PATH: a fake crontab (backed by a file) and a sudo
-#              that always refuses, so no test installs system packages
+#   $SB/bin    first on PATH: a fake crontab (backed by a file), and a sudo
+#              and an npm that always refuse, so no test installs system or
+#              global npm packages (your nvm's npm would write outside it)
 # The sandbox lives in $OLECHARMS_TEST_TMP (tests/run.sh creates it) or, when
 # a suite runs on its own, in a new temporary folder removed at exit. Either
 # way it must hold the .olecharms-test marker: nothing is ever deleted
@@ -31,7 +32,8 @@ SB=$S/sb
 
 # Nothing from the real environment may steer olecharms or git
 for _v in $(compgen -e | grep -E '^(OLECHARMS_|GIT_)'); do unset "$_v"; done
-unset _v XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME ZSH ZSH_CUSTOM ZDOTDIR HISTFILE
+for _v in $(compgen -e | grep -E '^(MISE_|NPM_CONFIG_|npm_config_)'); do unset "$_v"; done
+unset _v XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME ZSH ZSH_CUSTOM ZDOTDIR HISTFILE NVM_DIR
 unset SSH_CONNECTION SSH_TTY TMUX
 # Your own ~/.local/bin would make the tests depend on what you installed
 _p="" ; _IFS=$IFS; IFS=:
@@ -73,7 +75,8 @@ case "$1" in
 esac
 EOF
     printf '#!/bin/sh\necho "sudo: disabled in the olecharms tests" >&2\nexit 1\n' > "$SB/bin/sudo"
-    chmod +x "$SB/bin/crontab" "$SB/bin/sudo"
+    printf '#!/bin/sh\necho "npm: disabled in the olecharms tests" >&2\nexit 1\n' > "$SB/bin/npm"
+    chmod +x "$SB/bin/crontab" "$SB/bin/sudo" "$SB/bin/npm"
 
     local H=$SB/home D=$SB/win/Downloads
     printf '# user bashrc\nalias ll="ls -l"\n' > "$H/.bashrc"
@@ -89,3 +92,5 @@ build_sandbox >/dev/null || { echo "ABORT: could not build the sandbox in $SB"; 
 export HOME=$SB/home XDG_CONFIG_HOME=$SB/home/.config PATH="$SB/bin:$PATH" CRON_FILE=$SB/crontab.txt
 # The Windows side (gVim's home) is redirected into the sandbox too
 export OLECHARMS_WIN_VIM_HOME=$SB/winhome
+# mise's install script (its last way in without GitHub) is never fetched
+export OLECHARMS_MISE_SCRIPT=file://$SB/no-network/mise-install.sh
